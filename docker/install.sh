@@ -5,7 +5,7 @@
 apt-get update
 
 apt-get install -y \
-        software-properties-common python-software-properties curl
+        software-properties-common python-software-properties curl wget sudo
 add-apt-repository ppa:ubuntu-toolchain-r/test
 apt-get remove -y --purge \
         software-properties-common python-software-properties
