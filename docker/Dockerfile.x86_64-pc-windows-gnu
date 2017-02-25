@@ -1,0 +1,4 @@
+FROM japaric/x86_64-pc-windows-gnu
+
+COPY install.sh /
+RUN /install.sh

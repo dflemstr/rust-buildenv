@@ -1,0 +1,4 @@
+FROM japaric/mips64el-unknown-linux-gnuabi64
+
+COPY install.sh /
+RUN /install.sh

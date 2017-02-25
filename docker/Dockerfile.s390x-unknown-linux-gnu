@@ -1,0 +1,4 @@
+FROM japaric/s390x-unknown-linux-gnu
+
+COPY install.sh /
+RUN /install.sh

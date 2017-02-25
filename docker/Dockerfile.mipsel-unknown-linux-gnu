@@ -1,0 +1,4 @@
+FROM japaric/mipsel-unknown-linux-gnu
+
+COPY install.sh /
+RUN /install.sh

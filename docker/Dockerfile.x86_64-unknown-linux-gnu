@@ -1,0 +1,4 @@
+FROM japaric/x86_64-unknown-linux-gnu
+
+COPY install.sh /
+RUN /install.sh

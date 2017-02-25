@@ -1,0 +1,4 @@
+FROM japaric/arm-unknown-linux-musleabi
+
+COPY install.sh /
+RUN /install.sh
