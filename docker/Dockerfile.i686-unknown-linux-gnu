@@ -2,3 +2,8 @@ FROM japaric/i686-unknown-linux-gnu
 
 COPY install.sh /
 RUN /install.sh
+
+RUN apt-get update && apt-get install -y gcc-4.8 g++-4.8 && rm -rf /var/lib/apt/lists/*
+
+ENV CC_i686_unknown_linux_gnu=gcc-4.8 \
+    CXX_i686_unknown_linux_gnu=g++-4.8
