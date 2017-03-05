@@ -16,7 +16,7 @@ echo "deb-src http://apt.llvm.org/$DISTRIB_CODENAME/ llvm-toolchain-$DISTRIB_COD
 
 apt-get update
 apt-get install -y \
-        clang-5.0 libclang-5.0-dev libclang1-5.0 lld-5.0
+        clang-5.0 libclang-5.0-dev libclang1-5.0 llvm-5.0-dev lld-5.0
 
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
