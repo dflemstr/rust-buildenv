@@ -25,7 +25,7 @@ defaults: &defaults
     - run:
         name: Tag buildenv Docker image
         command: |
-          for target in TARGETS
+          for target in $TARGETS
           do docker tag rust-$RUST_IMAGE dflemstr/rust-buildenv:$target
           done
     - run:
@@ -41,7 +41,7 @@ defaults: &defaults
         name: Push application Docker image
         command: |
           if [ "${CIRCLE_BRANCH}" == "master" ]
-          then for target in TARGETS
+          then for target in $TARGETS
             do
               docker login -u $DOCKER_USER -p $DOCKER_PASS
               docker push dflemstr/rust-buildenv:$target
