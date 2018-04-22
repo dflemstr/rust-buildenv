@@ -20,22 +20,19 @@ defaults: &defaults
     - run:
         name: Build base Docker image
         command: |
-          docker build --cache-from=rust-$RUST_IMAGE -t rust-$RUST_IMAGE -f rust/ci/docker/$RUST_IMAGE/Dockerfile rust/ci/docker
+          docker build --cache-from=rust-$RUST_IMAGE -t rust-$RUST_IMAGE -f rust/src/ci/docker/$RUST_IMAGE/Dockerfile rust/src/ci/docker
           echo "export TARGETS=$(docker run --rm -ti rust-$RUST_IMAGE echo '$TARGETS')" >> $BASH_ENV
     - run:
-        name: Build buildenv Docker image
+        name: Tag buildenv Docker image
         command: |
           for target in TARGETS
-          do docker build --cache-from=dflemstr/rust-buildenv:$target -t dflemstr/rust-buildenv:$target -f docker/Dockerfile.$target
+          do docker tag rust-$RUST_IMAGE dflemstr/rust-buildenv:$target
           done
     - run:
         name: Save Docker image layer cache
         command: |
           mkdir -p /caches/images
           docker save -o /caches/images/rust-$RUST_IMAGE.tar rust-$RUST_IMAGE
-          for target in TARGETS
-          do docker save -o /caches/images/rust-buildenv-$TARGET.tar dflemstr/rust-buildenv:$TARGET
-          done
     - save_cache:
         key: v1-$RUST_IMAGE-{{ .Branch }}-{{ epoch }}
         paths:
