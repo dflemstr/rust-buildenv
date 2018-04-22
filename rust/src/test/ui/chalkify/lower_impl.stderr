@@ -1,0 +1,14 @@
+error: Implemented(T: Foo) :- ProjectionEq(<T as std::iter::Iterator>::Item == i32), TypeOutlives(T : 'static), Implemented(T: std::iter::Iterator), Implemented(T: std::marker::Sized).
+  --> $DIR/lower_impl.rs:15:1
+   |
+LL | #[rustc_dump_program_clauses] //~ ERROR Implemented(T: Foo) :-
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: Normalize(<T as Bar>::Assoc == std::vec::Vec<T>) :- Implemented(T: Bar).
+  --> $DIR/lower_impl.rs:23:5
+   |
+LL |     #[rustc_dump_program_clauses] //~ ERROR Normalize(<T as Bar>::Assoc == std::vec::Vec<T>) :-
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+
