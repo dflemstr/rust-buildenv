@@ -5,7 +5,7 @@
 apt-get update
 
 apt-get install -y \
-        software-properties-common python-software-properties curl wget sudo g++-multilib libglib2.0-dev git subversion
+        software-properties-common python-software-properties curl wget sudo g++-multilib libglib2.0-dev git subversion bzip2
 add-apt-repository ppa:ubuntu-toolchain-r/test
 apt-get remove -y --purge \
         software-properties-common python-software-properties
@@ -16,7 +16,7 @@ echo "deb-src http://apt.llvm.org/$DISTRIB_CODENAME/ llvm-toolchain-$DISTRIB_COD
 
 apt-get update
 apt-get install -y \
-        clang-5.0 libclang-5.0-dev libclang1-5.0 llvm-5.0-dev lld-5.0
+        clang-6.0 libclang-6.0-dev libclang1-6.0 llvm-6.0-dev lld-6.0
 
 apt-get autoremove -y
 rm -rf /var/lib/apt/lists/*
