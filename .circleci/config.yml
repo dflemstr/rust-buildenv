@@ -42,7 +42,9 @@ defaults: &defaults
         command: |
           if [ "${CIRCLE_BRANCH}" == "master" ]
           then for target in TARGETS
-            do docker push dflemstr/rust-buildenv:$target
+            do
+              docker login -u $DOCKER_USER -p $DOCKER_PASS
+              docker push dflemstr/rust-buildenv:$target
             done
           fi
 
