@@ -21,7 +21,7 @@ defaults: &defaults
         name: Build base Docker image
         command: |
           docker build --cache-from=rust-$RUST_IMAGE -t rust-$RUST_IMAGE -f rust/src/ci/docker/$RUST_IMAGE/Dockerfile rust/src/ci/docker
-          echo "export TARGETS=$(docker run --rm -ti rust-$RUST_IMAGE echo '$TARGETS')" >> $BASH_ENV
+          echo "export TARGETS=$(docker run --rm -v $PWD/fake_x.py:/x.py rust-$RUST_IMAGE /bin/bash -c 'eval "$SCRIPT"')" >> $BASH_ENV
     - run:
         name: Tag buildenv Docker image
         command: |
@@ -41,9 +41,10 @@ defaults: &defaults
         name: Push application Docker image
         command: |
           if [ "${CIRCLE_BRANCH}" == "master" ]
-          then for target in $TARGETS
+          then
+            docker login -u $DOCKER_USER -p $DOCKER_PASS
+            for target in $TARGETS
             do
-              docker login -u $DOCKER_USER -p $DOCKER_PASS
               docker push dflemstr/rust-buildenv:$target
             done
           fi
