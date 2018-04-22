@@ -7,7 +7,7 @@ defaults: &defaults
     - setup_remote_docker
     - restore_cache:
         keys:
-          - v1-{{ .Environment.RUST_IMAGE }}-{{ .Branch }}
+          - v1-{{ .Environment.CIRCLE_JOB }}-{{ .Branch }}
         paths:
           - /caches/images/
     - run:
@@ -34,7 +34,7 @@ defaults: &defaults
           mkdir -p /caches/images
           docker save -o /caches/images/rust-$RUST_IMAGE.tar rust-$RUST_IMAGE
     - save_cache:
-        key: v1-{{ .Environment.RUST_IMAGE }}-{{ .Branch }}-{{ epoch }}
+        key: v1-{{ .Environment.CIRCLE_JOB }}-{{ .Branch }}-{{ epoch }}
         paths:
           - /caches/images
     - deploy:
