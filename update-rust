@@ -1,0 +1,2 @@
+#!/bin/sh -eu
+exec git subtree pull --prefix rust --squash git@github.com:rust-lang/rust.git master
