@@ -105,12 +105,38 @@ jobs:
   dist-s390x-linux:
     <<: *defaults
     environment: RUST_IMAGE=dist-s390x-linux
-  dist-x86:
+  dist-x86_64-freebsd:
     <<: *defaults
     environment: RUST_IMAGE=dist-x86_64-freebsd
-  dist-x86:
+  dist-x86_64-musl:
     <<: *defaults
     environment: RUST_IMAGE=dist-x86_64-musl
-  dist-x86:
+  dist-x86_64-netbsd:
     <<: *defaults
     environment: RUST_IMAGE=dist-x86_64-netbsd
+
+workflows:
+  version: 2
+  dist:
+    jobs:
+      - dist-various-1
+      - dist-various-2
+      - dist-aarch64-linux
+      - dist-android
+      - dist-arm-linux
+      - dist-armhf-linux
+      - dist-armv7-linux
+      - dist-i586-gnu-i586-i686-musl
+      - dist-i686-freebsd
+      - dist-i686-linux
+      - dist-mips-linux
+      - dist-mips64-linux
+      - dist-mips64el-linux
+      - dist-mipsel-linux
+      - dist-powerpc-linux
+      - dist-powerpc64-linux
+      - dist-powerpc64le-linux
+      - dist-s390x-linux
+      - dist-x86_64-freebsd
+      - dist-x86_64-musl
+      - dist-x86_64-netbsd
