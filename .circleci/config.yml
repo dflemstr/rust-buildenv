@@ -25,12 +25,15 @@ defaults: &defaults
           docker cp target-extractor $container:/target-extractor
           targets=$(docker start -a "$container")
           echo >&2 "Targets: $targets"
-          echo "export TARGETS=$targets" >> $BASH_ENV
+          echo "export TARGETS='$targets'" >> $BASH_ENV
     - run:
         name: Tag buildenv Docker image
         command: |
+          source $BASH_ENV
           for target in $TARGETS
-          do docker tag rust-$RUST_IMAGE dflemstr/rust-buildenv:$target
+          do
+              echo >&2 "Tagging target: $target"
+              docker tag rust-$RUST_IMAGE dflemstr/rust-buildenv:$target
           done
     - run:
         name: Save Docker image layer cache
@@ -44,11 +47,13 @@ defaults: &defaults
     - deploy:
         name: Push application Docker image
         command: |
+          source $BASH_ENV
           if [ "${CIRCLE_BRANCH}" == "master" ]
           then
             docker login -u $DOCKER_USER -p $DOCKER_PASS
             for target in $TARGETS
             do
+              echo >&2 "Pushing target: $target"
               docker push dflemstr/rust-buildenv:$target
             done
           fi
