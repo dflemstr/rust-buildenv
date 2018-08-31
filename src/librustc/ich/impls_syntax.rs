@@ -19,23 +19,22 @@ use std::mem;
 use syntax::ast;
 use syntax::feature_gate;
 use syntax::parse::token;
-use syntax::symbol::InternedString;
+use syntax::symbol::{InternedString, LocalInternedString};
 use syntax::tokenstream;
-use syntax_pos::FileMap;
+use syntax_pos::SourceFile;
 
 use hir::def_id::{DefId, CrateNum, CRATE_DEF_INDEX};
 
+use smallvec::SmallVec;
 use rustc_data_structures::stable_hasher::{HashStable, ToStableHashKey,
                                            StableHasher, StableHasherResult};
-use rustc_data_structures::accumulate_vec::AccumulateVec;
 
 impl<'a> HashStable<StableHashingContext<'a>> for InternedString {
     #[inline]
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        let s: &str = &**self;
-        s.hash_stable(hcx, hasher);
+        self.with(|s| s.hash_stable(hcx, hasher))
     }
 }
 
@@ -46,6 +45,27 @@ impl<'a> ToStableHashKey<StableHashingContext<'a>> for InternedString {
     fn to_stable_hash_key(&self,
                           _: &StableHashingContext<'a>)
                           -> InternedString {
+        self.clone()
+    }
+}
+
+impl<'a> HashStable<StableHashingContext<'a>> for LocalInternedString {
+    #[inline]
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        let s: &str = &**self;
+        s.hash_stable(hcx, hasher);
+    }
+}
+
+impl<'a> ToStableHashKey<StableHashingContext<'a>> for LocalInternedString {
+    type KeyType = LocalInternedString;
+
+    #[inline]
+    fn to_stable_hash_key(&self,
+                          _: &StableHashingContext<'a>)
+                          -> LocalInternedString {
         self.clone()
     }
 }
@@ -66,7 +86,7 @@ impl<'a> ToStableHashKey<StableHashingContext<'a>> for ast::Name {
     fn to_stable_hash_key(&self,
                           _: &StableHashingContext<'a>)
                           -> InternedString {
-        self.as_str()
+        self.as_interned_str()
     }
 }
 
@@ -78,11 +98,12 @@ impl_stable_hash_for!(enum ::syntax::ast::AsmDialect {
 impl_stable_hash_for!(enum ::syntax::ext::base::MacroKind {
     Bang,
     Attr,
-    Derive
+    Derive,
+    ProcMacroStub,
 });
 
 
-impl_stable_hash_for!(enum ::syntax::abi::Abi {
+impl_stable_hash_for!(enum ::rustc_target::spec::abi::Abi {
     Cdecl,
     Stdcall,
     Fastcall,
@@ -94,6 +115,7 @@ impl_stable_hash_for!(enum ::syntax::abi::Abi {
     PtxKernel,
     Msp430Interrupt,
     X86Interrupt,
+    AmdGpuKernel,
     Rust,
     C,
     System,
@@ -110,6 +132,15 @@ impl_stable_hash_for!(struct ::syntax::attr::Stability {
     rustc_depr,
     rustc_const_unstable
 });
+
+impl<'a> HashStable<StableHashingContext<'a>>
+for ::syntax::edition::Edition {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        mem::discriminant(self).hash_stable(hcx, hasher);
+    }
+}
 
 impl<'a> HashStable<StableHashingContext<'a>>
 for ::syntax::attr::StabilityLevel {
@@ -176,11 +207,10 @@ impl<'a> HashStable<StableHashingContext<'a>> for [ast::Attribute] {
         }
 
         // Some attributes are always ignored during hashing.
-        let filtered: AccumulateVec<[&ast::Attribute; 8]> = self
+        let filtered: SmallVec<[&ast::Attribute; 8]> = self
             .iter()
             .filter(|attr| {
-                !attr.is_sugared_doc &&
-                attr.name().map(|name| !hcx.is_ignored_attr(name)).unwrap_or(true)
+                !attr.is_sugared_doc && !hcx.is_ignored_attr(attr.name())
             })
             .collect();
 
@@ -191,12 +221,23 @@ impl<'a> HashStable<StableHashingContext<'a>> for [ast::Attribute] {
     }
 }
 
+impl<'a> HashStable<StableHashingContext<'a>> for ast::Path {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        self.segments.len().hash_stable(hcx, hasher);
+        for segment in &self.segments {
+            segment.ident.name.hash_stable(hcx, hasher);
+        }
+    }
+}
+
 impl<'a> HashStable<StableHashingContext<'a>> for ast::Attribute {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         // Make sure that these have been filtered out.
-        debug_assert!(self.name().map(|name| !hcx.is_ignored_attr(name)).unwrap_or(true));
+        debug_assert!(!hcx.is_ignored_attr(self.name()));
         debug_assert!(!self.is_sugared_doc);
 
         let ast::Attribute {
@@ -209,10 +250,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for ast::Attribute {
         } = *self;
 
         style.hash_stable(hcx, hasher);
-        path.segments.len().hash_stable(hcx, hasher);
-        for segment in &path.segments {
-            segment.ident.name.hash_stable(hcx, hasher);
-        }
+        path.hash_stable(hcx, hasher);
         for tt in tokens.trees() {
             tt.hash_stable(hcx, hasher);
         }
@@ -287,6 +325,7 @@ fn hash_token<'a, 'gcx, W: StableHasherResult>(
         token::Token::Pound |
         token::Token::Dollar |
         token::Token::Question |
+        token::Token::SingleQuote |
         token::Token::Whitespace |
         token::Token::Comment |
         token::Token::Eof => {}
@@ -354,14 +393,12 @@ impl_stable_hash_for!(enum ::syntax::ast::MetaItemKind {
 
 impl_stable_hash_for!(struct ::syntax_pos::hygiene::ExpnInfo {
     call_site,
-    callee
-});
-
-impl_stable_hash_for!(struct ::syntax_pos::hygiene::NameAndSpan {
+    def_site,
     format,
     allow_internal_unstable,
     allow_internal_unsafe,
-    span
+    local_inner_macros,
+    edition
 });
 
 impl_stable_hash_for!(enum ::syntax_pos::hygiene::ExpnFormat {
@@ -371,9 +408,11 @@ impl_stable_hash_for!(enum ::syntax_pos::hygiene::ExpnFormat {
 });
 
 impl_stable_hash_for!(enum ::syntax_pos::hygiene::CompilerDesugaringKind {
-    DotFill,
+    Async,
     QuestionMark,
-    Catch
+    ExistentialReturnType,
+    ForLoop,
+    TryBlock
 });
 
 impl_stable_hash_for!(enum ::syntax_pos::FileName {
@@ -383,15 +422,16 @@ impl_stable_hash_for!(enum ::syntax_pos::FileName {
     Anon,
     MacroExpansion,
     ProcMacroSourceCode,
+    CliCrateAttr,
     CfgSpec,
     Custom(s)
 });
 
-impl<'a> HashStable<StableHashingContext<'a>> for FileMap {
+impl<'a> HashStable<StableHashingContext<'a>> for SourceFile {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        let FileMap {
+        let SourceFile {
             name: _, // We hash the smaller name_hash instead of this
             name_hash,
             name_was_remapped,
@@ -418,55 +458,49 @@ impl<'a> HashStable<StableHashingContext<'a>> for FileMap {
 
         src_hash.hash_stable(hcx, hasher);
 
-        // We only hash the relative position within this filemap
-        lines.with_lock(|lines| {
-            lines.len().hash_stable(hcx, hasher);
-            for &line in lines.iter() {
-                stable_byte_pos(line, start_pos).hash_stable(hcx, hasher);
-            }
-        });
+        // We only hash the relative position within this source_file
+        lines.len().hash_stable(hcx, hasher);
+        for &line in lines.iter() {
+            stable_byte_pos(line, start_pos).hash_stable(hcx, hasher);
+        }
 
-        // We only hash the relative position within this filemap
-        multibyte_chars.with_lock(|multibyte_chars| {
-            multibyte_chars.len().hash_stable(hcx, hasher);
-            for &char_pos in multibyte_chars.iter() {
-                stable_multibyte_char(char_pos, start_pos).hash_stable(hcx, hasher);
-            }
-        });
+        // We only hash the relative position within this source_file
+        multibyte_chars.len().hash_stable(hcx, hasher);
+        for &char_pos in multibyte_chars.iter() {
+            stable_multibyte_char(char_pos, start_pos).hash_stable(hcx, hasher);
+        }
 
-        non_narrow_chars.with_lock(|non_narrow_chars| {
-            non_narrow_chars.len().hash_stable(hcx, hasher);
-            for &char_pos in non_narrow_chars.iter() {
-                stable_non_narrow_char(char_pos, start_pos).hash_stable(hcx, hasher);
-            }
-        });
+        non_narrow_chars.len().hash_stable(hcx, hasher);
+        for &char_pos in non_narrow_chars.iter() {
+            stable_non_narrow_char(char_pos, start_pos).hash_stable(hcx, hasher);
+        }
     }
 }
 
 fn stable_byte_pos(pos: ::syntax_pos::BytePos,
-                   filemap_start: ::syntax_pos::BytePos)
+                   source_file_start: ::syntax_pos::BytePos)
                    -> u32 {
-    pos.0 - filemap_start.0
+    pos.0 - source_file_start.0
 }
 
 fn stable_multibyte_char(mbc: ::syntax_pos::MultiByteChar,
-                         filemap_start: ::syntax_pos::BytePos)
+                         source_file_start: ::syntax_pos::BytePos)
                          -> (u32, u32) {
     let ::syntax_pos::MultiByteChar {
         pos,
         bytes,
     } = mbc;
 
-    (pos.0 - filemap_start.0, bytes as u32)
+    (pos.0 - source_file_start.0, bytes as u32)
 }
 
 fn stable_non_narrow_char(swc: ::syntax_pos::NonNarrowChar,
-                          filemap_start: ::syntax_pos::BytePos)
+                          source_file_start: ::syntax_pos::BytePos)
                           -> (u32, u32) {
     let pos = swc.pos();
     let width = swc.width();
 
-    (pos.0 - filemap_start.0, width as u32)
+    (pos.0 - source_file_start.0, width as u32)
 }
 
 
@@ -477,7 +511,7 @@ impl<'gcx> HashStable<StableHashingContext<'gcx>> for feature_gate::Features {
                                           hasher: &mut StableHasher<W>) {
         // Unfortunately we cannot exhaustively list fields here, since the
         // struct is macro generated.
-        self.declared_stable_lang_features.hash_stable(hcx, hasher);
+        self.declared_lang_features.hash_stable(hcx, hasher);
         self.declared_lib_features.hash_stable(hcx, hasher);
 
         self.walk_feature_fields(|feature_name, value| {

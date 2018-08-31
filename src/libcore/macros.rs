@@ -396,6 +396,7 @@ macro_rules! write {
 /// ```
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[allow_internal_unstable]
 macro_rules! writeln {
     ($dst:expr) => (
         write!($dst, "\n")
@@ -403,11 +404,8 @@ macro_rules! writeln {
     ($dst:expr,) => (
         writeln!($dst)
     );
-    ($dst:expr, $fmt:expr) => (
-        write!($dst, concat!($fmt, "\n"))
-    );
-    ($dst:expr, $fmt:expr, $($arg:tt)*) => (
-        write!($dst, concat!($fmt, "\n"), $($arg)*)
+    ($dst:expr, $($arg:tt)*) => (
+        $dst.write_fmt(format_args_nl!($($arg)*))
     );
 }
 
@@ -421,13 +419,13 @@ macro_rules! writeln {
 /// * Iterators that dynamically terminate.
 ///
 /// If the determination that the code is unreachable proves incorrect, the
-/// program immediately terminates with a [`panic!`].  The function [`unreachable`],
-/// which belongs to the [`std::intrinsics`] module, informs the compilier to
+/// program immediately terminates with a [`panic!`].  The function [`unreachable_unchecked`],
+/// which belongs to the [`std::hint`] module, informs the compilier to
 /// optimize the code out of the release version entirely.
 ///
 /// [`panic!`]:  ../std/macro.panic.html
-/// [`unreachable`]: ../std/intrinsics/fn.unreachable.html
-/// [`std::intrinsics`]: ../std/intrinsics/index.html
+/// [`unreachable_unchecked`]: ../std/hint/fn.unreachable_unchecked.html
+/// [`std::hint`]: ../std/hint/index.html
 ///
 /// # Panics
 ///
@@ -543,6 +541,7 @@ macro_rules! unimplemented {
 /// into libsyntax itself.
 ///
 /// For more information, see documentation for `std`'s macros.
+#[cfg(dox)]
 mod builtin {
 
     /// Unconditionally causes compilation to fail with the given error message when encountered.
@@ -551,8 +550,7 @@ mod builtin {
     ///
     /// [`std::compile_error!`]: ../std/macro.compile_error.html
     #[stable(feature = "compile_error_macro", since = "1.20.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! compile_error {
         ($msg:expr) => ({ /* compiler built-in */ });
         ($msg:expr,) => ({ /* compiler built-in */ });
@@ -564,8 +562,7 @@ mod builtin {
     ///
     /// [`std::format_args!`]: ../std/macro.format_args.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! format_args {
         ($fmt:expr) => ({ /* compiler built-in */ });
         ($fmt:expr, $($args:tt)*) => ({ /* compiler built-in */ });
@@ -577,8 +574,7 @@ mod builtin {
     ///
     /// [`std::env!`]: ../std/macro.env.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! env {
         ($name:expr) => ({ /* compiler built-in */ });
         ($name:expr,) => ({ /* compiler built-in */ });
@@ -590,8 +586,7 @@ mod builtin {
     ///
     /// [`std::option_env!`]: ../std/macro.option_env.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! option_env {
         ($name:expr) => ({ /* compiler built-in */ });
         ($name:expr,) => ({ /* compiler built-in */ });
@@ -603,11 +598,10 @@ mod builtin {
     ///
     /// [`std::concat_idents!`]: ../std/macro.concat_idents.html
     #[unstable(feature = "concat_idents_macro", issue = "29599")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! concat_idents {
-        ($($e:ident),*) => ({ /* compiler built-in */ });
-        ($($e:ident,)*) => ({ /* compiler built-in */ });
+        ($($e:ident),+) => ({ /* compiler built-in */ });
+        ($($e:ident,)+) => ({ /* compiler built-in */ });
     }
 
     /// Concatenates literals into a static string slice.
@@ -616,8 +610,7 @@ mod builtin {
     ///
     /// [`std::concat!`]: ../std/macro.concat.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! concat {
         ($($e:expr),*) => ({ /* compiler built-in */ });
         ($($e:expr,)*) => ({ /* compiler built-in */ });
@@ -629,8 +622,7 @@ mod builtin {
     ///
     /// [`std::line!`]: ../std/macro.line.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! line { () => ({ /* compiler built-in */ }) }
 
     /// A macro which expands to the column number on which it was invoked.
@@ -639,8 +631,7 @@ mod builtin {
     ///
     /// [`std::column!`]: ../std/macro.column.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! column { () => ({ /* compiler built-in */ }) }
 
     /// A macro which expands to the file name from which it was invoked.
@@ -649,8 +640,7 @@ mod builtin {
     ///
     /// [`std::file!`]: ../std/macro.file.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! file { () => ({ /* compiler built-in */ }) }
 
     /// A macro which stringifies its arguments.
@@ -659,8 +649,7 @@ mod builtin {
     ///
     /// [`std::stringify!`]: ../std/macro.stringify.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! stringify { ($($t:tt)*) => ({ /* compiler built-in */ }) }
 
     /// Includes a utf8-encoded file as a string.
@@ -669,8 +658,7 @@ mod builtin {
     ///
     /// [`std::include_str!`]: ../std/macro.include_str.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! include_str {
         ($file:expr) => ({ /* compiler built-in */ });
         ($file:expr,) => ({ /* compiler built-in */ });
@@ -682,8 +670,7 @@ mod builtin {
     ///
     /// [`std::include_bytes!`]: ../std/macro.include_bytes.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! include_bytes {
         ($file:expr) => ({ /* compiler built-in */ });
         ($file:expr,) => ({ /* compiler built-in */ });
@@ -695,8 +682,7 @@ mod builtin {
     ///
     /// [`std::module_path!`]: ../std/macro.module_path.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! module_path { () => ({ /* compiler built-in */ }) }
 
     /// Boolean evaluation of configuration flags, at compile-time.
@@ -705,8 +691,7 @@ mod builtin {
     ///
     /// [`std::cfg!`]: ../std/macro.cfg.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! cfg { ($($cfg:tt)*) => ({ /* compiler built-in */ }) }
 
     /// Parse a file as an expression or an item according to the context.
@@ -715,8 +700,7 @@ mod builtin {
     ///
     /// [`std::include!`]: ../std/macro.include.html
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[macro_export]
-    #[cfg(dox)]
+    #[rustc_doc_only_macro]
     macro_rules! include {
         ($file:expr) => ({ /* compiler built-in */ });
         ($file:expr,) => ({ /* compiler built-in */ });
@@ -727,9 +711,8 @@ mod builtin {
     /// For more information, see the documentation for [`std::assert!`].
     ///
     /// [`std::assert!`]: ../std/macro.assert.html
-    #[macro_export]
+    #[rustc_doc_only_macro]
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[cfg(dox)]
     macro_rules! assert {
         ($cond:expr) => ({ /* compiler built-in */ });
         ($cond:expr,) => ({ /* compiler built-in */ });

@@ -39,7 +39,7 @@ pub struct TransitiveRelation<T: Clone + Debug + Eq + Hash> {
     // are added with new elements. Perhaps better would be to ask the
     // user for a batch of edges to minimize this effect, but I
     // already wrote the code this way. :P -nmatsakis
-    closure: Lock<Option<BitMatrix>>,
+    closure: Lock<Option<BitMatrix<usize, usize>>>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, RustcEncodable, RustcDecodable, Debug)]
@@ -77,7 +77,7 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
             ..
         } = self;
 
-        map.entry(a.clone())
+        *map.entry(a.clone())
            .or_insert_with(|| {
                elements.push(a);
 
@@ -86,7 +86,6 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
 
                Index(elements.len() - 1)
            })
-           .clone()
     }
 
     /// Applies the (partial) function to each edge and returns a new
@@ -98,14 +97,7 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
     {
         let mut result = TransitiveRelation::new();
         for edge in &self.edges {
-            let r = f(&self.elements[edge.source.0]).and_then(|source| {
-                f(&self.elements[edge.target.0]).and_then(|target| {
-                    Some(result.add(source, target))
-                })
-            });
-            if r.is_none() {
-                return None;
-            }
+            result.add(f(&self.elements[edge.source.0])?, f(&self.elements[edge.target.0])?);
         }
         Some(result)
     }
@@ -354,7 +346,7 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
     }
 
     fn with_closure<OP, R>(&self, op: OP) -> R
-        where OP: FnOnce(&BitMatrix) -> R
+        where OP: FnOnce(&BitMatrix<usize, usize>) -> R
     {
         let mut closure_cell = self.closure.borrow_mut();
         let mut closure = closure_cell.take();
@@ -366,13 +358,13 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
         result
     }
 
-    fn compute_closure(&self) -> BitMatrix {
+    fn compute_closure(&self) -> BitMatrix<usize, usize> {
         let mut matrix = BitMatrix::new(self.elements.len(),
                                         self.elements.len());
         let mut changed = true;
         while changed {
             changed = false;
-            for edge in self.edges.iter() {
+            for edge in &self.edges {
                 // add an edge from S -> T
                 changed |= matrix.add(edge.source.0, edge.target.0);
 
@@ -396,7 +388,7 @@ impl<T: Clone + Debug + Eq + Hash> TransitiveRelation<T> {
 /// - Input: `[a, b, x]`. Output: `[a, x]`.
 /// - Input: `[b, a, x]`. Output: `[b, a, x]`.
 /// - Input: `[a, x, b, y]`. Output: `[a, x]`.
-fn pare_down(candidates: &mut Vec<usize>, closure: &BitMatrix) {
+fn pare_down(candidates: &mut Vec<usize>, closure: &BitMatrix<usize, usize>) {
     let mut i = 0;
     while i < candidates.len() {
         let candidate_i = candidates[i];

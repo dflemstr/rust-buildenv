@@ -8,17 +8,26 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// ignore-tidy-linelength
-// min-llvm-version 4.0
-
 // compile-flags: -g -C no-prepopulate-passes
+// ignore-tidy-linelength
 
-// CHECK: {{.*}}DISubprogram{{.*}}name: "foo"{{.*}}DIFlagNoReturn
+#![crate_type = "lib"]
 
-fn foo() -> ! {
+#[no_mangle]
+pub fn foo() -> ! {
+// CHECK: @foo() unnamed_addr #0
     loop {}
 }
 
-pub fn main() {
-    foo();
+pub enum EmptyEnum {}
+
+#[no_mangle]
+pub fn bar() -> EmptyEnum {
+// CHECK: @bar() unnamed_addr #0
+    loop {}
 }
+
+// CHECK: attributes #0 = {{{.*}} noreturn {{.*}}}
+
+// CHECK: DISubprogram(name: "foo", {{.*}} DIFlagNoReturn
+// CHECK: DISubprogram(name: "bar", {{.*}} DIFlagNoReturn

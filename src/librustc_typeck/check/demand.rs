@@ -8,8 +8,6 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::iter;
-
 use check::FnCtxt;
 use rustc::infer::InferOk;
 use rustc::traits::ObligationCause;
@@ -19,11 +17,11 @@ use syntax::util::parser::PREC_POSTFIX;
 use syntax_pos::Span;
 use rustc::hir;
 use rustc::hir::def::Def;
-use rustc::hir::map::NodeItem;
-use rustc::hir::{Item, ItemConst, print};
+use rustc::hir::Node;
+use rustc::hir::{Item, ItemKind, print};
 use rustc::ty::{self, Ty, AssociatedItem};
 use rustc::ty::adjustment::AllowTwoPhase;
-use errors::{DiagnosticBuilder, CodeMapper};
+use errors::{Applicability, DiagnosticBuilder, SourceMapper};
 
 use super::method::probe;
 
@@ -116,7 +114,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         // If the expected type is an enum with any variants whose sole
         // field is of the found type, suggest such variants. See Issue
         // #42764.
-        if let ty::TyAdt(expected_adt, substs) = expected.sty {
+        if let ty::Adt(expected_adt, substs) = expected.sty {
             let mut compatible_variants = vec![];
             for variant in &expected_adt.variants {
                 if variant.fields.len() == 1 {
@@ -140,25 +138,12 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
             }
         }
 
-        if let Some((msg, suggestion)) = self.check_ref(expr, checked_ty, expected) {
-            err.span_suggestion(expr.span, msg, suggestion);
-        } else if !self.check_for_cast(&mut err, expr, expr_ty, expected) {
-            let methods = self.get_conversion_methods(expr.span, expected, checked_ty);
-            if let Ok(expr_text) = self.tcx.sess.codemap().span_to_snippet(expr.span) {
-                let suggestions = iter::repeat(expr_text).zip(methods.iter())
-                    .map(|(receiver, method)| format!("{}.{}()", receiver, method.name))
-                    .collect::<Vec<_>>();
-                if !suggestions.is_empty() {
-                    err.span_suggestions(expr.span,
-                                         "try using a conversion method",
-                                         suggestions);
-                }
-            }
-        }
+        self.suggest_ref_or_into(&mut err, expr, expected, expr_ty);
+
         (expected, Some(err))
     }
 
-    fn get_conversion_methods(&self, span: Span, expected: Ty<'tcx>, checked_ty: Ty<'tcx>)
+    pub fn get_conversion_methods(&self, span: Span, expected: Ty<'tcx>, checked_ty: Ty<'tcx>)
                               -> Vec<AssociatedItem> {
         let mut methods = self.probe_for_return_type(span,
                                                      probe::Mode::MethodCall,
@@ -194,6 +179,57 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
+    /// Identify some cases where `as_ref()` would be appropriate and suggest it.
+    ///
+    /// Given the following code:
+    /// ```
+    /// struct Foo;
+    /// fn takes_ref(_: &Foo) {}
+    /// let ref opt = Some(Foo);
+    ///
+    /// opt.map(|arg| takes_ref(arg));
+    /// ```
+    /// Suggest using `opt.as_ref().map(|arg| takes_ref(arg));` instead.
+    ///
+    /// It only checks for `Option` and `Result` and won't work with
+    /// ```
+    /// opt.map(|arg| { takes_ref(arg) });
+    /// ```
+    fn can_use_as_ref(&self, expr: &hir::Expr) -> Option<(Span, &'static str, String)> {
+        if let hir::ExprKind::Path(hir::QPath::Resolved(_, ref path)) = expr.node {
+            if let hir::def::Def::Local(id) = path.def {
+                let parent = self.tcx.hir.get_parent_node(id);
+                if let Some(Node::Expr(hir::Expr {
+                    id,
+                    node: hir::ExprKind::Closure(_, decl, ..),
+                    ..
+                })) = self.tcx.hir.find(parent) {
+                    let parent = self.tcx.hir.get_parent_node(*id);
+                    if let (Some(Node::Expr(hir::Expr {
+                        node: hir::ExprKind::MethodCall(path, span, expr),
+                        ..
+                    })), 1) = (self.tcx.hir.find(parent), decl.inputs.len()) {
+                        let self_ty = self.tables.borrow().node_id_to_type(expr[0].hir_id);
+                        let self_ty = format!("{:?}", self_ty);
+                        let name = path.ident.as_str();
+                        let is_as_ref_able = (
+                            self_ty.starts_with("&std::option::Option") ||
+                            self_ty.starts_with("&std::result::Result") ||
+                            self_ty.starts_with("std::option::Option") ||
+                            self_ty.starts_with("std::result::Result")
+                        ) && (name == "map" || name == "and_then");
+                        if is_as_ref_able {
+                            return Some((span.shrink_to_lo(),
+                                         "consider using `as_ref` instead",
+                                         "as_ref().".into()));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// This function is used to determine potential "simple" improvements or users' errors and
     /// provide them useful help. For example:
     ///
@@ -210,38 +246,47 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
     /// In addition of this check, it also checks between references mutability state. If the
     /// expected is mutable but the provided isn't, maybe we could just say "Hey, try with
     /// `&mut`!".
-    fn check_ref(&self,
+    pub fn check_ref(&self,
                  expr: &hir::Expr,
                  checked_ty: Ty<'tcx>,
                  expected: Ty<'tcx>)
-                 -> Option<(&'static str, String)> {
+                 -> Option<(Span, &'static str, String)> {
+        let cm = self.sess().source_map();
+        // Use the callsite's span if this is a macro call. #41858
+        let sp = cm.call_span_if_macro(expr.span);
+        if !cm.span_to_filename(sp).is_real() {
+            return None;
+        }
+
         match (&expected.sty, &checked_ty.sty) {
-            (&ty::TyRef(_, exp), &ty::TyRef(_, check)) => match (&exp.ty.sty, &check.ty.sty) {
-                (&ty::TyStr, &ty::TyArray(arr, _)) |
-                (&ty::TyStr, &ty::TySlice(arr)) if arr == self.tcx.types.u8 => {
-                    if let hir::ExprLit(_) = expr.node {
-                        let sp = self.sess().codemap().call_span_if_macro(expr.span);
-                        if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(sp) {
-                            return Some(("consider removing the leading `b`",
-                                         src[1..].to_string()));
+            (&ty::Ref(_, exp, _), &ty::Ref(_, check, _)) => match (&exp.sty, &check.sty) {
+                (&ty::Str, &ty::Array(arr, _)) |
+                (&ty::Str, &ty::Slice(arr)) if arr == self.tcx.types.u8 => {
+                    if let hir::ExprKind::Lit(_) = expr.node {
+                        if let Ok(src) = cm.span_to_snippet(sp) {
+                            if src.starts_with("b\"") {
+                                return Some((sp,
+                                             "consider removing the leading `b`",
+                                             src[1..].to_string()));
+                            }
                         }
                     }
-                    None
                 },
-                (&ty::TyArray(arr, _), &ty::TyStr) |
-                (&ty::TySlice(arr), &ty::TyStr) if arr == self.tcx.types.u8 => {
-                    if let hir::ExprLit(_) = expr.node {
-                        let sp = self.sess().codemap().call_span_if_macro(expr.span);
-                        if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(sp) {
-                            return Some(("consider adding a leading `b`",
-                                         format!("b{}", src)));
+                (&ty::Array(arr, _), &ty::Str) |
+                (&ty::Slice(arr), &ty::Str) if arr == self.tcx.types.u8 => {
+                    if let hir::ExprKind::Lit(_) = expr.node {
+                        if let Ok(src) = cm.span_to_snippet(sp) {
+                            if src.starts_with("\"") {
+                                return Some((sp,
+                                             "consider adding a leading `b`",
+                                             format!("b{}", src)));
+                            }
                         }
                     }
-                    None
                 }
-                _ => None,
+                _ => {}
             },
-            (&ty::TyRef(_, mutability), _) => {
+            (&ty::Ref(_, _, mutability), _) => {
                 // Check if it can work when put into a ref. For example:
                 //
                 // ```
@@ -250,7 +295,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // let x = 0u32;
                 // bar(&x); // error, expected &mut
                 // ```
-                let ref_ty = match mutability.mutbl {
+                let ref_ty = match mutability {
                     hir::Mutability::MutMutable => self.tcx.mk_mut_ref(
                                                        self.tcx.mk_region(ty::ReStatic),
                                                        checked_ty),
@@ -259,26 +304,28 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                                        checked_ty),
                 };
                 if self.can_coerce(ref_ty, expected) {
-                    // Use the callsite's span if this is a macro call. #41858
-                    let sp = self.sess().codemap().call_span_if_macro(expr.span);
-                    if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(sp) {
+                    if let Ok(src) = cm.span_to_snippet(sp) {
                         let sugg_expr = match expr.node { // parenthesize if needed (Issue #46756)
-                            hir::ExprCast(_, _) | hir::ExprBinary(_, _, _) => format!("({})", src),
+                            hir::ExprKind::Cast(_, _) |
+                            hir::ExprKind::Binary(_, _, _) => format!("({})", src),
                             _ => src,
                         };
-                        return Some(match mutability.mutbl {
+                        if let Some(sugg) = self.can_use_as_ref(expr) {
+                            return Some(sugg);
+                        }
+                        return Some(match mutability {
                             hir::Mutability::MutMutable => {
-                                ("consider mutably borrowing here", format!("&mut {}", sugg_expr))
+                                (sp, "consider mutably borrowing here", format!("&mut {}",
+                                                                                sugg_expr))
                             }
                             hir::Mutability::MutImmutable => {
-                                ("consider borrowing here", format!("&{}", sugg_expr))
+                                (sp, "consider borrowing here", format!("&{}", sugg_expr))
                             }
                         });
                     }
                 }
-                None
             }
-            (_, &ty::TyRef(_, checked)) => {
+            (_, &ty::Ref(_, checked, _)) => {
                 // We have `&T`, check if what was expected was `T`. If so,
                 // we may want to suggest adding a `*`, or removing
                 // a `&`.
@@ -286,37 +333,44 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                 // (But, also check check the `expn_info()` to see if this is
                 // a macro; if so, it's hard to extract the text and make a good
                 // suggestion, so don't bother.)
-                if self.infcx.can_sub(self.param_env, checked.ty, &expected).is_ok() &&
-                   expr.span.ctxt().outer().expn_info().is_none() {
+                if self.infcx.can_sub(self.param_env, checked, &expected).is_ok() &&
+                   sp.ctxt().outer().expn_info().is_none() {
                     match expr.node {
                         // Maybe remove `&`?
-                        hir::ExprAddrOf(_, ref expr) => {
-                            if let Ok(code) = self.tcx.sess.codemap().span_to_snippet(expr.span) {
-                                return Some(("consider removing the borrow", code));
+                        hir::ExprKind::AddrOf(_, ref expr) => {
+                            if !cm.span_to_filename(expr.span).is_real() {
+                                return None;
+                            }
+                            if let Ok(code) = cm.span_to_snippet(expr.span) {
+                                return Some((sp, "consider removing the borrow", code));
                             }
                         }
 
                         // Maybe add `*`? Only if `T: Copy`.
                         _ => {
                             if !self.infcx.type_moves_by_default(self.param_env,
-                                                                checked.ty,
-                                                                expr.span) {
-                                let sp = self.sess().codemap().call_span_if_macro(expr.span);
-                                if let Ok(code) = self.tcx.sess.codemap().span_to_snippet(sp) {
-                                    return Some(("consider dereferencing the borrow",
-                                                 format!("*{}", code)));
+                                                                checked,
+                                                                sp) {
+                                // do not suggest if the span comes from a macro (#52783)
+                                if let (Ok(code),
+                                        true) = (cm.span_to_snippet(sp), sp == expr.span) {
+                                    return Some((
+                                        sp,
+                                        "consider dereferencing the borrow",
+                                        format!("*{}", code),
+                                    ));
                                 }
                             }
                         }
                     }
                 }
-                None
             }
-            _ => None,
+            _ => {}
         }
+        None
     }
 
-    fn check_for_cast(&self,
+    pub fn check_for_cast(&self,
                       err: &mut DiagnosticBuilder<'tcx>,
                       expr: &hir::Expr,
                       checked_ty: Ty<'tcx>,
@@ -326,7 +380,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
         match self.tcx.hir.find(parent_id) {
             Some(parent) => {
                 // Shouldn't suggest `.into()` on `const`s.
-                if let NodeItem(Item { node: ItemConst(_, _), .. }) = parent {
+                if let Node::Item(Item { node: ItemKind::Const(_, _), .. }) = parent {
                     // FIXME(estebank): modify once we decide to suggest `as` casts
                     return false;
                 }
@@ -354,7 +408,7 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
 
         let needs_paren = expr.precedence().order() < (PREC_POSTFIX as i8);
 
-        if let Ok(src) = self.tcx.sess.codemap().span_to_snippet(expr.span) {
+        if let Ok(src) = self.tcx.sess.source_map().span_to_snippet(expr.span) {
             let msg = format!("you can cast an `{}` to `{}`", checked_ty, expected_ty);
             let cast_suggestion = format!("{}{}{} as {}",
                                           if needs_paren { "(" } else { "" },
@@ -367,189 +421,240 @@ impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
                                           if needs_paren { ")" } else { "" });
 
             match (&expected_ty.sty, &checked_ty.sty) {
-                (&ty::TyInt(ref exp), &ty::TyInt(ref found)) => {
+                (&ty::Int(ref exp), &ty::Int(ref found)) => {
                     match (found.bit_width(), exp.bit_width()) {
                         (Some(found), Some(exp)) if found > exp => {
                             if can_cast {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_truncate),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_truncate),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect // lossy conversion
+                                );
                             }
                         }
                         (None, _) | (_, None) => {
                             if can_cast {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_isize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_isize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect // lossy conversion
+                                );
                             }
                         }
                         _ => {
-                            err.span_suggestion(expr.span,
-                                                &format!("{}, which {}", msg, will_sign_extend),
-                                                into_suggestion);
+                            err.span_suggestion_with_applicability(
+                                expr.span,
+                                &format!("{}, which {}", msg, will_sign_extend),
+                                into_suggestion,
+                                Applicability::MachineApplicable
+                            );
                         }
                     }
                     true
                 }
-                (&ty::TyUint(ref exp), &ty::TyUint(ref found)) => {
+                (&ty::Uint(ref exp), &ty::Uint(ref found)) => {
                     match (found.bit_width(), exp.bit_width()) {
                         (Some(found), Some(exp)) if found > exp => {
                             if can_cast {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_truncate),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_truncate),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                         }
                         (None, _) | (_, None) => {
                             if can_cast {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_usize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_usize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                         }
                         _ => {
-                            err.span_suggestion(expr.span,
-                                                &format!("{}, which {}", msg, will_zero_extend),
-                                                into_suggestion);
+                            err.span_suggestion_with_applicability(
+                                expr.span,
+                                &format!("{}, which {}", msg, will_zero_extend),
+                                into_suggestion,
+                                Applicability::MachineApplicable
+                            );
                         }
                     }
                     true
                 }
-                (&ty::TyInt(ref exp), &ty::TyUint(ref found)) => {
+                (&ty::Int(ref exp), &ty::Uint(ref found)) => {
                     if can_cast {
                         match (found.bit_width(), exp.bit_width()) {
                             (Some(found), Some(exp)) if found > exp - 1 => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_truncate),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_truncate),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             (None, None) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_truncate),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_truncate),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             (None, _) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_isize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_isize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             (_, None) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_usize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_usize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             _ => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_zero_extend),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_zero_extend),
+                                    cast_suggestion,
+                                    Applicability::MachineApplicable
+                                );
                             }
                         }
                     }
                     true
                 }
-                (&ty::TyUint(ref exp), &ty::TyInt(ref found)) => {
+                (&ty::Uint(ref exp), &ty::Int(ref found)) => {
                     if can_cast {
                         match (found.bit_width(), exp.bit_width()) {
                             (Some(found), Some(exp)) if found - 1 > exp => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_truncate),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_truncate),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             (None, None) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_sign_extend),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_sign_extend),
+                                    cast_suggestion,
+                                    Applicability::MachineApplicable  // lossy conversion
+                                );
                             }
                             (None, _) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_usize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_usize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             (_, None) => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}",
-                                                             msg,
-                                                             depending_on_isize),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, depending_on_isize),
+                                    cast_suggestion,
+                                    Applicability::MaybeIncorrect  // lossy conversion
+                                );
                             }
                             _ => {
-                                err.span_suggestion(expr.span,
-                                                    &format!("{}, which {}", msg, will_sign_extend),
-                                                    cast_suggestion);
+                                err.span_suggestion_with_applicability(
+                                    expr.span,
+                                    &format!("{}, which {}", msg, will_sign_extend),
+                                    cast_suggestion,
+                                    Applicability::MachineApplicable
+                                );
                             }
                         }
                     }
                     true
                 }
-                (&ty::TyFloat(ref exp), &ty::TyFloat(ref found)) => {
+                (&ty::Float(ref exp), &ty::Float(ref found)) => {
                     if found.bit_width() < exp.bit_width() {
-                        err.span_suggestion(expr.span,
-                                            &format!("{} in a lossless way",
-                                                     msg),
-                                            into_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{} in a lossless way", msg),
+                            into_suggestion,
+                            Applicability::MachineApplicable
+                        );
                     } else if can_cast {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, producing the closest possible value",
-                                                     msg),
-                                            cast_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{}, producing the closest possible value", msg),
+                            cast_suggestion,
+                            Applicability::MaybeIncorrect  // lossy conversion
+                        );
                     }
                     true
                 }
-                (&ty::TyUint(_), &ty::TyFloat(_)) | (&ty::TyInt(_), &ty::TyFloat(_)) => {
+                (&ty::Uint(_), &ty::Float(_)) | (&ty::Int(_), &ty::Float(_)) => {
                     if can_cast {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, rounding the float towards zero",
-                                                     msg),
-                                            cast_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{}, rounding the float towards zero", msg),
+                            cast_suggestion,
+                            Applicability::MaybeIncorrect  // lossy conversion
+                        );
                         err.warn("casting here will cause undefined behavior if the rounded value \
                                   cannot be represented by the target integer type, including \
                                   `Inf` and `NaN` (this is a bug and will be fixed)");
                     }
                     true
                 }
-                (&ty::TyFloat(ref exp), &ty::TyUint(ref found)) => {
+                (&ty::Float(ref exp), &ty::Uint(ref found)) => {
                     // if `found` is `None` (meaning found is `usize`), don't suggest `.into()`
                     if exp.bit_width() > found.bit_width().unwrap_or(256) {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, producing the floating point \
-                                                      representation of the integer",
-                                                      msg),
-                                            into_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{}, producing the floating point representation of the \
+                                      integer",
+                                      msg),
+                            into_suggestion,
+                            Applicability::MachineApplicable
+                        );
                     } else if can_cast {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, producing the floating point \
-                                                      representation of the integer, rounded if \
-                                                      necessary",
-                                                      msg),
-                                            cast_suggestion);
+                        err.span_suggestion_with_applicability(expr.span,
+                            &format!("{}, producing the floating point representation of the \
+                                      integer, rounded if necessary",
+                                      msg),
+                            cast_suggestion,
+                            Applicability::MaybeIncorrect  // lossy conversion
+                        );
                     }
                     true
                 }
-                (&ty::TyFloat(ref exp), &ty::TyInt(ref found)) => {
+                (&ty::Float(ref exp), &ty::Int(ref found)) => {
                     // if `found` is `None` (meaning found is `isize`), don't suggest `.into()`
                     if exp.bit_width() > found.bit_width().unwrap_or(256) {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, producing the floating point \
-                                                      representation of the integer",
-                                                      msg),
-                                            into_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{}, producing the floating point representation of the \
+                                      integer",
+                                      msg),
+                            into_suggestion,
+                            Applicability::MachineApplicable
+                        );
                     } else if can_cast {
-                        err.span_suggestion(expr.span,
-                                            &format!("{}, producing the floating point \
-                                                      representation of the integer, rounded if \
-                                                      necessary",
-                                                      msg),
-                                            cast_suggestion);
+                        err.span_suggestion_with_applicability(
+                            expr.span,
+                            &format!("{}, producing the floating point representation of the \
+                                      integer, rounded if necessary",
+                                      msg),
+                            cast_suggestion,
+                            Applicability::MaybeIncorrect  // lossy conversion
+                        );
                     }
                     true
                 }

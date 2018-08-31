@@ -59,6 +59,78 @@ pub trait FileExt {
     #[stable(feature = "file_offset", since = "1.15.0")]
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<usize>;
 
+    /// Reads the exact number of byte required to fill `buf` from the given offset.
+    ///
+    /// The offset is relative to the start of the file and thus independent
+    /// from the current cursor.
+    ///
+    /// The current file cursor is not affected by this function.
+    ///
+    /// Similar to [`Read::read_exact`] but uses [`read_at`] instead of `read`.
+    ///
+    /// [`Read::read_exact`]: ../../../../std/io/trait.Read.html#method.read_exact
+    /// [`read_at`]: #tymethod.read_at
+    ///
+    /// # Errors
+    ///
+    /// If this function encounters an error of the kind
+    /// [`ErrorKind::Interrupted`] then the error is ignored and the operation
+    /// will continue.
+    ///
+    /// If this function encounters an "end of file" before completely filling
+    /// the buffer, it returns an error of the kind [`ErrorKind::UnexpectedEof`].
+    /// The contents of `buf` are unspecified in this case.
+    ///
+    /// If any other read error is encountered then this function immediately
+    /// returns. The contents of `buf` are unspecified in this case.
+    ///
+    /// If this function returns an error, it is unspecified how many bytes it
+    /// has read, but it will never read more than would be necessary to
+    /// completely fill the buffer.
+    ///
+    /// [`ErrorKind::Interrupted`]: ../../../../std/io/enum.ErrorKind.html#variant.Interrupted
+    /// [`ErrorKind::UnexpectedEof`]: ../../../../std/io/enum.ErrorKind.html#variant.UnexpectedEof
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(rw_exact_all_at)]
+    /// use std::io;
+    /// use std::fs::File;
+    /// use std::os::unix::prelude::FileExt;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let mut buf = [0u8; 8];
+    ///     let file = File::open("foo.txt")?;
+    ///
+    ///     // We now read exactly 8 bytes from the offset 10.
+    ///     file.read_exact_at(&mut buf, 10)?;
+    ///     println!("read {} bytes: {:?}", buf.len(), buf);
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "rw_exact_all_at", issue = "51984")]
+    fn read_exact_at(&self, mut buf: &mut [u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.read_at(buf, offset) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let tmp = buf;
+                    buf = &mut tmp[n..];
+                    offset += n as u64;
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        if !buf.is_empty() {
+            Err(io::Error::new(io::ErrorKind::UnexpectedEof,
+                               "failed to fill whole buffer"))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Writes a number of bytes starting from a given offset.
     ///
     /// Returns the number of bytes written.
@@ -93,6 +165,61 @@ pub trait FileExt {
     /// ```
     #[stable(feature = "file_offset", since = "1.15.0")]
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<usize>;
+
+    /// Attempts to write an entire buffer starting from a given offset.
+    ///
+    /// The offset is relative to the start of the file and thus independent
+    /// from the current cursor.
+    ///
+    /// The current file cursor is not affected by this function.
+    ///
+    /// This method will continuously call [`write_at`] until there is no more data
+    /// to be written or an error of non-[`ErrorKind::Interrupted`] kind is
+    /// returned. This method will not return until the entire buffer has been
+    /// successfully written or such an error occurs. The first error that is
+    /// not of [`ErrorKind::Interrupted`] kind generated from this method will be
+    /// returned.
+    ///
+    /// # Errors
+    ///
+    /// This function will return the first error of
+    /// non-[`ErrorKind::Interrupted`] kind that [`write_at`] returns.
+    ///
+    /// [`ErrorKind::Interrupted`]: ../../../../std/io/enum.ErrorKind.html#variant.Interrupted
+    /// [`write_at`]: #tymethod.write_at
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// #![feature(rw_exact_all_at)]
+    /// use std::fs::File;
+    /// use std::io;
+    /// use std::os::unix::prelude::FileExt;
+    ///
+    /// fn main() -> io::Result<()> {
+    ///     let file = File::open("foo.txt")?;
+    ///
+    ///     // We now write at the offset 10.
+    ///     file.write_all_at(b"sushi", 10)?;
+    ///     Ok(())
+    /// }
+    /// ```
+    #[unstable(feature = "rw_exact_all_at", issue = "51984")]
+    fn write_all_at(&self, mut buf: &[u8], mut offset: u64) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.write_at(buf, offset) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero,
+                                                   "failed to write whole buffer")),
+                Ok(n) => {
+                    buf = &buf[n..];
+                    offset += n as u64
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
 }
 
 #[stable(feature = "file_offset", since = "1.15.0")]
@@ -105,7 +232,9 @@ impl FileExt for fs::File {
     }
 }
 
-/// Unix-specific extensions to `Permissions`
+/// Unix-specific extensions to [`fs::Permissions`].
+///
+/// [`fs::Permissions`]: ../../../../std/fs/struct.Permissions.html
 #[stable(feature = "fs_ext", since = "1.1.0")]
 pub trait PermissionsExt {
     /// Returns the underlying raw `st_mode` bits that contain the standard
@@ -180,7 +309,9 @@ impl PermissionsExt for Permissions {
     }
 }
 
-/// Unix-specific extensions to `OpenOptions`
+/// Unix-specific extensions to [`fs::OpenOptions`].
+///
+/// [`fs::OpenOptions`]: ../../../../std/fs/struct.OpenOptions.html
 #[stable(feature = "fs_ext", since = "1.1.0")]
 pub trait OpenOptionsExt {
     /// Sets the mode bits that a new file will be created with.
@@ -246,13 +377,9 @@ impl OpenOptionsExt for OpenOptions {
     }
 }
 
-// Hm, why are there casts here to the returned type, shouldn't the types always
-// be the same? Right you are! Turns out, however, on android at least the types
-// in the raw `stat` structure are not the same as the types being returned. Who
-// knew!
-//
-// As a result to make sure this compiles for all platforms we do the manual
-// casts and rely on manual lowering to `stat` if the raw type is desired.
+/// Unix-specific extensions to [`fs::Metadata`].
+///
+/// [`fs::Metadata`]: ../../../../std/fs/struct.Metadata.html
 #[stable(feature = "metadata_ext", since = "1.1.0")]
 pub trait MetadataExt {
     /// Returns the ID of the device containing the file.
@@ -555,7 +682,12 @@ impl MetadataExt for fs::Metadata {
     fn blocks(&self) -> u64 { self.st_blocks() }
 }
 
-/// Add support for special unix types (block/char device, fifo and socket).
+/// Unix-specific extensions for [`FileType`].
+///
+/// Adds support for special Unix file types such as block/character devices,
+/// pipes, and sockets.
+///
+/// [`FileType`]: ../../../../std/fs/struct.FileType.html
 #[stable(feature = "file_type_ext", since = "1.5.0")]
 pub trait FileTypeExt {
     /// Returns whether this file type is a block device.
@@ -701,10 +833,10 @@ pub fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(src: P, dst: Q) -> io::Result<()>
     sys::fs::symlink(src.as_ref(), dst.as_ref())
 }
 
-#[stable(feature = "dir_builder", since = "1.6.0")]
-/// An extension trait for [`fs::DirBuilder`] for unix-specific options.
+/// Unix-specific extensions to [`fs::DirBuilder`].
 ///
 /// [`fs::DirBuilder`]: ../../../../std/fs/struct.DirBuilder.html
+#[stable(feature = "dir_builder", since = "1.6.0")]
 pub trait DirBuilderExt {
     /// Sets the mode to create new directories with. This option defaults to
     /// 0o777.

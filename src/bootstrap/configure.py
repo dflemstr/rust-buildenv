@@ -47,7 +47,7 @@ o("optimize-tests", "rust.optimize-tests", "build tests with optimizations")
 o("experimental-parallel-queries", "rust.experimental-parallel-queries", "build rustc with experimental parallelization")
 o("test-miri", "rust.test-miri", "run miri's test suite")
 o("debuginfo-tests", "rust.debuginfo-tests", "build tests with debugger metadata")
-o("quiet-tests", "rust.quiet-tests", "enable quieter output when running tests")
+o("verbose-tests", "rust.verbose-tests", "enable verbose output when running tests")
 o("ccache", "llvm.ccache", "invoke gcc/clang via ccache to reuse object files between builds")
 o("sccache", None, "invoke gcc/clang via sccache to reuse object files between builds")
 o("local-rust", None, "use an installed rustc rather than downloading a snapshot")
@@ -68,6 +68,7 @@ o("cargo-openssl-static", "build.openssl-static", "static openssl in cargo")
 o("profiler", "build.profiler", "build the profiler runtime")
 o("emscripten", None, "compile the emscripten backend as well as LLVM")
 o("full-tools", None, "enable all tools")
+o("lldb", "rust.lldb", "build lldb")
 
 # Optimization and debugging options. These may be overridden by the release
 # channel, etc.
@@ -120,6 +121,8 @@ v("musl-root-arm", "target.arm-unknown-linux-musleabi.musl-root",
   "arm-unknown-linux-musleabi install directory")
 v("musl-root-armhf", "target.arm-unknown-linux-musleabihf.musl-root",
   "arm-unknown-linux-musleabihf install directory")
+v("musl-root-armv5te", "target.armv5te-unknown-linux-musleabi.musl-root",
+  "armv5te-unknown-linux-musleabi install directory")
 v("musl-root-armv7", "target.armv7-unknown-linux-musleabihf.musl-root",
   "armv7-unknown-linux-musleabihf install directory")
 v("musl-root-aarch64", "target.aarch64-unknown-linux-musl.musl-root",
@@ -333,6 +336,7 @@ for key in known_args:
     elif option.name == 'full-tools':
         set('rust.codegen-backends', ['llvm', 'emscripten'])
         set('rust.lld', True)
+        set('rust.llvm-tools', True)
         set('build.extended', True)
     elif option.name == 'option-checking':
         # this was handled above
@@ -347,7 +351,7 @@ set('build.configure-args', sys.argv[1:])
 # all the various comments and whatnot.
 #
 # Note that the `target` section is handled separately as we'll duplicate it
-# per configure dtarget, so there's a bit of special handling for that here.
+# per configured target, so there's a bit of special handling for that here.
 sections = {}
 cur_section = None
 sections[None] = []
@@ -429,7 +433,7 @@ for section_key in config:
 # order that we read it in.
 p("")
 p("writing `config.toml` in current directory")
-with open('config.toml', 'w') as f:
+with bootstrap.output('config.toml') as f:
     for section in section_order:
         if section == 'target':
             for target in targets:
@@ -439,7 +443,7 @@ with open('config.toml', 'w') as f:
             for line in sections[section]:
                 f.write(line + "\n")
 
-with open('Makefile', 'w') as f:
+with bootstrap.output('Makefile') as f:
     contents = os.path.join(rust_dir, 'src', 'bootstrap', 'mk', 'Makefile.in')
     contents = open(contents).read()
     contents = contents.replace("$(CFG_SRC_DIR)", rust_dir + '/')

@@ -11,16 +11,14 @@
 use rustc::hir;
 use rustc::hir::def_id::DefId;
 use rustc::infer;
-use rustc::middle::const_val::ConstVal;
 use rustc::mir::*;
-use rustc::ty::{self, Ty, TyCtxt};
-use rustc::ty::subst::{Kind, Subst, Substs};
-use rustc::ty::maps::Providers;
-use rustc::mir::interpret::{Value, PrimVal};
+use rustc::ty::{self, Ty, TyCtxt, GenericParamDefKind};
+use rustc::ty::subst::{Subst, Substs};
+use rustc::ty::query::Providers;
 
 use rustc_data_structures::indexed_vec::{IndexVec, Idx};
 
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 use syntax::ast;
 use syntax_pos::Span;
 
@@ -71,8 +69,8 @@ fn make_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             )
         }
         ty::InstanceDef::Virtual(def_id, _) => {
-            // We are translating a call back to our def-id, which
-            // trans::mir knows to turn to an actual virtual call.
+            // We are generating a call back to our def-id, which the
+            // codegen backend knows to turn to an actual virtual call.
             build_call_shim(
                 tcx,
                 def_id,
@@ -140,12 +138,13 @@ enum CallKind {
 }
 
 fn temp_decl(mutability: Mutability, ty: Ty, span: Span) -> LocalDecl {
+    let source_info = SourceInfo { scope: OUTERMOST_SOURCE_SCOPE, span };
     LocalDecl {
         mutability, ty, name: None,
-        source_info: SourceInfo { scope: ARGUMENT_VISIBILITY_SCOPE, span },
-        syntactic_scope: ARGUMENT_VISIBILITY_SCOPE,
+        source_info,
+        visibility_scope: source_info.scope,
         internal: false,
-        is_user_variable: false
+        is_user_variable: None,
     }
 }
 
@@ -166,13 +165,13 @@ fn build_drop_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     debug!("build_drop_shim(def_id={:?}, ty={:?})", def_id, ty);
 
     // Check if this is a generator, if so, return the drop glue for it
-    if let Some(&ty::TyS { sty: ty::TyGenerator(gen_def_id, substs, _), .. }) = ty {
+    if let Some(&ty::TyS { sty: ty::Generator(gen_def_id, substs, _), .. }) = ty {
         let mir = &**tcx.optimized_mir(gen_def_id).generator_drop.as_ref().unwrap();
         return mir.subst(tcx, substs.substs);
     }
 
     let substs = if let Some(ty) = ty {
-        tcx.mk_substs(iter::once(Kind::from(ty)))
+        tcx.intern_substs(&[ty.into()])
     } else {
         Substs::identity_for_item(tcx, def_id)
     };
@@ -180,7 +179,7 @@ fn build_drop_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let sig = tcx.erase_late_bound_regions(&sig);
     let span = tcx.def_span(def_id);
 
-    let source_info = SourceInfo { span, scope: ARGUMENT_VISIBILITY_SCOPE };
+    let source_info = SourceInfo { span, scope: OUTERMOST_SOURCE_SCOPE };
 
     let return_block = BasicBlock::new(1);
     let mut blocks = IndexVec::new();
@@ -197,7 +196,7 @@ fn build_drop_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mut mir = Mir::new(
         blocks,
         IndexVec::from_elem_n(
-            VisibilityScopeData { span: span, parent_scope: None }, 1
+            SourceScopeData { span: span, parent_scope: None }, 1
         ),
         ClearCrossCrate::Clear,
         IndexVec::new(),
@@ -210,7 +209,7 @@ fn build_drop_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     if let Some(..) = ty {
         let patch = {
-            let param_env = tcx.param_env(def_id);
+            let param_env = tcx.param_env(def_id).with_reveal_all();
             let mut elaborator = DropShimElaborator {
                 mir: &mir,
                 patch: MirPatch::new(&mir),
@@ -302,17 +301,17 @@ fn build_clone_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     match self_ty.sty {
         _ if is_copy => builder.copy_shim(),
-        ty::TyArray(ty, len) => {
-            let len = len.val.unwrap_u64();
+        ty::Array(ty, len) => {
+            let len = len.unwrap_usize(tcx);
             builder.array_shim(dest, src, ty, len)
         }
-        ty::TyClosure(def_id, substs) => {
+        ty::Closure(def_id, substs) => {
             builder.tuple_like_shim(
                 dest, src,
                 substs.upvar_tys(def_id, tcx)
             )
         }
-        ty::TyTuple(tys) => builder.tuple_like_shim(dest, src, tys.iter().cloned()),
+        ty::Tuple(tys) => builder.tuple_like_shim(dest, src, tys.iter().cloned()),
         _ => {
             bug!("clone shim for `{:?}` which is not `Copy` and is not an aggregate", self_ty)
         }
@@ -356,7 +355,7 @@ impl<'a, 'tcx> CloneShimBuilder<'a, 'tcx> {
         Mir::new(
             self.blocks,
             IndexVec::from_elem_n(
-                VisibilityScopeData { span: self.span, parent_scope: None }, 1
+                SourceScopeData { span: self.span, parent_scope: None }, 1
             ),
             ClearCrossCrate::Clear,
             IndexVec::new(),
@@ -369,7 +368,7 @@ impl<'a, 'tcx> CloneShimBuilder<'a, 'tcx> {
     }
 
     fn source_info(&self) -> SourceInfo {
-        SourceInfo { span: self.span, scope: ARGUMENT_VISIBILITY_SCOPE }
+        SourceInfo { span: self.span, scope: OUTERMOST_SOURCE_SCOPE }
     }
 
     fn block(
@@ -429,25 +428,20 @@ impl<'a, 'tcx> CloneShimBuilder<'a, 'tcx> {
     ) {
         let tcx = self.tcx;
 
-        let substs = Substs::for_item(
-            tcx,
-            self.def_id,
-            |_, _| tcx.types.re_erased,
-            |_, _| ty
-        );
+        let substs = Substs::for_item(tcx, self.def_id, |param, _| {
+            match param.kind {
+                GenericParamDefKind::Lifetime => tcx.types.re_erased.into(),
+                GenericParamDefKind::Type {..} => ty.into(),
+            }
+        });
 
         // `func == Clone::clone(&ty) -> ty`
         let func_ty = tcx.mk_fn_def(self.def_id, substs);
         let func = Operand::Constant(box Constant {
             span: self.span,
             ty: func_ty,
-            literal: Literal::Value {
-                value: tcx.mk_const(ty::Const {
-                    // ZST function type
-                    val: ConstVal::Value(Value::ByVal(PrimVal::Undef)),
-                    ty: func_ty
-                }),
-            },
+            user_ty: None,
+            literal: ty::Const::zero_sized(self.tcx, func_ty),
         });
 
         let ref_loc = self.make_place(
@@ -505,12 +499,8 @@ impl<'a, 'tcx> CloneShimBuilder<'a, 'tcx> {
         box Constant {
             span: self.span,
             ty: self.tcx.types.usize,
-            literal: Literal::Value {
-                value: self.tcx.mk_const(ty::Const {
-                    val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(value.into()))),
-                    ty: self.tcx.types.usize,
-                })
-            }
+            user_ty: None,
+            literal: ty::Const::from_usize(self.tcx, value),
         }
     }
 
@@ -697,7 +687,7 @@ fn build_call_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     debug!("build_call_shim: sig={:?}", sig);
 
     let mut local_decls = local_decls_for_sig(&sig, span);
-    let source_info = SourceInfo { span, scope: ARGUMENT_VISIBILITY_SCOPE };
+    let source_info = SourceInfo { span, scope: OUTERMOST_SOURCE_SCOPE };
 
     let rcvr_arg = Local::new(1+0);
     let rcvr_l = Place::Local(rcvr_arg);
@@ -737,13 +727,8 @@ fn build_call_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
             (Operand::Constant(box Constant {
                 span,
                 ty,
-                literal: Literal::Value {
-                    value: tcx.mk_const(ty::Const {
-                        // ZST function type
-                        val: ConstVal::Value(Value::ByVal(PrimVal::Undef)),
-                        ty
-                    }),
-                },
+                user_ty: None,
+                literal: ty::Const::zero_sized(tcx, ty),
              }),
              vec![rcvr])
         }
@@ -807,7 +792,7 @@ fn build_call_shim<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     let mut mir = Mir::new(
         blocks,
         IndexVec::from_elem_n(
-            VisibilityScopeData { span: span, parent_scope: None }, 1
+            SourceScopeData { span: span, parent_scope: None }, 1
         ),
         ClearCrossCrate::Clear,
         IndexVec::new(),
@@ -839,7 +824,7 @@ pub fn build_adt_ctor<'a, 'gcx, 'tcx>(infcx: &infer::InferCtxt<'a, 'gcx, 'tcx>,
     let sig = gcx.normalize_erasing_regions(param_env, sig);
 
     let (adt_def, substs) = match sig.output().sty {
-        ty::TyAdt(adt_def, substs) => (adt_def, substs),
+        ty::Adt(adt_def, substs) => (adt_def, substs),
         _ => bug!("unexpected type for ADT ctor {:?}", sig.output())
     };
 
@@ -849,7 +834,7 @@ pub fn build_adt_ctor<'a, 'gcx, 'tcx>(infcx: &infer::InferCtxt<'a, 'gcx, 'tcx>,
 
     let source_info = SourceInfo {
         span,
-        scope: ARGUMENT_VISIBILITY_SCOPE
+        scope: OUTERMOST_SOURCE_SCOPE
     };
 
     let variant_no = if adt_def.is_enum() {
@@ -865,7 +850,7 @@ pub fn build_adt_ctor<'a, 'gcx, 'tcx>(infcx: &infer::InferCtxt<'a, 'gcx, 'tcx>,
             kind: StatementKind::Assign(
                 Place::Local(RETURN_PLACE),
                 Rvalue::Aggregate(
-                    box AggregateKind::Adt(adt_def, variant_no, substs, None),
+                    box AggregateKind::Adt(adt_def, variant_no, substs, None, None),
                     (1..sig.inputs().len()+1).map(|i| {
                         Operand::Move(Place::Local(Local::new(i)))
                     }).collect()
@@ -882,7 +867,7 @@ pub fn build_adt_ctor<'a, 'gcx, 'tcx>(infcx: &infer::InferCtxt<'a, 'gcx, 'tcx>,
     Mir::new(
         IndexVec::from_elem_n(start_block, 1),
         IndexVec::from_elem_n(
-            VisibilityScopeData { span: span, parent_scope: None }, 1
+            SourceScopeData { span: span, parent_scope: None }, 1
         ),
         ClearCrossCrate::Clear,
         IndexVec::new(),

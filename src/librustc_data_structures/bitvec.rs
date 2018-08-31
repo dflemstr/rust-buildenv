@@ -8,27 +8,77 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::collections::BTreeMap;
-use std::collections::btree_map::Entry;
-use std::marker::PhantomData;
-use std::iter::FromIterator;
 use indexed_vec::{Idx, IndexVec};
+use std::marker::PhantomData;
 
 type Word = u128;
 const WORD_BITS: usize = 128;
 
-/// A very simple BitVector type.
+/// A very simple BitArray type.
+///
+/// It does not support resizing after creation; use `BitVector` for that.
 #[derive(Clone, Debug, PartialEq)]
-pub struct BitVector {
+pub struct BitArray<C: Idx> {
     data: Vec<Word>,
+    marker: PhantomData<C>,
 }
 
-impl BitVector {
-    #[inline]
-    pub fn new(num_bits: usize) -> BitVector {
-        let num_words = words(num_bits);
+#[derive(Clone, Debug, PartialEq)]
+pub struct BitVector<C: Idx> {
+    data: BitArray<C>,
+}
+
+impl<C: Idx> BitVector<C> {
+    pub fn grow(&mut self, num_bits: C) {
+        self.data.grow(num_bits)
+    }
+
+    pub fn new() -> BitVector<C> {
         BitVector {
+            data: BitArray::new(0),
+        }
+    }
+
+    pub fn with_capacity(bits: usize) -> BitVector<C> {
+        BitVector {
+            data: BitArray::new(bits),
+        }
+    }
+
+    /// Returns true if the bit has changed.
+    #[inline]
+    pub fn insert(&mut self, bit: C) -> bool {
+        self.grow(bit);
+        self.data.insert(bit)
+    }
+
+    #[inline]
+    pub fn contains(&self, bit: C) -> bool {
+        let (word, mask) = word_mask(bit);
+        if let Some(word) = self.data.data.get(word) {
+            (word & mask) != 0
+        } else {
+            false
+        }
+    }
+}
+
+impl<C: Idx> BitArray<C> {
+    // Do not make this method public, instead switch your use case to BitVector.
+    #[inline]
+    fn grow(&mut self, num_bits: C) {
+        let num_words = words(num_bits);
+        if self.data.len() <= num_words {
+            self.data.resize(num_words + 1, 0)
+        }
+    }
+
+    #[inline]
+    pub fn new(num_bits: usize) -> BitArray<C> {
+        let num_words = words(num_bits);
+        BitArray {
             data: vec![0; num_words],
+            marker: PhantomData,
         }
     }
 
@@ -43,15 +93,30 @@ impl BitVector {
         self.data.iter().map(|e| e.count_ones() as usize).sum()
     }
 
+    /// True if `self` contains the bit `bit`.
     #[inline]
-    pub fn contains(&self, bit: usize) -> bool {
+    pub fn contains(&self, bit: C) -> bool {
         let (word, mask) = word_mask(bit);
         (self.data[word] & mask) != 0
     }
 
+    /// True if `self` contains all the bits in `other`.
+    ///
+    /// The two vectors must have the same length.
+    #[inline]
+    pub fn contains_all(&self, other: &BitArray<C>) -> bool {
+        assert_eq!(self.data.len(), other.data.len());
+        self.data.iter().zip(&other.data).all(|(a, b)| (a & b) == *b)
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.data.iter().all(|a| *a == 0)
+    }
+
     /// Returns true if the bit has changed.
     #[inline]
-    pub fn insert(&mut self, bit: usize) -> bool {
+    pub fn insert(&mut self, bit: C) -> bool {
         let (word, mask) = word_mask(bit);
         let data = &mut self.data[word];
         let value = *data;
@@ -60,9 +125,16 @@ impl BitVector {
         new_value != value
     }
 
+    /// Sets all bits to true.
+    pub fn insert_all(&mut self) {
+        for data in &mut self.data {
+            *data = u128::max_value();
+        }
+    }
+
     /// Returns true if the bit has changed.
     #[inline]
-    pub fn remove(&mut self, bit: usize) -> bool {
+    pub fn remove(&mut self, bit: C) -> bool {
         let (word, mask) = word_mask(bit);
         let data = &mut self.data[word];
         let value = *data;
@@ -72,7 +144,7 @@ impl BitVector {
     }
 
     #[inline]
-    pub fn insert_all(&mut self, all: &BitVector) -> bool {
+    pub fn merge(&mut self, all: &BitArray<C>) -> bool {
         assert!(self.data.len() == all.data.len());
         let mut changed = false;
         for (i, j) in self.data.iter_mut().zip(&all.data) {
@@ -85,34 +157,28 @@ impl BitVector {
         changed
     }
 
-    #[inline]
-    pub fn grow(&mut self, num_bits: usize) {
-        let num_words = words(num_bits);
-        if self.data.len() < num_words {
-            self.data.resize(num_words, 0)
-        }
-    }
-
     /// Iterates over indexes of set bits in a sorted order
     #[inline]
-    pub fn iter<'a>(&'a self) -> BitVectorIter<'a> {
-        BitVectorIter {
+    pub fn iter<'a>(&'a self) -> BitIter<'a, C> {
+        BitIter {
             iter: self.data.iter(),
             current: 0,
             idx: 0,
+            marker: PhantomData,
         }
     }
 }
 
-pub struct BitVectorIter<'a> {
+pub struct BitIter<'a, C: Idx> {
     iter: ::std::slice::Iter<'a, Word>,
     current: Word,
     idx: usize,
+    marker: PhantomData<C>
 }
 
-impl<'a> Iterator for BitVectorIter<'a> {
-    type Item = usize;
-    fn next(&mut self) -> Option<usize> {
+impl<'a, C: Idx> Iterator for BitIter<'a, C> {
+    type Item = C;
+    fn next(&mut self) -> Option<C> {
         while self.current == 0 {
             self.current = if let Some(&i) = self.iter.next() {
                 if i == 0 {
@@ -130,7 +196,8 @@ impl<'a> Iterator for BitVectorIter<'a> {
         self.current >>= offset;
         self.current >>= 1; // shift otherwise overflows for 0b1000_0000_…_0000
         self.idx += offset + 1;
-        return Some(self.idx - 1);
+
+        Some(C::new(self.idx - 1))
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -139,53 +206,32 @@ impl<'a> Iterator for BitVectorIter<'a> {
     }
 }
 
-impl FromIterator<bool> for BitVector {
-    fn from_iter<I>(iter: I) -> BitVector
-    where
-        I: IntoIterator<Item = bool>,
-    {
-        let iter = iter.into_iter();
-        let (len, _) = iter.size_hint();
-        // Make the minimum length for the bitvector WORD_BITS bits since that's
-        // the smallest non-zero size anyway.
-        let len = if len < WORD_BITS { WORD_BITS } else { len };
-        let mut bv = BitVector::new(len);
-        for (idx, val) in iter.enumerate() {
-            if idx > len {
-                bv.grow(idx);
-            }
-            if val {
-                bv.insert(idx);
-            }
-        }
-
-        bv
-    }
-}
-
 /// A "bit matrix" is basically a matrix of booleans represented as
 /// one gigantic bitvector. In other words, it is as if you have
 /// `rows` bitvectors, each of length `columns`.
 #[derive(Clone, Debug)]
-pub struct BitMatrix {
+pub struct BitMatrix<R: Idx, C: Idx> {
     columns: usize,
     vector: Vec<Word>,
+    phantom: PhantomData<(R, C)>,
 }
 
-impl BitMatrix {
+impl<R: Idx, C: Idx> BitMatrix<R, C> {
     /// Create a new `rows x columns` matrix, initially empty.
-    pub fn new(rows: usize, columns: usize) -> BitMatrix {
+    pub fn new(rows: usize, columns: usize) -> BitMatrix<R, C> {
         // For every element, we need one bit for every other
         // element. Round up to an even number of words.
         let words_per_row = words(columns);
         BitMatrix {
             columns,
             vector: vec![0; rows * words_per_row],
+            phantom: PhantomData,
         }
     }
 
     /// The range of bits for a given row.
-    fn range(&self, row: usize) -> (usize, usize) {
+    fn range(&self, row: R) -> (usize, usize) {
+        let row = row.index();
         let words_per_row = words(self.columns);
         let start = row * words_per_row;
         (start, start + words_per_row)
@@ -195,7 +241,7 @@ impl BitMatrix {
     /// `column` to the bitset for `row`.
     ///
     /// Returns true if this changed the matrix, and false otherwise.
-    pub fn add(&mut self, row: usize, column: usize) -> bool {
+    pub fn add(&mut self, row: R, column: R) -> bool {
         let (start, _) = self.range(row);
         let (word, mask) = word_mask(column);
         let vector = &mut self.vector[..];
@@ -209,7 +255,7 @@ impl BitMatrix {
     /// the matrix cell at `(row, column)` true?  Put yet another way,
     /// if the matrix represents (transitive) reachability, can
     /// `row` reach `column`?
-    pub fn contains(&self, row: usize, column: usize) -> bool {
+    pub fn contains(&self, row: R, column: R) -> bool {
         let (start, _) = self.range(row);
         let (word, mask) = word_mask(column);
         (self.vector[start + word] & mask) != 0
@@ -219,7 +265,7 @@ impl BitMatrix {
     /// is an O(n) operation where `n` is the number of elements
     /// (somewhat independent from the actual size of the
     /// intersection, in particular).
-    pub fn intersection(&self, a: usize, b: usize) -> Vec<usize> {
+    pub fn intersection(&self, a: R, b: R) -> Vec<C> {
         let (a_start, a_end) = self.range(a);
         let (b_start, b_end) = self.range(b);
         let mut result = Vec::with_capacity(self.columns);
@@ -230,7 +276,7 @@ impl BitMatrix {
                     break;
                 }
                 if v & 0x1 != 0 {
-                    result.push(base * WORD_BITS + bit);
+                    result.push(C::new(base * WORD_BITS + bit));
                 }
                 v >>= 1;
             }
@@ -245,7 +291,7 @@ impl BitMatrix {
     /// you have an edge `write -> read`, because in that case
     /// `write` can reach everything that `read` can (and
     /// potentially more).
-    pub fn merge(&mut self, read: usize, write: usize) -> bool {
+    pub fn merge(&mut self, read: R, write: R) -> bool {
         let (read_start, read_end) = self.range(read);
         let (write_start, write_end) = self.range(write);
         let vector = &mut self.vector[..];
@@ -254,38 +300,59 @@ impl BitMatrix {
             let v1 = vector[write_index];
             let v2 = v1 | vector[read_index];
             vector[write_index] = v2;
-            changed = changed | (v1 != v2);
+            changed |= v1 != v2;
         }
         changed
     }
 
     /// Iterates through all the columns set to true in a given row of
     /// the matrix.
-    pub fn iter<'a>(&'a self, row: usize) -> BitVectorIter<'a> {
+    pub fn iter<'a>(&'a self, row: R) -> BitIter<'a, C> {
         let (start, end) = self.range(row);
-        BitVectorIter {
+        BitIter {
             iter: self.vector[start..end].iter(),
             current: 0,
             idx: 0,
+            marker: PhantomData,
         }
     }
 }
 
+/// A moderately sparse bit matrix, in which rows are instantiated lazily.
+///
+/// Initially, every row has no explicit representation. If any bit within a
+/// row is set, the entire row is instantiated as
+/// `Some(<full-column-width-BitArray>)`. Furthermore, any previously
+/// uninstantiated rows prior to it will be instantiated as `None`. Those prior
+/// rows may themselves become fully instantiated later on if any of their bits
+/// are set.
 #[derive(Clone, Debug)]
 pub struct SparseBitMatrix<R, C>
 where
     R: Idx,
     C: Idx,
 {
-    vector: IndexVec<R, SparseBitSet<C>>,
+    num_columns: usize,
+    rows: IndexVec<R, Option<BitArray<C>>>,
 }
 
 impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
-    /// Create a new `rows x columns` matrix, initially empty.
-    pub fn new(rows: R, _columns: C) -> SparseBitMatrix<R, C> {
-        SparseBitMatrix {
-            vector: IndexVec::from_elem_n(SparseBitSet::new(), rows.index()),
+    /// Create a new empty sparse bit matrix with no rows or columns.
+    pub fn new(num_columns: usize) -> Self {
+        Self {
+            num_columns,
+            rows: IndexVec::new(),
         }
+    }
+
+    fn ensure_row(&mut self, row: R) -> &mut BitArray<C> {
+        // Instantiate any missing rows up to and including row `row` with an
+        // empty BitArray.
+        self.rows.ensure_contains_elem(row, || None);
+
+        // Then replace row `row` with a full BitArray if necessary.
+        let num_columns = self.num_columns;
+        self.rows[row].get_or_insert_with(|| BitArray::new(num_columns))
     }
 
     /// Sets the cell at `(row, column)` to true. Put another way, insert
@@ -293,7 +360,7 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
     ///
     /// Returns true if this changed the matrix, and false otherwise.
     pub fn add(&mut self, row: R, column: C) -> bool {
-        self.vector[row].insert(column)
+        self.ensure_row(row).insert(column)
     }
 
     /// Do the bits from `row` contain `column`? Put another way, is
@@ -301,7 +368,7 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
     /// if the matrix represents (transitive) reachability, can
     /// `row` reach `column`?
     pub fn contains(&self, row: R, column: C) -> bool {
-        self.vector[row].contains(column)
+        self.row(row).map_or(false, |r| r.contains(column))
     }
 
     /// Add the bits from row `read` to the bits from row `write`,
@@ -312,171 +379,55 @@ impl<R: Idx, C: Idx> SparseBitMatrix<R, C> {
     /// `write` can reach everything that `read` can (and
     /// potentially more).
     pub fn merge(&mut self, read: R, write: R) -> bool {
-        let mut changed = false;
-
-        if read != write {
-            let (bit_set_read, bit_set_write) = self.vector.pick2_mut(read, write);
-
-            for read_val in bit_set_read.iter() {
-                changed = changed | bit_set_write.insert(read_val);
-            }
+        if read == write || self.row(read).is_none() {
+            return false;
         }
 
-        changed
+        self.ensure_row(write);
+        if let (Some(bitvec_read), Some(bitvec_write)) = self.rows.pick2_mut(read, write) {
+            bitvec_write.merge(bitvec_read)
+        } else {
+            unreachable!()
+        }
+    }
+
+    /// Merge a row, `from`, into the `into` row.
+    pub fn merge_into(&mut self, into: R, from: &BitArray<C>) -> bool {
+        self.ensure_row(into).merge(from)
+    }
+
+    /// Add all bits to the given row.
+    pub fn add_all(&mut self, row: R) {
+        self.ensure_row(row).insert_all();
+    }
+
+    pub fn rows(&self) -> impl Iterator<Item = R> {
+        self.rows.indices()
     }
 
     /// Iterates through all the columns set to true in a given row of
     /// the matrix.
     pub fn iter<'a>(&'a self, row: R) -> impl Iterator<Item = C> + 'a {
-        self.vector[row].iter()
+        self.row(row).into_iter().flat_map(|r| r.iter())
     }
-}
 
-#[derive(Clone, Debug)]
-pub struct SparseBitSet<I: Idx> {
-    chunk_bits: BTreeMap<u32, Word>,
-    _marker: PhantomData<I>,
-}
-
-#[derive(Copy, Clone)]
-pub struct SparseChunk<I> {
-    key: u32,
-    bits: Word,
-    _marker: PhantomData<I>,
-}
-
-impl<I: Idx> SparseChunk<I> {
-    pub fn one(index: I) -> Self {
-        let index = index.index();
-        let key_usize = index / 128;
-        let key = key_usize as u32;
-        assert_eq!(key as usize, key_usize);
-        SparseChunk {
-            key,
-            bits: 1 << (index % 128),
-            _marker: PhantomData,
+    pub fn row(&self, row: R) -> Option<&BitArray<C>> {
+        if let Some(Some(row)) = self.rows.get(row) {
+            Some(row)
+        } else {
+            None
         }
-    }
-
-    pub fn any(&self) -> bool {
-        self.bits != 0
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = I> {
-        let base = self.key as usize * 128;
-        let mut bits = self.bits;
-        (0..128)
-            .map(move |i| {
-                let current_bits = bits;
-                bits >>= 1;
-                (i, current_bits)
-            })
-            .take_while(|&(_, bits)| bits != 0)
-            .filter_map(move |(i, bits)| {
-                if (bits & 1) != 0 {
-                    Some(I::new(base + i))
-                } else {
-                    None
-                }
-            })
-    }
-}
-
-impl<I: Idx> SparseBitSet<I> {
-    pub fn new() -> Self {
-        SparseBitSet {
-            chunk_bits: BTreeMap::new(),
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn capacity(&self) -> usize {
-        self.chunk_bits.len() * 128
-    }
-
-    pub fn contains_chunk(&self, chunk: SparseChunk<I>) -> SparseChunk<I> {
-        SparseChunk {
-            bits: self.chunk_bits
-                .get(&chunk.key)
-                .map_or(0, |bits| bits & chunk.bits),
-            ..chunk
-        }
-    }
-
-    pub fn insert_chunk(&mut self, chunk: SparseChunk<I>) -> SparseChunk<I> {
-        if chunk.bits == 0 {
-            return chunk;
-        }
-        let bits = self.chunk_bits.entry(chunk.key).or_insert(0);
-        let old_bits = *bits;
-        let new_bits = old_bits | chunk.bits;
-        *bits = new_bits;
-        let changed = new_bits ^ old_bits;
-        SparseChunk {
-            bits: changed,
-            ..chunk
-        }
-    }
-
-    pub fn remove_chunk(&mut self, chunk: SparseChunk<I>) -> SparseChunk<I> {
-        if chunk.bits == 0 {
-            return chunk;
-        }
-        let changed = match self.chunk_bits.entry(chunk.key) {
-            Entry::Occupied(mut bits) => {
-                let old_bits = *bits.get();
-                let new_bits = old_bits & !chunk.bits;
-                if new_bits == 0 {
-                    bits.remove();
-                } else {
-                    bits.insert(new_bits);
-                }
-                new_bits ^ old_bits
-            }
-            Entry::Vacant(_) => 0,
-        };
-        SparseChunk {
-            bits: changed,
-            ..chunk
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.chunk_bits.clear();
-    }
-
-    pub fn chunks<'a>(&'a self) -> impl Iterator<Item = SparseChunk<I>> + 'a {
-        self.chunk_bits.iter().map(|(&key, &bits)| SparseChunk {
-            key,
-            bits,
-            _marker: PhantomData,
-        })
-    }
-
-    pub fn contains(&self, index: I) -> bool {
-        self.contains_chunk(SparseChunk::one(index)).any()
-    }
-
-    pub fn insert(&mut self, index: I) -> bool {
-        self.insert_chunk(SparseChunk::one(index)).any()
-    }
-
-    pub fn remove(&mut self, index: I) -> bool {
-        self.remove_chunk(SparseChunk::one(index)).any()
-    }
-
-    pub fn iter<'a>(&'a self) -> impl Iterator<Item = I> + 'a {
-        self.chunks().flat_map(|chunk| chunk.iter())
     }
 }
 
 #[inline]
-fn words(elements: usize) -> usize {
-    (elements + WORD_BITS - 1) / WORD_BITS
+fn words<C: Idx>(elements: C) -> usize {
+    (elements.index() + WORD_BITS - 1) / WORD_BITS
 }
 
 #[inline]
-fn word_mask(index: usize) -> (usize, Word) {
+fn word_mask<C: Idx>(index: C) -> (usize, Word) {
+    let index = index.index();
     let word = index / WORD_BITS;
     let mask = 1 << (index % WORD_BITS);
     (word, mask)
@@ -484,7 +435,7 @@ fn word_mask(index: usize) -> (usize, Word) {
 
 #[test]
 fn bitvec_iter_works() {
-    let mut bitvec = BitVector::new(100);
+    let mut bitvec: BitArray<usize> = BitArray::new(100);
     bitvec.insert(1);
     bitvec.insert(10);
     bitvec.insert(19);
@@ -502,7 +453,7 @@ fn bitvec_iter_works() {
 
 #[test]
 fn bitvec_iter_works_2() {
-    let mut bitvec = BitVector::new(319);
+    let mut bitvec: BitArray<usize> = BitArray::new(319);
     bitvec.insert(0);
     bitvec.insert(127);
     bitvec.insert(191);
@@ -513,14 +464,14 @@ fn bitvec_iter_works_2() {
 
 #[test]
 fn union_two_vecs() {
-    let mut vec1 = BitVector::new(65);
-    let mut vec2 = BitVector::new(65);
+    let mut vec1: BitArray<usize> = BitArray::new(65);
+    let mut vec2: BitArray<usize> = BitArray::new(65);
     assert!(vec1.insert(3));
     assert!(!vec1.insert(3));
     assert!(vec2.insert(5));
     assert!(vec2.insert(64));
-    assert!(vec1.insert_all(&vec2));
-    assert!(!vec1.insert_all(&vec2));
+    assert!(vec1.merge(&vec2));
+    assert!(!vec1.merge(&vec2));
     assert!(vec1.contains(3));
     assert!(!vec1.contains(4));
     assert!(vec1.contains(5));
@@ -530,7 +481,7 @@ fn union_two_vecs() {
 
 #[test]
 fn grow() {
-    let mut vec1 = BitVector::new(65);
+    let mut vec1: BitVector<usize> = BitVector::with_capacity(65);
     for index in 0..65 {
         assert!(vec1.insert(index));
         assert!(!vec1.insert(index));
@@ -556,7 +507,7 @@ fn grow() {
 
 #[test]
 fn matrix_intersection() {
-    let mut vec1 = BitMatrix::new(200, 200);
+    let mut vec1: BitMatrix<usize, usize> = BitMatrix::new(200, 200);
 
     // (*) Elements reachable from both 2 and 65.
 
@@ -587,7 +538,49 @@ fn matrix_intersection() {
 
 #[test]
 fn matrix_iter() {
-    let mut matrix = BitMatrix::new(64, 100);
+    let mut matrix: BitMatrix<usize, usize> = BitMatrix::new(64, 100);
+    matrix.add(3, 22);
+    matrix.add(3, 75);
+    matrix.add(2, 99);
+    matrix.add(4, 0);
+    matrix.merge(3, 5);
+
+    let expected = [99];
+    let mut iter = expected.iter();
+    for i in matrix.iter(2) {
+        let j = *iter.next().unwrap();
+        assert_eq!(i, j);
+    }
+    assert!(iter.next().is_none());
+
+    let expected = [22, 75];
+    let mut iter = expected.iter();
+    for i in matrix.iter(3) {
+        let j = *iter.next().unwrap();
+        assert_eq!(i, j);
+    }
+    assert!(iter.next().is_none());
+
+    let expected = [0];
+    let mut iter = expected.iter();
+    for i in matrix.iter(4) {
+        let j = *iter.next().unwrap();
+        assert_eq!(i, j);
+    }
+    assert!(iter.next().is_none());
+
+    let expected = [22, 75];
+    let mut iter = expected.iter();
+    for i in matrix.iter(5) {
+        let j = *iter.next().unwrap();
+        assert_eq!(i, j);
+    }
+    assert!(iter.next().is_none());
+}
+
+#[test]
+fn sparse_matrix_iter() {
+    let mut matrix: SparseBitMatrix<usize, usize> = SparseBitMatrix::new(100);
     matrix.add(3, 22);
     matrix.add(3, 75);
     matrix.add(2, 99);

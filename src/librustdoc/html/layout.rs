@@ -32,7 +32,7 @@ pub struct Page<'a> {
 }
 
 pub fn render<T: fmt::Display, S: fmt::Display>(
-    dst: &mut io::Write, layout: &Layout, page: &Page, sidebar: &S, t: &T,
+    dst: &mut dyn io::Write, layout: &Layout, page: &Page, sidebar: &S, t: &T,
     css_file_extension: bool, themes: &[PathBuf])
     -> io::Result<()>
 {
@@ -85,6 +85,9 @@ pub fn render<T: fmt::Display, S: fmt::Display>(
                        autocomplete=\"off\" \
                        placeholder=\"Click or press ‘S’ to search, ‘?’ for more options…\" \
                        type=\"search\">\
+                <a id=\"settings-menu\" href=\"{root_path}settings.html\">\
+                    <img src=\"{root_path}wheel{suffix}.svg\" width=\"18\" alt=\"Change settings\">\
+                </a>\
             </div>\
         </form>\
     </nav>\
@@ -143,9 +146,9 @@ pub fn render<T: fmt::Display, S: fmt::Display>(
         window.rootPath = \"{root_path}\";\
         window.currentCrate = \"{krate}\";\
     </script>\
+    <script src=\"{root_path}aliases.js\"></script>\
     <script src=\"{root_path}main{suffix}.js\"></script>\
     <script defer src=\"{root_path}search-index.js\"></script>\
-    <script defer src=\"{root_path}aliases.js\"></script>\
 </body>\
 </html>",
     css_extension = if css_file_extension {
@@ -153,13 +156,13 @@ pub fn render<T: fmt::Display, S: fmt::Display>(
                 root_path = page.root_path,
                 suffix=page.resource_suffix)
     } else {
-        "".to_owned()
+        String::new()
     },
     content   = *t,
     root_path = page.root_path,
     css_class = page.css_class,
     logo      = if layout.logo.is_empty() {
-        "".to_string()
+        String::new()
     } else {
         format!("<a href='{}{}/index.html'>\
                  <img src='{}' alt='logo' width='100'></a>",
@@ -170,7 +173,7 @@ pub fn render<T: fmt::Display, S: fmt::Display>(
     description = page.description,
     keywords = page.keywords,
     favicon   = if layout.favicon.is_empty() {
-        "".to_string()
+        String::new()
     } else {
         format!(r#"<link rel="shortcut icon" href="{}">"#, layout.favicon)
     },
@@ -182,15 +185,16 @@ pub fn render<T: fmt::Display, S: fmt::Display>(
     themes = themes.iter()
                    .filter_map(|t| t.file_stem())
                    .filter_map(|t| t.to_str())
-                   .map(|t| format!(r#"<link rel="stylesheet" type="text/css" href="{}{}">"#,
+                   .map(|t| format!(r#"<link rel="stylesheet" type="text/css" href="{}{}{}.css">"#,
                                     page.root_path,
-                                    t.replace(".css", &format!("{}.css", page.resource_suffix))))
+                                    t,
+                                    page.resource_suffix))
                    .collect::<String>(),
     suffix=page.resource_suffix,
     )
 }
 
-pub fn redirect(dst: &mut io::Write, url: &str) -> io::Result<()> {
+pub fn redirect(dst: &mut dyn io::Write, url: &str) -> io::Result<()> {
     // <script> triggers a redirect before refresh, so this is fine.
     write!(dst,
 r##"<!DOCTYPE html>

@@ -39,14 +39,14 @@ pub struct WriteOutput<'b, W: Write + 'b> {
 
 impl<'b, W: Write> DumpOutput for WriteOutput<'b, W> {
     fn dump(&mut self, result: &Analysis) {
-        if let Err(_) = write!(self.output, "{}", as_json(&result)) {
+        if write!(self.output, "{}", as_json(&result)).is_err() {
             error!("Error writing output");
         }
     }
 }
 
 pub struct CallbackOutput<'b> {
-    callback: &'b mut FnMut(&Analysis),
+    callback: &'b mut dyn FnMut(&Analysis),
 }
 
 impl<'b> DumpOutput for CallbackOutput<'b> {
@@ -67,7 +67,7 @@ impl<'b, W: Write> JsonDumper<WriteOutput<'b, W>> {
 
 impl<'b> JsonDumper<CallbackOutput<'b>> {
     pub fn with_callback(
-        callback: &'b mut FnMut(&Analysis),
+        callback: &'b mut dyn FnMut(&Analysis),
         config: Config,
     ) -> JsonDumper<CallbackOutput<'b>> {
         JsonDumper {

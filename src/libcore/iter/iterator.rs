@@ -11,14 +11,14 @@
 use cmp::Ordering;
 use ops::Try;
 
-use super::{AlwaysOk, LoopState};
+use super::LoopState;
 use super::{Chain, Cycle, Cloned, Enumerate, Filter, FilterMap, Fuse};
 use super::{Flatten, FlatMap, flatten_compat};
 use super::{Inspect, Map, Peekable, Scan, Skip, SkipWhile, StepBy, Take, TakeWhile, Rev};
 use super::{Zip, Sum, Product};
 use super::{ChainState, FromIterator, ZipImpl};
 
-fn _assert_is_object_safe(_: &Iterator<Item=()>) {}
+fn _assert_is_object_safe(_: &dyn Iterator<Item=()>) {}
 
 /// An interface for dealing with iterators.
 ///
@@ -271,8 +271,29 @@ pub trait Iterator {
     /// Creates an iterator starting at the same point, but stepping by
     /// the given amount at each iteration.
     ///
-    /// Note that it will always return the first element of the iterator,
+    /// Note 1: The first element of the iterator will always be returned,
     /// regardless of the step given.
+    ///
+    /// Note 2: The time at which ignored elements are pulled is not fixed.
+    /// `StepBy` behaves like the sequence `next(), nth(step-1), nth(step-1), …`,
+    /// but is also free to behave like the sequence
+    /// `advance_n_and_return_first(step), advance_n_and_return_first(step), …`
+    /// Which way is used may change for some iterators for performance reasons.
+    /// The second way will advance the iterator earlier and may consume more items.
+    ///
+    /// `advance_n_and_return_first` is the equivalent of:
+    /// ```
+    /// fn advance_n_and_return_first<I>(iter: &mut I, total_step: usize) -> Option<I::Item>
+    /// where
+    ///     I: Iterator,
+    /// {
+    ///     let next = iter.next();
+    ///     if total_step > 1 {
+    ///         iter.nth(total_step-2);
+    ///     }
+    ///     next
+    /// }
+    /// ```
     ///
     /// # Panics
     ///
@@ -283,7 +304,6 @@ pub trait Iterator {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(iterator_step_by)]
     /// let a = [0, 1, 2, 3, 4, 5];
     /// let mut iter = a.into_iter().step_by(2);
     ///
@@ -293,9 +313,7 @@ pub trait Iterator {
     /// assert_eq!(iter.next(), None);
     /// ```
     #[inline]
-    #[unstable(feature = "iterator_step_by",
-               reason = "unstable replacement of Range::step_by",
-               issue = "27741")]
+    #[stable(feature = "iterator_step_by", since = "1.28.0")]
     fn step_by(self, step: usize) -> StepBy<Self> where Self: Sized {
         assert!(step != 0);
         StepBy{iter: self, step: step - 1, first_take: true}
@@ -366,8 +384,9 @@ pub trait Iterator {
     ///
     /// In other words, it zips two iterators together, into a single one.
     ///
-    /// When either iterator returns [`None`], all further calls to [`next`]
-    /// will return [`None`].
+    /// If either iterator returns [`None`], [`next`] from the zipped iterator
+    /// will return [`None`]. If the first iterator returns [`None`], `zip` will
+    /// short-circuit and `next` will not be called on the second iterator.
     ///
     /// # Examples
     ///
@@ -488,7 +507,7 @@ pub trait Iterator {
     fn map<B, F>(self, f: F) -> Map<Self, F> where
         Self: Sized, F: FnMut(Self::Item) -> B,
     {
-        Map{iter: self, f: f}
+        Map { iter: self, f }
     }
 
     /// Calls a closure on each element of an iterator.
@@ -599,7 +618,7 @@ pub trait Iterator {
     fn filter<P>(self, predicate: P) -> Filter<Self, P> where
         Self: Sized, P: FnMut(&Self::Item) -> bool,
     {
-        Filter{iter: self, predicate: predicate}
+        Filter {iter: self, predicate }
     }
 
     /// Creates an iterator that both filters and maps.
@@ -656,7 +675,7 @@ pub trait Iterator {
     fn filter_map<B, F>(self, f: F) -> FilterMap<Self, F> where
         Self: Sized, F: FnMut(Self::Item) -> Option<B>,
     {
-        FilterMap { iter: self, f: f }
+        FilterMap { iter: self, f }
     }
 
     /// Creates an iterator which gives the current iteration count as well as
@@ -809,7 +828,7 @@ pub trait Iterator {
     fn skip_while<P>(self, predicate: P) -> SkipWhile<Self, P> where
         Self: Sized, P: FnMut(&Self::Item) -> bool,
     {
-        SkipWhile{iter: self, flag: false, predicate: predicate}
+        SkipWhile { iter: self, flag: false, predicate }
     }
 
     /// Creates an iterator that yields elements based on a predicate.
@@ -889,7 +908,7 @@ pub trait Iterator {
     fn take_while<P>(self, predicate: P) -> TakeWhile<Self, P> where
         Self: Sized, P: FnMut(&Self::Item) -> bool,
     {
-        TakeWhile{iter: self, flag: false, predicate: predicate}
+        TakeWhile { iter: self, flag: false, predicate }
     }
 
     /// Creates an iterator that skips the first `n` elements.
@@ -911,7 +930,7 @@ pub trait Iterator {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn skip(self, n: usize) -> Skip<Self> where Self: Sized {
-        Skip{iter: self, n: n}
+        Skip { iter: self, n }
     }
 
     /// Creates an iterator that yields its first `n` elements.
@@ -943,7 +962,7 @@ pub trait Iterator {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn take(self, n: usize) -> Take<Self> where Self: Sized, {
-        Take{iter: self, n: n}
+        Take { iter: self, n }
     }
 
     /// An iterator adaptor similar to [`fold`] that holds internal state and
@@ -988,7 +1007,7 @@ pub trait Iterator {
     fn scan<St, B, F>(self, initial_state: St, f: F) -> Scan<Self, St, F>
         where Self: Sized, F: FnMut(&mut St, Self::Item) -> Option<B>,
     {
-        Scan{iter: self, f: f, state: initial_state}
+        Scan { iter: self, f, state: initial_state }
     }
 
     /// Creates an iterator that works like map, but flattens nested structure.
@@ -1040,8 +1059,6 @@ pub trait Iterator {
     /// Basic usage:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let data = vec![vec![1, 2, 3, 4], vec![5, 6]];
     /// let flattened = data.into_iter().flatten().collect::<Vec<u8>>();
     /// assert_eq!(flattened, &[1, 2, 3, 4, 5, 6]);
@@ -1050,8 +1067,6 @@ pub trait Iterator {
     /// Mapping and then flattening:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let words = ["alpha", "beta", "gamma"];
     ///
     /// // chars() returns an iterator
@@ -1078,8 +1093,6 @@ pub trait Iterator {
     /// Flattening once only removes one level of nesting:
     ///
     /// ```
-    /// #![feature(iterator_flatten)]
-    ///
     /// let d3 = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]];
     ///
     /// let d2 = d3.iter().flatten().collect::<Vec<_>>();
@@ -1094,8 +1107,10 @@ pub trait Iterator {
     /// `flatten()` a three-dimensional array the result will be
     /// two-dimensional and not one-dimensional. To get a one-dimensional
     /// structure, you have to `flatten()` again.
+    ///
+    /// [`flat_map()`]: #method.flat_map
     #[inline]
-    #[unstable(feature = "iterator_flatten", issue = "48213")]
+    #[stable(feature = "iterator_flatten", since = "1.29.0")]
     fn flatten(self) -> Flatten<Self>
     where Self: Sized, Self::Item: IntoIterator {
         Flatten { inner: flatten_compat(self) }
@@ -1168,8 +1183,9 @@ pub trait Iterator {
     /// happening at various parts in the pipeline. To do that, insert
     /// a call to `inspect()`.
     ///
-    /// It's much more common for `inspect()` to be used as a debugging tool
-    /// than to exist in your final code, but never say never.
+    /// It's more common for `inspect()` to be used as a debugging tool than to
+    /// exist in your final code, but applications may find it useful in certain
+    /// situations when errors need to be logged before being discarded.
     ///
     /// # Examples
     ///
@@ -1209,12 +1225,38 @@ pub trait Iterator {
     /// about to filter: 3
     /// 6
     /// ```
+    ///
+    /// Logging errors before discarding them:
+    ///
+    /// ```
+    /// let lines = ["1", "2", "a"];
+    ///
+    /// let sum: i32 = lines
+    ///     .iter()
+    ///     .map(|line| line.parse::<i32>())
+    ///     .inspect(|num| {
+    ///         if let Err(ref e) = *num {
+    ///             println!("Parsing error: {}", e);
+    ///         }
+    ///     })
+    ///     .filter_map(Result::ok)
+    ///     .sum();
+    ///
+    /// println!("Sum: {}", sum);
+    /// ```
+    ///
+    /// This will print:
+    ///
+    /// ```text
+    /// Parsing error: invalid digit found in string
+    /// Sum: 3
+    /// ```
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     fn inspect<F>(self, f: F) -> Inspect<Self, F> where
         Self: Sized, F: FnMut(&Self::Item),
     {
-        Inspect{iter: self, f: f}
+        Inspect { iter: self, f }
     }
 
     /// Borrows an iterator, rather than consuming it.
@@ -1589,7 +1631,7 @@ pub trait Iterator {
     fn fold<B, F>(mut self, init: B, mut f: F) -> B where
         Self: Sized, F: FnMut(B, Self::Item) -> B,
     {
-        self.try_fold(init, move |acc, x| AlwaysOk(f(acc, x))).0
+        self.try_fold(init, move |acc, x| Ok::<B, !>(f(acc, x))).unwrap()
     }
 
     /// Tests if every element of the iterator matches a predicate.
@@ -1752,7 +1794,6 @@ pub trait Iterator {
     /// # Examples
     ///
     /// ```
-    /// #![feature(iterator_find_map)]
     /// let a = ["lol", "NaN", "2", "5"];
     ///
     /// let mut first_number = a.iter().find_map(|s| s.parse().ok());
@@ -1760,9 +1801,7 @@ pub trait Iterator {
     /// assert_eq!(first_number, Some(2));
     /// ```
     #[inline]
-    #[unstable(feature = "iterator_find_map",
-               reason = "unstable new API",
-               issue = "49602")]
+    #[stable(feature = "iterator_find_map", since = "1.30.0")]
     fn find_map<B, F>(&mut self, mut f: F) -> Option<B> where
         Self: Sized,
         F: FnMut(Self::Item) -> Option<B>,

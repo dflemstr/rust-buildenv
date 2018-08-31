@@ -10,6 +10,8 @@
 
 //! A dynamically-sized view into a contiguous sequence, `[T]`.
 //!
+//! *[See also the slice primitive type](../../std/primitive.slice.html).*
+//!
 //! Slices are a view into a block of memory represented as a pointer and a
 //! length.
 //!
@@ -78,8 +80,6 @@
 //! * Further methods that return iterators are [`.split`], [`.splitn`],
 //!   [`.chunks`], [`.windows`] and more.
 //!
-//! *[See also the slice primitive type](../../std/primitive.slice.html).*
-//!
 //! [`Clone`]: ../../std/clone/trait.Clone.html
 //! [`Eq`]: ../../std/cmp/trait.Eq.html
 //! [`Ord`]: ../../std/cmp/trait.Ord.html
@@ -101,7 +101,6 @@ use core::cmp::Ordering::{self, Less};
 use core::mem::size_of;
 use core::mem;
 use core::ptr;
-#[cfg(stage0)] use core::slice::SliceExt;
 use core::{u8, u16, u32};
 
 use borrow::{Borrow, BorrowMut, ToOwned};
@@ -120,9 +119,9 @@ pub use core::slice::{SplitN, RSplitN, SplitNMut, RSplitNMut};
 pub use core::slice::{RSplit, RSplitMut};
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use core::slice::{from_raw_parts, from_raw_parts_mut};
-#[unstable(feature = "from_ref", issue = "45703")]
-pub use core::slice::{from_ref, from_ref_mut};
-#[unstable(feature = "slice_get_slice", issue = "35729")]
+#[stable(feature = "from_ref", since = "1.28.0")]
+pub use core::slice::{from_ref, from_mut};
+#[stable(feature = "slice_get_slice", since = "1.28.0")]
 pub use core::slice::SliceIndex;
 #[unstable(feature = "exact_chunks", issue = "47115")]
 pub use core::slice::{ExactChunks, ExactChunksMut};
@@ -171,13 +170,9 @@ mod hack {
     }
 }
 
-#[cfg_attr(stage0, lang = "slice")]
-#[cfg_attr(not(stage0), lang = "slice_alloc")]
+#[lang = "slice_alloc"]
 #[cfg(not(test))]
 impl<T> [T] {
-    #[cfg(stage0)]
-    slice_core_methods!();
-
     /// Sorts the slice.
     ///
     /// This sort is stable (i.e. does not reorder equal elements) and `O(n log n)` worst-case.
@@ -394,10 +389,80 @@ impl<T> [T] {
         // NB see hack module in this file
         hack::into_vec(self)
     }
+
+    /// Creates a vector by repeating a slice `n` times.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(repeat_generic_slice)]
+    ///
+    /// fn main() {
+    ///     assert_eq!([1, 2].repeat(3), vec![1, 2, 1, 2, 1, 2]);
+    /// }
+    /// ```
+    #[unstable(feature = "repeat_generic_slice",
+               reason = "it's on str, why not on slice?",
+               issue = "48784")]
+    pub fn repeat(&self, n: usize) -> Vec<T> where T: Copy {
+        if n == 0 {
+            return Vec::new();
+        }
+
+        // If `n` is larger than zero, it can be split as
+        // `n = 2^expn + rem (2^expn > rem, expn >= 0, rem >= 0)`.
+        // `2^expn` is the number represented by the leftmost '1' bit of `n`,
+        // and `rem` is the remaining part of `n`.
+
+        // Using `Vec` to access `set_len()`.
+        let mut buf = Vec::with_capacity(self.len() * n);
+
+        // `2^expn` repetition is done by doubling `buf` `expn`-times.
+        buf.extend(self);
+        {
+            let mut m = n >> 1;
+            // If `m > 0`, there are remaining bits up to the leftmost '1'.
+            while m > 0 {
+                // `buf.extend(buf)`:
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        buf.as_ptr(),
+                        (buf.as_mut_ptr() as *mut T).add(buf.len()),
+                        buf.len(),
+                    );
+                    // `buf` has capacity of `self.len() * n`.
+                    let buf_len = buf.len();
+                    buf.set_len(buf_len * 2);
+                }
+
+                m >>= 1;
+            }
+        }
+
+        // `rem` (`= n - 2^expn`) repetition is done by copying
+        // first `rem` repetitions from `buf` itself.
+        let rem_len = self.len() * n - buf.len(); // `self.len() * rem`
+        if rem_len > 0 {
+            // `buf.extend(buf[0 .. rem_len])`:
+            unsafe {
+                // This is non-overlapping since `2^expn > rem`.
+                ptr::copy_nonoverlapping(
+                    buf.as_ptr(),
+                    (buf.as_mut_ptr() as *mut T).add(buf.len()),
+                    rem_len,
+                );
+                // `buf.len() + rem_len` equals to `buf.capacity()` (`= self.len() * n`).
+                let buf_cap = buf.capacity();
+                buf.set_len(buf_cap);
+            }
+        }
+        buf
+    }
 }
 
-#[cfg_attr(stage0, lang = "slice_u8")]
-#[cfg_attr(not(stage0), lang = "slice_u8_alloc")]
+#[lang = "slice_u8_alloc"]
 #[cfg(not(test))]
 impl [u8] {
     /// Returns a vector containing a copy of this slice where each byte
@@ -433,9 +498,6 @@ impl [u8] {
         me.make_ascii_lowercase();
         me
     }
-
-    #[cfg(stage0)]
-    slice_u8_core_methods!();
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -504,15 +566,17 @@ impl<T: Clone, V: Borrow<[T]>> SliceConcatExt<T> for [V] {
     }
 
     fn join(&self, sep: &T) -> Vec<T> {
+        let mut iter = self.iter();
+        let first = match iter.next() {
+            Some(first) => first,
+            None => return vec![],
+        };
         let size = self.iter().fold(0, |acc, v| acc + v.borrow().len());
         let mut result = Vec::with_capacity(size + self.len());
-        let mut first = true;
-        for v in self {
-            if first {
-                first = false
-            } else {
-                result.push(sep.clone())
-            }
+        result.extend_from_slice(first.borrow());
+
+        for v in iter {
+            result.push(sep.clone());
             result.extend_from_slice(v.borrow())
         }
         result
@@ -651,8 +715,8 @@ unsafe fn merge<T, F>(v: &mut [T], mid: usize, buf: *mut T, is_less: &mut F)
 {
     let len = v.len();
     let v = v.as_mut_ptr();
-    let v_mid = v.offset(mid as isize);
-    let v_end = v.offset(len as isize);
+    let v_mid = v.add(mid);
+    let v_end = v.add(len);
 
     // The merge process first copies the shorter run into `buf`. Then it traces the newly copied
     // run and the longer run forwards (or backwards), comparing their next unconsumed elements and
@@ -678,7 +742,7 @@ unsafe fn merge<T, F>(v: &mut [T], mid: usize, buf: *mut T, is_less: &mut F)
         ptr::copy_nonoverlapping(v, buf, mid);
         hole = MergeHole {
             start: buf,
-            end: buf.offset(mid as isize),
+            end: buf.add(mid),
             dest: v,
         };
 
@@ -702,7 +766,7 @@ unsafe fn merge<T, F>(v: &mut [T], mid: usize, buf: *mut T, is_less: &mut F)
         ptr::copy_nonoverlapping(v_mid, buf, len - mid);
         hole = MergeHole {
             start: buf,
-            end: buf.offset((len - mid) as isize),
+            end: buf.add(len - mid),
             dest: v_mid,
         };
 

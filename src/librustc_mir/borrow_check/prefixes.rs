@@ -36,6 +36,7 @@ impl<'tcx> IsPrefixOf<'tcx> for Place<'tcx> {
             }
 
             match *cursor {
+                Place::Promoted(_) |
                 Place::Local(_) | Place::Static(_) => return false,
                 Place::Projection(ref proj) => {
                     cursor = &proj.base;
@@ -98,6 +99,7 @@ impl<'cx, 'gcx, 'tcx> Iterator for Prefixes<'cx, 'gcx, 'tcx> {
 
         'cursor: loop {
             let proj = match *cursor {
+                Place::Promoted(_) |
                 Place::Local(_) | // search yielded this leaf
                 Place::Static(_) => {
                     self.next = None;
@@ -153,31 +155,27 @@ impl<'cx, 'gcx, 'tcx> Iterator for Prefixes<'cx, 'gcx, 'tcx> {
 
             let ty = proj.base.ty(self.mir, self.tcx).to_ty(self.tcx);
             match ty.sty {
-                ty::TyRawPtr(_) |
-                ty::TyRef(
+                ty::RawPtr(_) |
+                ty::Ref(
                     _, /*rgn*/
-                    ty::TypeAndMut {
-                        ty: _,
-                            mutbl: hir::MutImmutable,
-                        },
+                    _, /*ty*/
+                    hir::MutImmutable
                     ) => {
                     // don't continue traversing over derefs of raw pointers or shared borrows.
                     self.next = None;
                     return Some(cursor);
                 }
 
-                ty::TyRef(
+                ty::Ref(
                     _, /*rgn*/
-                    ty::TypeAndMut {
-                        ty: _,
-                        mutbl: hir::MutMutable,
-                    },
+                    _, /*ty*/
+                    hir::MutMutable,
                     ) => {
                     self.next = Some(&proj.base);
                     return Some(cursor);
                 }
 
-                ty::TyAdt(..) if ty.is_box() => {
+                ty::Adt(..) if ty.is_box() => {
                     self.next = Some(&proj.base);
                     return Some(cursor);
                 }

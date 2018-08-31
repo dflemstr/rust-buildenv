@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use rustc_data_structures::thin_vec::ThinVec;
+
 use syntax::ast;
 use syntax::ext::base::*;
 use syntax::ext::base;
@@ -21,7 +23,7 @@ use syntax::tokenstream::TokenTree;
 pub fn expand_syntax_ext<'cx>(cx: &'cx mut ExtCtxt,
                               sp: Span,
                               tts: &[TokenTree])
-                              -> Box<base::MacResult + 'cx> {
+                              -> Box<dyn base::MacResult + 'cx> {
     if !cx.ecfg.enable_concat_idents() {
         feature_gate::emit_feature_err(&cx.parse_sess,
                                        "concat_idents",
@@ -29,6 +31,11 @@ pub fn expand_syntax_ext<'cx>(cx: &'cx mut ExtCtxt,
                                        feature_gate::GateIssue::Language,
                                        feature_gate::EXPLAIN_CONCAT_IDENTS);
         return base::DummyResult::expr(sp);
+    }
+
+    if tts.is_empty() {
+        cx.span_err(sp, "concat_idents! takes 1 or more arguments.");
+        return DummyResult::expr(sp);
     }
 
     let mut res_str = String::new();
@@ -44,7 +51,7 @@ pub fn expand_syntax_ext<'cx>(cx: &'cx mut ExtCtxt,
         } else {
             match *e {
                 TokenTree::Token(_, token::Ident(ident, _)) =>
-                    res_str.push_str(&ident.name.as_str()),
+                    res_str.push_str(&ident.as_str()),
                 _ => {
                     cx.span_err(sp, "concat_idents! requires ident args.");
                     return DummyResult::expr(sp);
@@ -63,7 +70,7 @@ pub fn expand_syntax_ext<'cx>(cx: &'cx mut ExtCtxt,
                 id: ast::DUMMY_NODE_ID,
                 node: ast::ExprKind::Path(None, ast::Path::from_ident(self.ident)),
                 span: self.ident.span,
-                attrs: ast::ThinVec::new(),
+                attrs: ThinVec::new(),
             }))
         }
 

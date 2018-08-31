@@ -183,13 +183,16 @@ pub trait ToStableHashKey<HCX> {
 
 // Implement HashStable by just calling `Hash::hash()`. This works fine for
 // self-contained values that don't depend on the hashing context `CTX`.
+#[macro_export]
 macro_rules! impl_stable_hash_via_hash {
     ($t:ty) => (
-        impl<CTX> HashStable<CTX> for $t {
+        impl<CTX> $crate::stable_hasher::HashStable<CTX> for $t {
             #[inline]
-            fn hash_stable<W: StableHasherResult>(&self,
-                                                  _: &mut CTX,
-                                                  hasher: &mut StableHasher<W>) {
+            fn hash_stable<W: $crate::stable_hasher::StableHasherResult>(
+                &self,
+                _: &mut CTX,
+                hasher: &mut $crate::stable_hasher::StableHasher<W>
+            ) {
                 ::std::hash::Hash::hash(self, hasher);
             }
         }
@@ -429,7 +432,7 @@ impl<I: ::indexed_vec::Idx, T, CTX> HashStable<CTX> for ::indexed_vec::IndexVec<
 }
 
 
-impl<I: ::indexed_vec::Idx, CTX> HashStable<CTX> for ::indexed_set::IdxSetBuf<I>
+impl<I: ::indexed_vec::Idx, CTX> HashStable<CTX> for ::indexed_set::IdxSet<I>
 {
     fn hash_stable<W: StableHasherResult>(&self,
                                           ctx: &mut CTX,

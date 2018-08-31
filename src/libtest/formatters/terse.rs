@@ -18,6 +18,7 @@ pub(crate) struct TerseFormatter<T> {
     max_name_len: usize,
 
     test_count: usize,
+    total_test_count: usize,
 }
 
 impl<T: Write> TerseFormatter<T> {
@@ -33,6 +34,7 @@ impl<T: Write> TerseFormatter<T> {
             max_name_len,
             is_multithreaded,
             test_count: 0,
+            total_test_count: 0, // initialized later, when write_run_start is called
         }
     }
 
@@ -66,7 +68,8 @@ impl<T: Write> TerseFormatter<T> {
             // we insert a new line every 100 dots in order to flush the
             // screen when dealing with line-buffered output (e.g. piping to
             // `stamp` in the rust CI).
-            self.write_plain("\n")?;
+            let out = format!(" {}/{}\n", self.test_count+1, self.total_test_count);
+            self.write_plain(&out)?;
         }
 
         self.test_count += 1;
@@ -105,7 +108,7 @@ impl<T: Write> TerseFormatter<T> {
         for &(ref f, ref stdout) in &state.not_failures {
             successes.push(f.name.to_string());
             if !stdout.is_empty() {
-                stdouts.push_str(&format!("---- {} stdout ----\n\t", f.name));
+                stdouts.push_str(&format!("---- {} stdout ----\n", f.name));
                 let output = String::from_utf8_lossy(stdout);
                 stdouts.push_str(&output);
                 stdouts.push_str("\n");
@@ -131,7 +134,7 @@ impl<T: Write> TerseFormatter<T> {
         for &(ref f, ref stdout) in &state.failures {
             failures.push(f.name.to_string());
             if !stdout.is_empty() {
-                fail_out.push_str(&format!("---- {} stdout ----\n\t", f.name));
+                fail_out.push_str(&format!("---- {} stdout ----\n", f.name));
                 let output = String::from_utf8_lossy(stdout);
                 fail_out.push_str(&output);
                 fail_out.push_str("\n");
@@ -160,6 +163,7 @@ impl<T: Write> TerseFormatter<T> {
 
 impl<T: Write> OutputFormatter for TerseFormatter<T> {
     fn write_run_start(&mut self, test_count: usize) -> io::Result<()> {
+        self.total_test_count = test_count;
         let noun = if test_count != 1 { "tests" } else { "test" };
         self.write_plain(&format!("\nrunning {} {}\n", test_count, noun))
     }

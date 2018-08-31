@@ -770,17 +770,18 @@ match x {
 "##,
 
 E0411: r##"
-The `Self` keyword was used outside an impl or a trait.
+The `Self` keyword was used outside an impl, trait, or type definition.
 
 Erroneous code example:
 
 ```compile_fail,E0411
-<Self>::foo; // error: use of `Self` outside of an impl or trait
+<Self>::foo; // error: use of `Self` outside of an impl, trait, or type
+             // definition
 ```
 
 The `Self` keyword represents the current type, which explains why it can only
-be used inside an impl or a trait. It gives access to the associated items of a
-type:
+be used inside an impl, trait, or type definition. It gives access to the
+associated items of a type:
 
 ```
 trait Foo {
@@ -967,16 +968,18 @@ one.
 "##,
 
 E0423: r##"
-A `struct` variant name was used like a function name.
+An identifier was used like a function name or a value was expected and the
+identifier exists but it belongs to a different namespace.
 
-Erroneous code example:
+For (an erroneous) example, here a `struct` variant name were used as a
+function:
 
 ```compile_fail,E0423
 struct Foo { a: bool };
 
 let f = Foo();
-// error: `Foo` is a struct variant name, but this expression uses
-//        it like a function name
+// error: expected function, found `Foo`
+// `Foo` is a struct name, but this expression uses it like a function name
 ```
 
 Please verify you didn't misspell the name of what you actually wanted to use
@@ -986,6 +989,30 @@ here. Example:
 fn Foo() -> u32 { 0 }
 
 let f = Foo(); // ok!
+```
+
+It is common to forget the trailing `!` on macro invocations, which would also
+yield this error:
+
+```compile_fail,E0423
+println("");
+// error: expected function, found macro `println`
+// did you mean `println!(...)`? (notice the trailing `!`)
+```
+
+Another case where this error is emitted is when a value is expected, but
+something else is found:
+
+```compile_fail,E0423
+pub mod a {
+    pub const I: i32 = 1;
+}
+
+fn h1() -> i32 {
+    a.I
+    //~^ ERROR expected value, found module `a`
+    // did you mean `a::I`?
+}
 ```
 "##,
 
@@ -1230,7 +1257,7 @@ let map = HashMap::new();
 ```
 
 Please verify you didn't misspell the type/module's name or that you didn't
-forgot to import it:
+forget to import it:
 
 
 ```
@@ -1395,35 +1422,6 @@ If you would like to import all exported macros, write `macro_use` with no
 arguments.
 "##,
 
-E0467: r##"
-Macro re-export declarations were empty or malformed.
-
-Erroneous code examples:
-
-```compile_fail,E0467
-#[macro_reexport]                    // error: no macros listed for export
-extern crate core as macros_for_good;
-
-#[macro_reexport(fun_macro = "foo")] // error: not a macro identifier
-extern crate core as other_macros_for_good;
-```
-
-This is a syntax error at the level of attribute declarations.
-
-Currently, `macro_reexport` requires at least one macro name to be listed.
-Unlike `macro_use`, listing no names does not re-export all macros from the
-given crate.
-
-Decide which macros you would like to export and list them properly.
-
-These are proper re-export declarations:
-
-```ignore (cannot-doctest-multicrate-project)
-#[macro_reexport(some_macro, another_macro)]
-extern crate macros_for_good;
-```
-"##,
-
 E0468: r##"
 A non-root module attempts to import macros from another crate.
 
@@ -1493,48 +1491,6 @@ macro_rules! drink {
 // In your crate:
 #[macro_use(eat, drink)]
 extern crate some_crate; //ok!
-```
-"##,
-
-E0470: r##"
-A macro listed for re-export was not found.
-
-Erroneous code example:
-
-```compile_fail,E0470
-#[macro_reexport(drink, be_merry)]
-extern crate alloc;
-
-fn main() {
-    // ...
-}
-```
-
-Either the listed macro is not contained in the imported crate, or it is not
-exported from the given crate.
-
-This could be caused by a typo. Did you misspell the macro's name?
-
-Double-check the names of the macros listed for re-export, and that the crate
-in question exports them.
-
-A working version:
-
-```ignore (cannot-doctest-multicrate-project)
-// In some_crate crate:
-#[macro_export]
-macro_rules! eat {
-    ...
-}
-
-#[macro_export]
-macro_rules! drink {
-    ...
-}
-
-// In your_crate:
-#[macro_reexport(eat, drink)]
-extern crate some_crate;
 ```
 "##,
 
@@ -1626,7 +1582,7 @@ mod SomeModule {
                                             // `SomeModule` module.
 }
 
-println!("const value: {}", SomeModule::PRIVATE); // error: constant `CONSTANT`
+println!("const value: {}", SomeModule::PRIVATE); // error: constant `PRIVATE`
                                                   //        is private
 ```
 
@@ -1715,6 +1671,8 @@ register_diagnostics! {
 //  E0421, merged into 531
     E0531, // unresolved pattern path kind `name`
 //  E0427, merged into 530
+//  E0467, removed
+//  E0470, removed
     E0573,
     E0574,
     E0575,

@@ -87,7 +87,6 @@ use io;
 use iter::{self, FusedIterator};
 use ops::{self, Deref};
 use rc::Rc;
-use str::FromStr;
 use sync::Arc;
 
 use ffi::{OsStr, OsString};
@@ -298,10 +297,9 @@ pub const MAIN_SEPARATOR: char = ::sys::path::MAIN_SEP;
 // Iterate through `iter` while it matches `prefix`; return `None` if `prefix`
 // is not a prefix of `iter`, otherwise return `Some(iter_after_prefix)` giving
 // `iter` after having exhausted `prefix`.
-fn iter_after<A, I, J>(mut iter: I, mut prefix: J) -> Option<I>
-    where I: Iterator<Item = A> + Clone,
-          J: Iterator<Item = A>,
-          A: PartialEq
+fn iter_after<'a, 'b, I, J>(mut iter: I, mut prefix: J) -> Option<I>
+    where I: Iterator<Item = Component<'a>> + Clone,
+          J: Iterator<Item = Component<'b>>,
 {
     loop {
         let mut iter_next = iter.clone();
@@ -1044,8 +1042,6 @@ impl<'a> cmp::Ord for Components<'a> {
 /// # Examples
 ///
 /// ```
-/// #![feature(path_ancestors)]
-///
 /// use std::path::Path;
 ///
 /// let path = Path::new("/foo/bar");
@@ -1058,26 +1054,23 @@ impl<'a> cmp::Ord for Components<'a> {
 /// [`ancestors`]: struct.Path.html#method.ancestors
 /// [`Path`]: struct.Path.html
 #[derive(Copy, Clone, Debug)]
-#[unstable(feature = "path_ancestors", issue = "48581")]
+#[stable(feature = "path_ancestors", since = "1.28.0")]
 pub struct Ancestors<'a> {
     next: Option<&'a Path>,
 }
 
-#[unstable(feature = "path_ancestors", issue = "48581")]
+#[stable(feature = "path_ancestors", since = "1.28.0")]
 impl<'a> Iterator for Ancestors<'a> {
     type Item = &'a Path;
 
     fn next(&mut self) -> Option<Self::Item> {
         let next = self.next;
-        self.next = match next {
-            Some(path) => path.parent(),
-            None => None,
-        };
+        self.next = next.and_then(Path::parent);
         next
     }
 }
 
-#[unstable(feature = "path_ancestors", issue = "48581")]
+#[stable(feature = "path_ancestors", since = "1.28.0")]
 impl<'a> FusedIterator for Ancestors<'a> {}
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1414,6 +1407,14 @@ impl From<PathBuf> for Box<Path> {
     }
 }
 
+#[stable(feature = "more_box_slice_clone", since = "1.29.0")]
+impl Clone for Box<Path> {
+    #[inline]
+    fn clone(&self) -> Self {
+        self.to_path_buf().into_boxed_path()
+    }
+}
+
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, T: ?Sized + AsRef<OsStr>> From<&'a T> for PathBuf {
     fn from(s: &'a T) -> PathBuf {
@@ -1442,32 +1443,6 @@ impl From<String> for PathBuf {
     }
 }
 
-/// Error returned from [`PathBuf::from_str`][`from_str`].
-///
-/// Note that parsing a path will never fail. This error is just a placeholder
-/// for implementing `FromStr` for `PathBuf`.
-///
-/// [`from_str`]: struct.PathBuf.html#method.from_str
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[stable(feature = "path_from_str", since = "1.26.0")]
-pub enum ParsePathError {}
-
-#[stable(feature = "path_from_str", since = "1.26.0")]
-impl fmt::Display for ParsePathError {
-    fn fmt(&self, _: &mut fmt::Formatter) -> fmt::Result {
-        match *self {}
-    }
-}
-
-#[stable(feature = "path_from_str", since = "1.26.0")]
-impl FromStr for PathBuf {
-    type Err = ParsePathError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(PathBuf::from(s))
-    }
-}
-
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<P: AsRef<Path>> iter::FromIterator<P> for PathBuf {
     fn from_iter<I: IntoIterator<Item = P>>(iter: I) -> PathBuf {
@@ -1488,7 +1463,7 @@ impl<P: AsRef<Path>> iter::Extend<P> for PathBuf {
 
 #[stable(feature = "rust1", since = "1.0.0")]
 impl fmt::Debug for PathBuf {
-    fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(&**self, formatter)
     }
 }
@@ -1529,6 +1504,22 @@ impl<'a> From<PathBuf> for Cow<'a, Path> {
     #[inline]
     fn from(s: PathBuf) -> Cow<'a, Path> {
         Cow::Owned(s)
+    }
+}
+
+#[stable(feature = "cow_from_pathbuf_ref", since = "1.28.0")]
+impl<'a> From<&'a PathBuf> for Cow<'a, Path> {
+    #[inline]
+    fn from(p: &'a PathBuf) -> Cow<'a, Path> {
+        Cow::Borrowed(p.as_path())
+    }
+}
+
+#[stable(feature = "pathbuf_from_cow_path", since = "1.28.0")]
+impl<'a> From<Cow<'a, Path>> for PathBuf {
+    #[inline]
+    fn from(p: Cow<'a, Path>) -> Self {
+        p.into_owned()
     }
 }
 
@@ -1746,9 +1737,11 @@ impl Path {
 
     /// Converts a `Path` to a [`Cow<str>`].
     ///
-    /// Any non-Unicode sequences are replaced with U+FFFD REPLACEMENT CHARACTER.
+    /// Any non-Unicode sequences are replaced with
+    /// [`U+FFFD REPLACEMENT CHARACTER`][U+FFFD].
     ///
     /// [`Cow<str>`]: ../borrow/enum.Cow.html
+    /// [U+FFFD]: ../char/constant.REPLACEMENT_CHARACTER.html
     ///
     /// # Examples
     ///
@@ -1842,7 +1835,7 @@ impl Path {
     /// * On Unix, a path has a root if it begins with `/`.
     ///
     /// * On Windows, a path has a root if it:
-    ///     * has no prefix and begins with a separator, e.g. `\\windows`
+    ///     * has no prefix and begins with a separator, e.g. `\windows`
     ///     * has a prefix followed by a separator, e.g. `c:\windows` but not `c:windows`
     ///     * has any non-disk prefix, e.g. `\\server\share`
     ///
@@ -1902,8 +1895,6 @@ impl Path {
     /// # Examples
     ///
     /// ```
-    /// #![feature(path_ancestors)]
-    ///
     /// use std::path::Path;
     ///
     /// let mut ancestors = Path::new("/foo/bar").ancestors();
@@ -1915,7 +1906,7 @@ impl Path {
     ///
     /// [`None`]: ../../std/option/enum.Option.html#variant.None
     /// [`parent`]: struct.Path.html#method.parent
-    #[unstable(feature = "path_ancestors", issue = "48581")]
+    #[stable(feature = "path_ancestors", since = "1.28.0")]
     pub fn ancestors(&self) -> Ancestors {
         Ancestors {
             next: Some(&self),
@@ -1967,7 +1958,7 @@ impl Path {
     /// # Examples
     ///
     /// ```
-    /// use std::path::Path;
+    /// use std::path::{Path, PathBuf};
     ///
     /// let path = Path::new("/test/haha/foo.txt");
     ///
@@ -1978,17 +1969,20 @@ impl Path {
     /// assert_eq!(path.strip_prefix("/test/haha/foo.txt/"), Ok(Path::new("")));
     /// assert_eq!(path.strip_prefix("test").is_ok(), false);
     /// assert_eq!(path.strip_prefix("/haha").is_ok(), false);
+    ///
+    /// let prefix = PathBuf::from("/test/");
+    /// assert_eq!(path.strip_prefix(prefix), Ok(Path::new("haha/foo.txt")));
     /// ```
     #[stable(since = "1.7.0", feature = "path_strip_prefix")]
-    pub fn strip_prefix<'a, P: ?Sized>(&'a self, base: &'a P)
-                                       -> Result<&'a Path, StripPrefixError>
+    pub fn strip_prefix<P>(&self, base: P)
+                           -> Result<&Path, StripPrefixError>
         where P: AsRef<Path>
     {
         self._strip_prefix(base.as_ref())
     }
 
-    fn _strip_prefix<'a>(&'a self, base: &'a Path)
-                         -> Result<&'a Path, StripPrefixError> {
+    fn _strip_prefix(&self, base: &Path)
+                     -> Result<&Path, StripPrefixError> {
         iter_after(self.components(), base.components())
             .map(|c| c.as_path())
             .ok_or(StripPrefixError(()))
@@ -2309,8 +2303,8 @@ impl Path {
         fs::symlink_metadata(self)
     }
 
-    /// Returns the canonical form of the path with all intermediate components
-    /// normalized and symbolic links resolved.
+    /// Returns the canonical, absolute form of the path with all intermediate
+    /// components normalized and symbolic links resolved.
     ///
     /// This is an alias to [`fs::canonicalize`].
     ///

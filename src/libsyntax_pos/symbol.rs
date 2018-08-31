@@ -12,12 +12,16 @@
 //! allows bidirectional lookup; i.e. given a value, one can easily find the
 //! type, and vice versa.
 
+use edition::Edition;
 use hygiene::SyntaxContext;
 use {Span, DUMMY_SP, GLOBALS};
 
+use rustc_data_structures::fx::FxHashMap;
+use arena::DroplessArena;
 use serialize::{Decodable, Decoder, Encodable, Encoder};
-use std::collections::HashMap;
 use std::fmt;
+use std::str;
+use std::cmp::{PartialEq, Ordering, PartialOrd, Ord};
 use std::hash::{Hash, Hasher};
 
 #[derive(Copy, Clone, Eq)]
@@ -36,6 +40,11 @@ impl Ident {
         Ident::new(name, DUMMY_SP)
     }
 
+    /// Maps an interned string to an identifier with an empty syntax context.
+    pub fn from_interned_str(string: InternedString) -> Ident {
+        Ident::with_empty_ctxt(string.as_symbol())
+    }
+
     /// Maps a string to an identifier with an empty syntax context.
     pub fn from_str(string: &str) -> Ident {
         Ident::with_empty_ctxt(Symbol::intern(string))
@@ -47,11 +56,37 @@ impl Ident {
     }
 
     pub fn without_first_quote(self) -> Ident {
-        Ident::new(Symbol::intern(self.name.as_str().trim_left_matches('\'')), self.span)
+        Ident::new(Symbol::intern(self.as_str().trim_left_matches('\'')), self.span)
     }
 
+    /// "Normalize" ident for use in comparisons using "item hygiene".
+    /// Identifiers with same string value become same if they came from the same "modern" macro
+    /// (e.g. `macro` item, but not `macro_rules` item) and stay different if they came from
+    /// different "modern" macros.
+    /// Technically, this operation strips all non-opaque marks from ident's syntactic context.
     pub fn modern(self) -> Ident {
         Ident::new(self.name, self.span.modern())
+    }
+
+    /// "Normalize" ident for use in comparisons using "local variable hygiene".
+    /// Identifiers with same string value become same if they came from the same non-transparent
+    /// macro (e.g. `macro` or `macro_rules!` items) and stay different if they came from different
+    /// non-transparent macros.
+    /// Technically, this operation strips all transparent marks from ident's syntactic context.
+    pub fn modern_and_legacy(self) -> Ident {
+        Ident::new(self.name, self.span.modern_and_legacy())
+    }
+
+    pub fn gensym(self) -> Ident {
+        Ident::new(self.name.gensymed(), self.span)
+    }
+
+    pub fn as_str(self) -> LocalInternedString {
+        self.name.as_str()
+    }
+
+    pub fn as_interned_str(self) -> InternedString {
+        self.name.as_interned_str()
     }
 }
 
@@ -83,10 +118,10 @@ impl fmt::Display for Ident {
 impl Encodable for Ident {
     fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
         if self.span.ctxt().modern() == SyntaxContext::empty() {
-            s.emit_str(&self.name.as_str())
+            s.emit_str(&self.as_str())
         } else { // FIXME(jseyfried) intercrate hygiene
             let mut string = "#".to_owned();
-            string.push_str(&self.name.as_str());
+            string.push_str(&self.as_str());
             s.emit_str(&string)
         }
     }
@@ -134,11 +169,17 @@ impl Symbol {
         with_interner(|interner| interner.gensymed(self))
     }
 
-    pub fn as_str(self) -> InternedString {
+    pub fn as_str(self) -> LocalInternedString {
         with_interner(|interner| unsafe {
-            InternedString {
+            LocalInternedString {
                 string: ::std::mem::transmute::<&str, &str>(interner.get(self))
             }
+        })
+    }
+
+    pub fn as_interned_str(self) -> InternedString {
+        with_interner(|interner| InternedString {
+            symbol: interner.interned(self)
         })
     }
 
@@ -182,22 +223,35 @@ impl<T: ::std::ops::Deref<Target=str>> PartialEq<T> for Symbol {
     }
 }
 
-#[derive(Default)]
+// The &'static strs in this type actually point into the arena
 pub struct Interner {
-    names: HashMap<Box<str>, Symbol>,
-    strings: Vec<Box<str>>,
+    arena: DroplessArena,
+    names: FxHashMap<&'static str, Symbol>,
+    strings: Vec<&'static str>,
     gensyms: Vec<Symbol>,
 }
 
 impl Interner {
     pub fn new() -> Self {
-        Interner::default()
+        Interner {
+            arena: DroplessArena::new(),
+            names: Default::default(),
+            strings: Default::default(),
+            gensyms: Default::default(),
+        }
     }
 
     fn prefill(init: &[&str]) -> Self {
         let mut this = Interner::new();
         for &string in init {
-            this.intern(string);
+            if string == "" {
+                // We can't allocate empty strings in the arena, so handle this here
+                let name = Symbol(this.strings.len() as u32);
+                this.names.insert("", name);
+                this.strings.push("");
+            } else {
+                this.intern(string);
+            }
         }
         this
     }
@@ -208,8 +262,17 @@ impl Interner {
         }
 
         let name = Symbol(self.strings.len() as u32);
-        let string = string.to_string().into_boxed_str();
-        self.strings.push(string.clone());
+
+        // from_utf8_unchecked is safe since we just allocated a &str which is known to be utf8
+        let string: &str = unsafe {
+            str::from_utf8_unchecked(self.arena.alloc_slice(string.as_bytes()))
+        };
+        // It is safe to extend the arena allocation to 'static because we only access
+        // these while the arena is still alive
+        let string: &'static str =  unsafe {
+            &*(string as *const str)
+        };
+        self.strings.push(string);
         self.names.insert(string, name);
         name
     }
@@ -238,7 +301,7 @@ impl Interner {
 
     pub fn get(&self, symbol: Symbol) -> &str {
         match self.strings.get(symbol.0 as usize) {
-            Some(ref string) => string,
+            Some(string) => string,
             None => self.get(self.gensyms[(!0 - symbol.0) as usize]),
         }
     }
@@ -266,6 +329,17 @@ macro_rules! declare_keywords {(
                 ident: Ident::with_empty_ctxt(super::Symbol($index))
             };
         )*
+
+        impl ::std::str::FromStr for Keyword {
+            type Err = ();
+
+            fn from_str(s: &str) -> Result<Self, ()> {
+                match s {
+                    $($string => Ok($konst),)*
+                    _ => Err(()),
+                }
+            }
+        }
     }
 
     impl Interner {
@@ -278,7 +352,7 @@ macro_rules! declare_keywords {(
 // NB: leaving holes in the ident table is bad! a different ident will get
 // interned with the id from the hole, but it will be between the min and max
 // of the reserved words, and thus tagged as "reserved".
-// After modifying this list adjust `is_special_ident`, `is_used_keyword`/`is_unused_keyword`,
+// After modifying this list adjust `is_special`, `is_used_keyword`/`is_unused_keyword`,
 // this should be rarely necessary though if the keywords are kept in alphabetic order.
 declare_keywords! {
     // Special reserved identifiers used internally for elided lifetimes,
@@ -328,31 +402,82 @@ declare_keywords! {
 
     // Keywords reserved for future use.
     (40, Abstract,           "abstract")
-    (41, Alignof,            "alignof")
-    (42, Become,             "become")
-    (43, Do,                 "do")
-    (44, Final,              "final")
-    (45, Macro,              "macro")
-    (46, Offsetof,           "offsetof")
-    (47, Override,           "override")
-    (48, Priv,               "priv")
-    (49, Pure,               "pure")
-    (50, Sizeof,             "sizeof")
-    (51, Typeof,             "typeof")
-    (52, Unsized,            "unsized")
-    (53, Virtual,            "virtual")
-    (54, Yield,              "yield")
+    (41, Become,             "become")
+    (42, Do,                 "do")
+    (43, Final,              "final")
+    (44, Macro,              "macro")
+    (45, Override,           "override")
+    (46, Priv,               "priv")
+    (47, Typeof,             "typeof")
+    (48, Unsized,            "unsized")
+    (49, Virtual,            "virtual")
+    (50, Yield,              "yield")
+
+    // Edition-specific keywords reserved for future use.
+    (51, Async,              "async") // >= 2018 Edition Only
+    (52, Try,                "try") // >= 2018 Edition Only
 
     // Special lifetime names
-    (55, UnderscoreLifetime, "'_")
-    (56, StaticLifetime,     "'static")
+    (53, UnderscoreLifetime, "'_")
+    (54, StaticLifetime,     "'static")
 
     // Weak keywords, have special meaning only in specific contexts.
-    (57, Auto,               "auto")
-    (58, Catch,              "catch")
-    (59, Default,            "default")
-    (60, Dyn,                "dyn")
-    (61, Union,              "union")
+    (55, Auto,               "auto")
+    (56, Catch,              "catch")
+    (57, Default,            "default")
+    (58, Dyn,                "dyn")
+    (59, Union,              "union")
+    (60, Existential,        "existential")
+}
+
+impl Symbol {
+    fn is_unused_keyword_2018(self) -> bool {
+        self >= keywords::Async.name() &&
+        self <= keywords::Try.name()
+    }
+}
+
+impl Ident {
+    // Returns true for reserved identifiers used internally for elided lifetimes,
+    // unnamed method parameters, crate root module, error recovery etc.
+    pub fn is_special(self) -> bool {
+        self.name <= keywords::Underscore.name()
+    }
+
+    /// Returns `true` if the token is a keyword used in the language.
+    pub fn is_used_keyword(self) -> bool {
+        self.name >= keywords::As.name() && self.name <= keywords::While.name()
+    }
+
+    /// Returns `true` if the token is a keyword reserved for possible future use.
+    pub fn is_unused_keyword(self) -> bool {
+        // Note: `span.edition()` is relatively expensive, don't call it unless necessary.
+        self.name >= keywords::Abstract.name() && self.name <= keywords::Yield.name() ||
+        self.name.is_unused_keyword_2018() && self.span.edition() == Edition::Edition2018
+    }
+
+    /// Returns `true` if the token is either a special identifier or a keyword.
+    pub fn is_reserved(self) -> bool {
+        self.is_special() || self.is_used_keyword() || self.is_unused_keyword()
+    }
+
+    /// A keyword or reserved identifier that can be used as a path segment.
+    pub fn is_path_segment_keyword(self) -> bool {
+        self.name == keywords::Super.name() ||
+        self.name == keywords::SelfValue.name() ||
+        self.name == keywords::SelfType.name() ||
+        self.name == keywords::Extern.name() ||
+        self.name == keywords::Crate.name() ||
+        self.name == keywords::CrateRoot.name() ||
+        self.name == keywords::DollarCrate.name()
+    }
+
+    // We see this identifier in a normal identifier position, like variable name or a type.
+    // How was it written originally? Did it use the raw form? Let's try to guess.
+    pub fn is_raw_guess(self) -> bool {
+        self.name != keywords::Invalid.name() &&
+        self.is_reserved() && !self.is_path_segment_keyword()
+    }
 }
 
 // If an interner exists, return it. Otherwise, prepare a fresh one.
@@ -361,84 +486,208 @@ fn with_interner<T, F: FnOnce(&mut Interner) -> T>(f: F) -> T {
     GLOBALS.with(|globals| f(&mut *globals.symbol_interner.lock()))
 }
 
-/// Represents a string stored in the thread-local interner. Because the
-/// interner lives for the life of the thread, this can be safely treated as an
-/// immortal string, as long as it never crosses between threads.
-///
-/// FIXME(pcwalton): You must be careful about what you do in the destructors
-/// of objects stored in TLS, because they may run after the interner is
-/// destroyed. In particular, they must not access string contents. This can
-/// be fixed in the future by just leaking all strings until thread death
-/// somehow.
+/// Represents a string stored in the interner. Because the interner outlives any thread
+/// which uses this type, we can safely treat `string` which points to interner data,
+/// as an immortal string, as long as this type never crosses between threads.
+// FIXME: Ensure that the interner outlives any thread which uses LocalInternedString,
+//        by creating a new thread right after constructing the interner
 #[derive(Clone, Copy, Hash, PartialOrd, Eq, Ord)]
-pub struct InternedString {
+pub struct LocalInternedString {
     string: &'static str,
 }
 
-impl<U: ?Sized> ::std::convert::AsRef<U> for InternedString where str: ::std::convert::AsRef<U> {
+impl LocalInternedString {
+    pub fn as_interned_str(self) -> InternedString {
+        InternedString {
+            symbol: Symbol::intern(self.string)
+        }
+    }
+}
+
+impl<U: ?Sized> ::std::convert::AsRef<U> for LocalInternedString
+where
+    str: ::std::convert::AsRef<U>
+{
     fn as_ref(&self) -> &U {
         self.string.as_ref()
     }
 }
 
-impl<T: ::std::ops::Deref<Target = str>> ::std::cmp::PartialEq<T> for InternedString {
+impl<T: ::std::ops::Deref<Target = str>> ::std::cmp::PartialEq<T> for LocalInternedString {
     fn eq(&self, other: &T) -> bool {
         self.string == other.deref()
     }
 }
 
-impl ::std::cmp::PartialEq<InternedString> for str {
-    fn eq(&self, other: &InternedString) -> bool {
+impl ::std::cmp::PartialEq<LocalInternedString> for str {
+    fn eq(&self, other: &LocalInternedString) -> bool {
         self == other.string
     }
 }
 
-impl<'a> ::std::cmp::PartialEq<InternedString> for &'a str {
-    fn eq(&self, other: &InternedString) -> bool {
+impl<'a> ::std::cmp::PartialEq<LocalInternedString> for &'a str {
+    fn eq(&self, other: &LocalInternedString) -> bool {
         *self == other.string
     }
 }
 
-impl ::std::cmp::PartialEq<InternedString> for String {
-    fn eq(&self, other: &InternedString) -> bool {
+impl ::std::cmp::PartialEq<LocalInternedString> for String {
+    fn eq(&self, other: &LocalInternedString) -> bool {
         self == other.string
     }
 }
 
-impl<'a> ::std::cmp::PartialEq<InternedString> for &'a String {
-    fn eq(&self, other: &InternedString) -> bool {
+impl<'a> ::std::cmp::PartialEq<LocalInternedString> for &'a String {
+    fn eq(&self, other: &LocalInternedString) -> bool {
         *self == other.string
     }
 }
 
-impl !Send for InternedString { }
+impl !Send for LocalInternedString {}
+impl !Sync for LocalInternedString {}
 
-impl ::std::ops::Deref for InternedString {
+impl ::std::ops::Deref for LocalInternedString {
     type Target = str;
     fn deref(&self) -> &str { self.string }
 }
 
-impl fmt::Debug for InternedString {
+impl fmt::Debug for LocalInternedString {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Debug::fmt(self.string, f)
     }
 }
 
-impl fmt::Display for InternedString {
+impl fmt::Display for LocalInternedString {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(self.string, f)
     }
 }
 
+impl Decodable for LocalInternedString {
+    fn decode<D: Decoder>(d: &mut D) -> Result<LocalInternedString, D::Error> {
+        Ok(Symbol::intern(&d.read_str()?).as_str())
+    }
+}
+
+impl Encodable for LocalInternedString {
+    fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
+        s.emit_str(self.string)
+    }
+}
+
+/// Represents a string stored in the string interner
+#[derive(Clone, Copy, Eq)]
+pub struct InternedString {
+    symbol: Symbol,
+}
+
+impl InternedString {
+    pub fn with<F: FnOnce(&str) -> R, R>(self, f: F) -> R {
+        let str = with_interner(|interner| {
+            interner.get(self.symbol) as *const str
+        });
+        // This is safe because the interner keeps string alive until it is dropped.
+        // We can access it because we know the interner is still alive since we use a
+        // scoped thread local to access it, and it was alive at the beginning of this scope
+        unsafe { f(&*str) }
+    }
+
+    pub fn as_symbol(self) -> Symbol {
+        self.symbol
+    }
+
+    pub fn as_str(self) -> LocalInternedString {
+        self.symbol.as_str()
+    }
+}
+
+impl Hash for InternedString {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.with(|str| str.hash(state))
+    }
+}
+
+impl PartialOrd<InternedString> for InternedString {
+    fn partial_cmp(&self, other: &InternedString) -> Option<Ordering> {
+        if self.symbol == other.symbol {
+            return Some(Ordering::Equal);
+        }
+        self.with(|self_str| other.with(|other_str| self_str.partial_cmp(other_str)))
+    }
+}
+
+impl Ord for InternedString {
+    fn cmp(&self, other: &InternedString) -> Ordering {
+        if self.symbol == other.symbol {
+            return Ordering::Equal;
+        }
+        self.with(|self_str| other.with(|other_str| self_str.cmp(&other_str)))
+    }
+}
+
+impl<T: ::std::ops::Deref<Target = str>> PartialEq<T> for InternedString {
+    fn eq(&self, other: &T) -> bool {
+        self.with(|string| string == other.deref())
+    }
+}
+
+impl PartialEq<InternedString> for InternedString {
+    fn eq(&self, other: &InternedString) -> bool {
+        self.symbol == other.symbol
+    }
+}
+
+impl PartialEq<InternedString> for str {
+    fn eq(&self, other: &InternedString) -> bool {
+        other.with(|string| self == string)
+    }
+}
+
+impl<'a> PartialEq<InternedString> for &'a str {
+    fn eq(&self, other: &InternedString) -> bool {
+        other.with(|string| *self == string)
+    }
+}
+
+impl PartialEq<InternedString> for String {
+    fn eq(&self, other: &InternedString) -> bool {
+        other.with(|string| self == string)
+    }
+}
+
+impl<'a> PartialEq<InternedString> for &'a String {
+    fn eq(&self, other: &InternedString) -> bool {
+        other.with(|string| *self == string)
+    }
+}
+
+impl ::std::convert::From<InternedString> for String {
+    fn from(val: InternedString) -> String {
+        val.as_symbol().to_string()
+    }
+}
+
+impl fmt::Debug for InternedString {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.with(|str| fmt::Debug::fmt(&str, f))
+    }
+}
+
+impl fmt::Display for InternedString {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.with(|str| fmt::Display::fmt(&str, f))
+    }
+}
+
 impl Decodable for InternedString {
     fn decode<D: Decoder>(d: &mut D) -> Result<InternedString, D::Error> {
-        Ok(Symbol::intern(&d.read_str()?).as_str())
+        Ok(Symbol::intern(&d.read_str()?).as_interned_str())
     }
 }
 
 impl Encodable for InternedString {
     fn encode<S: Encoder>(&self, s: &mut S) -> Result<(), S::Error> {
-        s.emit_str(self.string)
+        self.with(|string| s.emit_str(string))
     }
 }
 

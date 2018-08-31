@@ -16,7 +16,7 @@
 //!
 //! ```
 //! #![rustc_partition_reused(module="spike", cfg="rpass2")]
-//! #![rustc_partition_translated(module="spike-x", cfg="rpass2")]
+//! #![rustc_partition_codegened(module="spike-x", cfg="rpass2")]
 //! ```
 //!
 //! The first indicates (in the cfg `rpass2`) that `spike.o` will be
@@ -27,18 +27,18 @@
 //! the HIR doesn't change as a result of the annotations, which might
 //! perturb the reuse results.
 
+use rustc::hir::def_id::LOCAL_CRATE;
 use rustc::dep_graph::{DepNode, DepConstructor};
-use rustc::mir::mono::CodegenUnit;
+use rustc::mir::mono::CodegenUnitNameBuilder;
 use rustc::ty::TyCtxt;
 use syntax::ast;
-use syntax_pos::symbol::Symbol;
-use rustc::ich::{ATTR_PARTITION_REUSED, ATTR_PARTITION_TRANSLATED};
+use rustc::ich::{ATTR_PARTITION_REUSED, ATTR_PARTITION_CODEGENED};
 
 const MODULE: &'static str = "module";
 const CFG: &'static str = "cfg";
 
 #[derive(Debug, PartialEq, Clone, Copy)]
-enum Disposition { Reused, Translated }
+enum Disposition { Reused, Codegened }
 
 pub fn assert_module_sources<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     tcx.dep_graph.with_ignore(|| {
@@ -61,8 +61,8 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
     fn check_attr(&self, attr: &ast::Attribute) {
         let disposition = if attr.check_name(ATTR_PARTITION_REUSED) {
             Disposition::Reused
-        } else if attr.check_name(ATTR_PARTITION_TRANSLATED) {
-            Disposition::Translated
+        } else if attr.check_name(ATTR_PARTITION_CODEGENED) {
+            Disposition::Codegened
         } else {
             return;
         };
@@ -72,34 +72,71 @@ impl<'a, 'tcx> AssertModuleSource<'a, 'tcx> {
             return;
         }
 
-        let mname = self.field(attr, MODULE);
-        let mangled_cgu_name = CodegenUnit::mangle_name(&mname.as_str());
-        let mangled_cgu_name = Symbol::intern(&mangled_cgu_name).as_str();
+        let user_path = self.field(attr, MODULE).as_str().to_string();
+        let crate_name = self.tcx.crate_name(LOCAL_CRATE).as_str().to_string();
+
+        if !user_path.starts_with(&crate_name) {
+            let msg = format!("Found malformed codegen unit name `{}`. \
+                Codegen units names must always start with the name of the \
+                crate (`{}` in this case).", user_path, crate_name);
+            self.tcx.sess.span_fatal(attr.span, &msg);
+        }
+
+        // Split of the "special suffix" if there is one.
+        let (user_path, cgu_special_suffix) = if let Some(index) = user_path.rfind(".") {
+            (&user_path[..index], Some(&user_path[index + 1 ..]))
+        } else {
+            (&user_path[..], None)
+        };
+
+        let mut cgu_path_components = user_path.split("-").collect::<Vec<_>>();
+
+        // Remove the crate name
+        assert_eq!(cgu_path_components.remove(0), crate_name);
+
+        let cgu_name_builder = &mut CodegenUnitNameBuilder::new(self.tcx);
+        let cgu_name = cgu_name_builder.build_cgu_name(LOCAL_CRATE,
+                                                       cgu_path_components,
+                                                       cgu_special_suffix);
+
+        debug!("mapping '{}' to cgu name '{}'", self.field(attr, MODULE), cgu_name);
 
         let dep_node = DepNode::new(self.tcx,
-                                    DepConstructor::CompileCodegenUnit(mangled_cgu_name));
+                                    DepConstructor::CompileCodegenUnit(cgu_name));
 
         if let Some(loaded_from_cache) = self.tcx.dep_graph.was_loaded_from_cache(&dep_node) {
             match (disposition, loaded_from_cache) {
                 (Disposition::Reused, false) => {
                     self.tcx.sess.span_err(
                         attr.span,
-                        &format!("expected module named `{}` to be Reused but is Translated",
-                                 mname));
+                        &format!("expected module named `{}` to be Reused but is Codegened",
+                                 user_path));
                 }
-                (Disposition::Translated, true) => {
+                (Disposition::Codegened, true) => {
                     self.tcx.sess.span_err(
                         attr.span,
-                        &format!("expected module named `{}` to be Translated but is Reused",
-                                 mname));
+                        &format!("expected module named `{}` to be Codegened but is Reused",
+                                 user_path));
                 }
                 (Disposition::Reused, true) |
-                (Disposition::Translated, false) => {
+                (Disposition::Codegened, false) => {
                     // These are what we would expect.
                 }
             }
         } else {
-            self.tcx.sess.span_err(attr.span, &format!("no module named `{}`", mname));
+            let available_cgus = self.tcx
+                .collect_and_partition_mono_items(LOCAL_CRATE)
+                .1
+                .iter()
+                .map(|cgu| format!("{}", cgu.name()))
+                .collect::<Vec<String>>()
+                .join(", ");
+
+            self.tcx.sess.span_err(attr.span,
+                &format!("no module named `{}` (mangled: {}).\nAvailable modules: {}",
+                    user_path,
+                    cgu_name,
+                    available_cgus));
         }
     }
 

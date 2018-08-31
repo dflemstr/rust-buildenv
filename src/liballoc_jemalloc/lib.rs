@@ -11,27 +11,25 @@
 #![no_std]
 #![allow(unused_attributes)]
 #![unstable(feature = "alloc_jemalloc",
-            reason = "this library is unlikely to be stabilized in its current \
-                      form or name",
-            issue = "27783")]
-#![feature(alloc_system)]
+            reason = "implementation detail of std, does not provide any public API",
+            issue = "0")]
+#![feature(core_intrinsics)]
 #![feature(libc)]
 #![feature(linkage)]
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(staged_api)]
 #![feature(rustc_attrs)]
 #![cfg_attr(dummy_jemalloc, allow(dead_code, unused_extern_crates))]
 #![cfg_attr(not(dummy_jemalloc), feature(allocator_api))]
 #![rustc_alloc_kind = "exe"]
 
-extern crate alloc_system;
 extern crate libc;
 
 #[cfg(not(dummy_jemalloc))]
 pub use contents::*;
 #[cfg(not(dummy_jemalloc))]
 mod contents {
-    use core::alloc::GlobalAlloc;
-    use alloc_system::System;
     use libc::{c_int, c_void, size_t};
 
     // Note that the symbols here are prefixed by default on macOS and Windows (we
@@ -92,22 +90,16 @@ mod contents {
     // linkage directives are provided as part of the current compiler allocator
     // ABI
 
-    #[no_mangle]
     #[rustc_std_internal_symbol]
+    #[cfg_attr(stage0, no_mangle)]
     pub unsafe extern fn __rde_alloc(size: usize, align: usize) -> *mut u8 {
         let flags = align_to_flags(align, size);
         let ptr = mallocx(size as size_t, flags) as *mut u8;
         ptr
     }
 
-    #[no_mangle]
     #[rustc_std_internal_symbol]
-    pub unsafe extern fn __rde_oom() -> ! {
-        System.oom()
-    }
-
-    #[no_mangle]
-    #[rustc_std_internal_symbol]
+    #[cfg_attr(stage0, no_mangle)]
     pub unsafe extern fn __rde_dealloc(ptr: *mut u8,
                                        size: usize,
                                        align: usize) {
@@ -115,8 +107,8 @@ mod contents {
         sdallocx(ptr as *mut c_void, size, flags);
     }
 
-    #[no_mangle]
     #[rustc_std_internal_symbol]
+    #[cfg_attr(stage0, no_mangle)]
     pub unsafe extern fn __rde_realloc(ptr: *mut u8,
                                        _old_size: usize,
                                        align: usize,
@@ -126,8 +118,8 @@ mod contents {
         ptr
     }
 
-    #[no_mangle]
     #[rustc_std_internal_symbol]
+    #[cfg_attr(stage0, no_mangle)]
     pub unsafe extern fn __rde_alloc_zeroed(size: usize, align: usize) -> *mut u8 {
         let ptr = if align <= MIN_ALIGN && align <= size {
             calloc(size as size_t, 1) as *mut u8

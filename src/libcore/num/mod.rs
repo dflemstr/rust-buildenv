@@ -16,15 +16,14 @@ use convert::TryFrom;
 use fmt;
 use intrinsics;
 use mem;
-#[allow(deprecated)] use nonzero::NonZero;
+use nonzero::NonZero;
 use ops;
 use str::FromStr;
 
 macro_rules! impl_nonzero_fmt {
-    ( #[$stability: meta] ( $( $Trait: ident ),+ ) for $Ty: ident ) => {
+    ( ( $( $Trait: ident ),+ ) for $Ty: ident ) => {
         $(
-            #[$stability]
-            #[allow(deprecated)]
+            #[stable(feature = "nonzero", since = "1.28.0")]
             impl fmt::$Trait for $Ty {
                 #[inline]
                 fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -35,39 +34,47 @@ macro_rules! impl_nonzero_fmt {
     }
 }
 
-macro_rules! nonzero_integers {
-    ( #[$stability: meta] #[$deprecation: meta] $( $Ty: ident($Int: ty); )+ ) => {
-        $(
-            /// An integer that is known not to equal zero.
-            ///
-            /// This may enable some memory layout optimization such as:
-            ///
-            /// ```rust
-            /// # #![feature(nonzero)]
-            /// use std::mem::size_of;
-            /// assert_eq!(size_of::<Option<std::num::NonZeroU32>>(), size_of::<u32>());
-            /// ```
-            #[$stability]
-            #[$deprecation]
-            #[allow(deprecated)]
-            #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-            pub struct $Ty(NonZero<$Int>);
+macro_rules! doc_comment {
+    ($x:expr, $($tt:tt)*) => {
+        #[doc = $x]
+        $($tt)*
+    };
+}
 
-            #[allow(deprecated)]
+macro_rules! nonzero_integers {
+    ( $( $Ty: ident($Int: ty); )+ ) => {
+        $(
+            doc_comment! {
+                concat!("An integer that is known not to equal zero.
+
+This enables some memory layout optimization.
+For example, `Option<", stringify!($Ty), ">` is the same size as `", stringify!($Int), "`:
+
+```rust
+use std::mem::size_of;
+assert_eq!(size_of::<Option<std::num::", stringify!($Ty), ">>(), size_of::<", stringify!($Int),
+">());
+```"),
+                #[stable(feature = "nonzero", since = "1.28.0")]
+                #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
+                #[repr(transparent)]
+                pub struct $Ty(NonZero<$Int>);
+            }
+
             impl $Ty {
                 /// Create a non-zero without checking the value.
                 ///
                 /// # Safety
                 ///
                 /// The value must not be zero.
-                #[$stability]
+                #[stable(feature = "nonzero", since = "1.28.0")]
                 #[inline]
                 pub const unsafe fn new_unchecked(n: $Int) -> Self {
                     $Ty(NonZero(n))
                 }
 
                 /// Create a non-zero if the given value is not zero.
-                #[$stability]
+                #[stable(feature = "nonzero", since = "1.28.0")]
                 #[inline]
                 pub fn new(n: $Int) -> Option<Self> {
                     if n != 0 {
@@ -78,7 +85,7 @@ macro_rules! nonzero_integers {
                 }
 
                 /// Returns the value as a primitive type.
-                #[$stability]
+                #[stable(feature = "nonzero", since = "1.28.0")]
                 #[inline]
                 pub fn get(self) -> $Int {
                     self.0 .0
@@ -87,7 +94,6 @@ macro_rules! nonzero_integers {
             }
 
             impl_nonzero_fmt! {
-                #[$stability]
                 (Debug, Display, Binary, Octal, LowerHex, UpperHex) for $Ty
             }
         )+
@@ -95,27 +101,12 @@ macro_rules! nonzero_integers {
 }
 
 nonzero_integers! {
-    #[unstable(feature = "nonzero", issue = "49137")]
-    #[allow(deprecated)]  // Redundant, works around "error: inconsistent lockstep iteration"
     NonZeroU8(u8);
     NonZeroU16(u16);
     NonZeroU32(u32);
     NonZeroU64(u64);
     NonZeroU128(u128);
     NonZeroUsize(usize);
-}
-
-nonzero_integers! {
-    #[unstable(feature = "nonzero", issue = "49137")]
-    #[rustc_deprecated(since = "1.26.0", reason = "\
-        signed non-zero integers are considered for removal due to lack of known use cases. \
-        If you’re using them, please comment on https://github.com/rust-lang/rust/issues/49137")]
-    NonZeroI8(i8);
-    NonZeroI16(i16);
-    NonZeroI32(i32);
-    NonZeroI64(i64);
-    NonZeroI128(i128);
-    NonZeroIsize(isize);
 }
 
 /// Provides intentionally-wrapped arithmetic on `T`.
@@ -143,6 +134,7 @@ nonzero_integers! {
 /// ```
 #[stable(feature = "rust1", since = "1.0.0")]
 #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default, Hash)]
+#[repr(transparent)]
 pub struct Wrapping<T>(#[stable(feature = "rust1", since = "1.0.0")]
                        pub T);
 
@@ -188,25 +180,19 @@ impl<T: fmt::UpperHex> fmt::UpperHex for Wrapping<T> {
     }
 }
 
-mod wrapping;
-
 // All these modules are technically private and only exposed for coretests:
 pub mod flt2dec;
 pub mod dec2flt;
 pub mod bignum;
 pub mod diy_float;
 
-macro_rules! doc_comment {
-    ($x:expr, $($tt:tt)*) => {
-        #[doc = $x]
-        $($tt)*
-    };
-}
+mod wrapping;
 
 // `Int` + `SignedInt` implemented for signed integers
 macro_rules! int_impl {
     ($SelfT:ty, $ActualT:ident, $UnsignedT:ty, $BITS:expr, $Min:expr, $Max:expr, $Feature:expr,
-     $EndFeature:expr) => {
+     $EndFeature:expr, $rot:expr, $rot_op:expr, $rot_result:expr, $swap_op:expr, $swapped:expr,
+     $reversed:expr) => {
         doc_comment! {
             concat!("Returns the smallest value that can be represented by this integer type.
 
@@ -252,7 +238,7 @@ depending on `radix`:
 
  * `0-9`
  * `a-z`
- * `a-z`
+ * `A-Z`
 
 # Panics
 
@@ -287,8 +273,9 @@ $EndFeature, "
 ```
 "),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn count_ones(self) -> u32 { (self as $UnsignedT).count_ones() }
+            pub const fn count_ones(self) -> u32 { (self as $UnsignedT).count_ones() }
         }
 
         doc_comment! {
@@ -302,8 +289,9 @@ Basic usage:
 ", $Feature, "assert_eq!(", stringify!($SelfT), "::max_value().count_zeros(), 1);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn count_zeros(self) -> u32 {
+            pub const fn count_zeros(self) -> u32 {
                 (!self).count_ones()
             }
         }
@@ -322,8 +310,9 @@ assert_eq!(n.leading_zeros(), 0);",
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn leading_zeros(self) -> u32 {
+            pub const fn leading_zeros(self) -> u32 {
                 (self as $UnsignedT).leading_zeros()
             }
         }
@@ -342,110 +331,101 @@ assert_eq!(n.trailing_zeros(), 2);",
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn trailing_zeros(self) -> u32 {
+            pub const fn trailing_zeros(self) -> u32 {
                 (self as $UnsignedT).trailing_zeros()
             }
         }
 
-        /// Shifts the bits to the left by a specified amount, `n`,
-        /// wrapping the truncated bits to the end of the resulting integer.
-        ///
-        /// Please note this isn't the same operation as `<<`!
-        ///
-        /// # Examples
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `i64` is used here.
-        ///
-        /// Basic usage:
-        ///
-        /// ```
-        /// let n = 0x0123456789ABCDEFi64;
-        /// let m = -0x76543210FEDCBA99i64;
-        ///
-        /// assert_eq!(n.rotate_left(32), m);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn rotate_left(self, n: u32) -> Self {
-            (self as $UnsignedT).rotate_left(n) as Self
+        doc_comment! {
+            concat!("Shifts the bits to the left by a specified amount, `n`,
+wrapping the truncated bits to the end of the resulting integer.
+
+Please note this isn't the same operation as `<<`!
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $rot_op, stringify!($SelfT), ";
+let m = ", $rot_result, ";
+
+assert_eq!(n.rotate_left(", $rot, "), m);
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[inline]
+            pub fn rotate_left(self, n: u32) -> Self {
+                (self as $UnsignedT).rotate_left(n) as Self
+            }
         }
 
-        /// Shifts the bits to the right by a specified amount, `n`,
-        /// wrapping the truncated bits to the beginning of the resulting
-        /// integer.
-        ///
-        /// Please note this isn't the same operation as `>>`!
-        ///
-        /// # Examples
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `i64` is used here.
-        ///
-        /// Basic usage:
-        ///
-        /// ```
-        /// let n = 0x0123456789ABCDEFi64;
-        /// let m = -0xFEDCBA987654322i64;
-        ///
-        /// assert_eq!(n.rotate_right(4), m);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn rotate_right(self, n: u32) -> Self {
-            (self as $UnsignedT).rotate_right(n) as Self
+        doc_comment! {
+            concat!("Shifts the bits to the right by a specified amount, `n`,
+wrapping the truncated bits to the beginning of the resulting
+integer.
+
+Please note this isn't the same operation as `>>`!
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $rot_result, stringify!($SelfT), ";
+let m = ", $rot_op, ";
+
+assert_eq!(n.rotate_right(", $rot, "), m);
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[inline]
+            pub fn rotate_right(self, n: u32) -> Self {
+                (self as $UnsignedT).rotate_right(n) as Self
+            }
+        }
+        doc_comment! {
+            concat!("Reverses the byte order of the integer.
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $swap_op, stringify!($SelfT), ";
+
+let m = n.swap_bytes();
+
+assert_eq!(m, ", $swapped, ");
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
+            #[inline]
+            pub const fn swap_bytes(self) -> Self {
+                (self as $UnsignedT).swap_bytes() as Self
+            }
         }
 
-        /// Reverses the byte order of the integer.
-        ///
-        /// # Examples
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `i16` is used here.
-        ///
-        /// Basic usage:
-        ///
-        /// ```
-        /// let n: i16 = 0b0000000_01010101;
-        /// assert_eq!(n, 85);
-        ///
-        /// let m = n.swap_bytes();
-        ///
-        /// assert_eq!(m, 0b01010101_00000000);
-        /// assert_eq!(m, 21760);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn swap_bytes(self) -> Self {
-            (self as $UnsignedT).swap_bytes() as Self
-        }
+        doc_comment! {
+            concat!("Reverses the bit pattern of the integer.
 
-        /// Reverses the bit pattern of the integer.
-        ///
-        /// # Examples
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `i16` is used here.
-        ///
-        /// Basic usage:
-        ///
-        /// ```
-        /// #![feature(reverse_bits)]
-        ///
-        /// let n: i16 = 0b0000000_01010101;
-        /// assert_eq!(n, 85);
-        ///
-        /// let m = n.reverse_bits();
-        ///
-        /// assert_eq!(m as u16, 0b10101010_00000000);
-        /// assert_eq!(m, -22016);
-        /// ```
-        #[unstable(feature = "reverse_bits", issue = "48763")]
-        #[cfg(not(stage0))]
-        #[inline]
-        pub fn reverse_bits(self) -> Self {
-            (self as $UnsignedT).reverse_bits() as Self
+# Examples
+
+Basic usage:
+
+```
+#![feature(reverse_bits)]
+
+let n = ", $swap_op, stringify!($SelfT), ";
+let m = n.reverse_bits();
+
+assert_eq!(m, ", $reversed, ");
+```"),
+            #[unstable(feature = "reverse_bits", issue = "48763")]
+            #[inline]
+            pub fn reverse_bits(self) -> Self {
+                (self as $UnsignedT).reverse_bits() as Self
+            }
         }
 
         doc_comment! {
@@ -468,9 +448,17 @@ if cfg!(target_endian = \"big\") {
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn from_be(x: Self) -> Self {
-                if cfg!(target_endian = "big") { x } else { x.swap_bytes() }
+            pub const fn from_be(x: Self) -> Self {
+                #[cfg(target_endian = "big")]
+                {
+                    x
+                }
+                #[cfg(not(target_endian = "big"))]
+                {
+                    x.swap_bytes()
+                }
             }
         }
 
@@ -494,9 +482,17 @@ if cfg!(target_endian = \"little\") {
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn from_le(x: Self) -> Self {
-                if cfg!(target_endian = "little") { x } else { x.swap_bytes() }
+            pub const fn from_le(x: Self) -> Self {
+                #[cfg(target_endian = "little")]
+                {
+                    x
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    x.swap_bytes()
+                }
             }
         }
 
@@ -520,9 +516,17 @@ if cfg!(target_endian = \"big\") {
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn to_be(self) -> Self { // or not to be?
-                if cfg!(target_endian = "big") { self } else { self.swap_bytes() }
+            pub const fn to_be(self) -> Self { // or not to be?
+                #[cfg(target_endian = "big")]
+                {
+                    self
+                }
+                #[cfg(not(target_endian = "big"))]
+                {
+                    self.swap_bytes()
+                }
             }
         }
 
@@ -546,9 +550,17 @@ if cfg!(target_endian = \"little\") {
 $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn to_le(self) -> Self {
-                if cfg!(target_endian = "little") { self } else { self.swap_bytes() }
+            pub const fn to_le(self) -> Self {
+                #[cfg(target_endian = "little")]
+                {
+                    self
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    self.swap_bytes()
+                }
             }
         }
 
@@ -1765,7 +1777,11 @@ assert_eq!((-a).mod_euc(-b), 1);
             pub fn mod_euc(self, rhs: Self) -> Self {
                 let r = self % rhs;
                 if r < 0 {
-                    r + rhs.abs()
+                    if rhs < 0 {
+                        r - rhs
+                    } else {
+                        r + rhs
+                    }
                 } else {
                     r
                 }
@@ -1870,47 +1886,119 @@ $EndFeature, "
             pub fn is_negative(self) -> bool { self < 0 }
         }
 
-        /// Return the memory representation of this integer as a byte array.
-        ///
-        /// The target platform’s native endianness is used.
-        /// Portable code likely wants to use this after [`to_be`] or [`to_le`].
-        ///
-        /// [`to_be`]: #method.to_be
-        /// [`to_le`]: #method.to_le
+        /// Return the memory representation of this integer as a byte array in
+        /// big-endian (network) byte order.
         ///
         /// # Examples
         ///
         /// ```
         /// #![feature(int_to_from_bytes)]
         ///
-        /// let bytes = i32::min_value().to_be().to_bytes();
+        /// let bytes = 0x12_34_56_78_i32.to_be_bytes();
+        /// assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn to_be_bytes(self) -> [u8; mem::size_of::<Self>()] {
+            self.to_be().to_ne_bytes()
+        }
+
+        /// Return the memory representation of this integer as a byte array in
+        /// little-endian byte order.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let bytes =  0x12_34_56_78_i32.to_le_bytes();
+        /// assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12]);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn to_le_bytes(self) -> [u8; mem::size_of::<Self>()] {
+            self.to_le().to_ne_bytes()
+        }
+
+        /// Return the memory representation of this integer as a byte array in
+        /// native byte order.
+        ///
+        /// As the target platform's native endianness is used, portable code
+        /// should use [`to_be_bytes`] or [`to_le_bytes`], as appropriate,
+        /// instead.
+        ///
+        /// [`to_be_bytes`]: #method.to_be_bytes
+        /// [`to_le_bytes`]: #method.to_le_bytes
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let bytes = i32::min_value().to_be().to_ne_bytes();
         /// assert_eq!(bytes, [0x80, 0, 0, 0]);
         /// ```
-        #[unstable(feature = "int_to_from_bytes", issue = "49792")]
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
         #[inline]
-        pub fn to_bytes(self) -> [u8; mem::size_of::<Self>()] {
+        pub fn to_ne_bytes(self) -> [u8; mem::size_of::<Self>()] {
             unsafe { mem::transmute(self) }
         }
 
-        /// Create an integer value from its memory representation as a byte array.
-        ///
-        /// The target platform’s native endianness is used.
-        /// Portable code likely wants to use [`from_be`] or [`from_le`] after this.
-        ///
-        /// [`from_be`]: #method.from_be
-        /// [`from_le`]: #method.from_le
+        /// Create an integer value from its representation as a byte array in
+        /// big endian.
         ///
         /// # Examples
         ///
         /// ```
         /// #![feature(int_to_from_bytes)]
         ///
-        /// let int = i32::from_be(i32::from_bytes([0x80, 0, 0, 0]));
+        /// let int = i32::from_be_bytes([0x12, 0x34, 0x56, 0x78]);
+        /// assert_eq!(int, 0x12_34_56_78);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn from_be_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+            Self::from_be(Self::from_ne_bytes(bytes))
+        }
+
+        /// Create an integer value from its representation as a byte array in
+        /// little endian.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let int = i32::from_le_bytes([0x12, 0x34, 0x56, 0x78]);
+        /// assert_eq!(int, 0x78_56_34_12);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn from_le_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+            Self::from_le(Self::from_ne_bytes(bytes))
+        }
+
+        /// Create an integer value from its memory representation as a byte
+        /// array in native endianness.
+        ///
+        /// As the target platform's native endianness is used, portable code
+        /// likely wants to use [`from_be_bytes`] or [`from_le_bytes`], as
+        /// appropriate instead.
+        ///
+        /// [`from_be_bytes`]: #method.from_be_bytes
+        /// [`from_le_bytes`]: #method.from_le_bytes
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let int = i32::from_be(i32::from_ne_bytes([0x80, 0, 0, 0]));
         /// assert_eq!(int, i32::min_value());
         /// ```
-        #[unstable(feature = "int_to_from_bytes", issue = "49792")]
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
         #[inline]
-        pub fn from_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+        pub fn from_ne_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
             unsafe { mem::transmute(bytes) }
         }
     }
@@ -1918,51 +2006,77 @@ $EndFeature, "
 
 #[lang = "i8"]
 impl i8 {
-    int_impl! { i8, i8, u8, 8, -128, 127, "", "" }
+    int_impl! { i8, i8, u8, 8, -128, 127, "", "", 2, "-0x7e", "0xa", "0x12", "0x12", "0x48" }
 }
 
 #[lang = "i16"]
 impl i16 {
-    int_impl! { i16, i16, u16, 16, -32768, 32767, "", "" }
+    int_impl! { i16, i16, u16, 16, -32768, 32767, "", "", 4, "-0x5ffd", "0x3a", "0x1234", "0x3412",
+        "0x2c48" }
 }
 
 #[lang = "i32"]
 impl i32 {
-    int_impl! { i32, i32, u32, 32, -2147483648, 2147483647, "", "" }
+    int_impl! { i32, i32, u32, 32, -2147483648, 2147483647, "", "", 8, "0x10000b3", "0xb301",
+        "0x12345678", "0x78563412", "0x1e6a2c48" }
 }
 
 #[lang = "i64"]
 impl i64 {
-    int_impl! { i64, i64, u64, 64, -9223372036854775808, 9223372036854775807, "", "" }
+    int_impl! { i64, i64, u64, 64, -9223372036854775808, 9223372036854775807, "", "", 12,
+         "0xaa00000000006e1", "0x6e10aa", "0x1234567890123456", "0x5634129078563412",
+         "0x6a2c48091e6a2c48" }
 }
 
 #[lang = "i128"]
 impl i128 {
     int_impl! { i128, i128, u128, 128, -170141183460469231731687303715884105728,
-        170141183460469231731687303715884105727, "", "" }
+        170141183460469231731687303715884105727, "", "", 16,
+        "0x13f40000000000000000000000004f76", "0x4f7613f4", "0x12345678901234567890123456789012",
+        "0x12907856341290785634129078563412", "0x48091e6a2c48091e6a2c48091e6a2c48"
+    }
 }
 
 #[cfg(target_pointer_width = "16")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { isize, i16, u16, 16, -32768, 32767, "", "" }
+    int_impl! { isize, i16, u16, 16, -32768, 32767, "", "", 4, "-0x5ffd", "0x3a", "0x1234",
+        "0x3412", "0x2c48" }
 }
 
 #[cfg(target_pointer_width = "32")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { isize, i32, u32, 32, -2147483648, 2147483647, "", "" }
+    int_impl! { isize, i32, u32, 32, -2147483648, 2147483647, "", "", 8, "0x10000b3", "0xb301",
+        "0x12345678", "0x78563412", "0x1e6a2c48" }
 }
 
 #[cfg(target_pointer_width = "64")]
 #[lang = "isize"]
 impl isize {
-    int_impl! { isize, i64, u64, 64, -9223372036854775808, 9223372036854775807, "", "" }
+    int_impl! { isize, i64, u64, 64, -9223372036854775808, 9223372036854775807, "", "",
+        12, "0xaa00000000006e1", "0x6e10aa",  "0x1234567890123456", "0x5634129078563412",
+         "0x6a2c48091e6a2c48" }
+}
+
+// Emits the correct `cttz` call, depending on the size of the type.
+macro_rules! uint_cttz_call {
+    // As of LLVM 3.6 the codegen for the zero-safe cttz8 intrinsic
+    // emits two conditional moves on x86_64. By promoting the value to
+    // u16 and setting bit 8, we get better code without any conditional
+    // operations.
+    // FIXME: There's a LLVM patch (http://reviews.llvm.org/D9284)
+    // pending, remove this workaround once LLVM generates better code
+    // for cttz8.
+    ($value:expr, 8) => { intrinsics::cttz($value as u16 | 0x100) };
+    ($value:expr, $_BITS:expr) => { intrinsics::cttz($value) }
 }
 
 // `Int` + `UnsignedInt` implemented for unsigned integers
 macro_rules! uint_impl {
-    ($SelfT:ty, $ActualT:ty, $BITS:expr, $MaxV:expr, $Feature:expr, $EndFeature:expr) => {
+    ($SelfT:ty, $ActualT:ty, $BITS:expr, $MaxV:expr, $Feature:expr, $EndFeature:expr,
+        $rot:expr, $rot_op:expr, $rot_result:expr, $swap_op:expr, $swapped:expr,
+        $reversed:expr ) => {
         doc_comment! {
             concat!("Returns the smallest value that can be represented by this integer type.
 
@@ -2037,8 +2151,9 @@ Basic usage:
 assert_eq!(n.count_ones(), 3);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn count_ones(self) -> u32 {
+            pub const fn count_ones(self) -> u32 {
                 unsafe { intrinsics::ctpop(self as $ActualT) as u32 }
             }
         }
@@ -2054,8 +2169,9 @@ Basic usage:
 ", $Feature, "assert_eq!(", stringify!($SelfT), "::max_value().count_zeros(), 0);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn count_zeros(self) -> u32 {
+            pub const fn count_zeros(self) -> u32 {
                 (!self).count_ones()
             }
         }
@@ -2073,8 +2189,9 @@ Basic usage:
 assert_eq!(n.leading_zeros(), 2);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn leading_zeros(self) -> u32 {
+            pub const fn leading_zeros(self) -> u32 {
                 unsafe { intrinsics::ctlz(self as $ActualT) as u32 }
             }
         }
@@ -2093,127 +2210,106 @@ Basic usage:
 assert_eq!(n.trailing_zeros(), 3);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn trailing_zeros(self) -> u32 {
-                // As of LLVM 3.6 the codegen for the zero-safe cttz8 intrinsic
-                // emits two conditional moves on x86_64. By promoting the value to
-                // u16 and setting bit 8, we get better code without any conditional
-                // operations.
-                // FIXME: There's a LLVM patch (http://reviews.llvm.org/D9284)
-                // pending, remove this workaround once LLVM generates better code
-                // for cttz8.
-                unsafe {
-                    if $BITS == 8 {
-                        intrinsics::cttz(self as u16 | 0x100) as u32
-                    } else {
-                        intrinsics::cttz(self) as u32
-                    }
-                }
+            pub const fn trailing_zeros(self) -> u32 {
+                unsafe { uint_cttz_call!(self, $BITS) as u32 }
             }
         }
 
-        /// Shifts the bits to the left by a specified amount, `n`,
-        /// wrapping the truncated bits to the end of the resulting integer.
-        ///
-        /// Please note this isn't the same operation as `<<`!
-        ///
-        /// # Examples
-        ///
-        /// Basic usage:
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `u64` is used here.
-        ///
-        /// ```
-        /// let n = 0x0123456789ABCDEFu64;
-        /// let m = 0x3456789ABCDEF012u64;
-        ///
-        /// assert_eq!(n.rotate_left(12), m);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn rotate_left(self, n: u32) -> Self {
-            // Protect against undefined behaviour for over-long bit shifts
-            let n = n % $BITS;
-            (self << n) | (self >> (($BITS - n) % $BITS))
+        doc_comment! {
+            concat!("Shifts the bits to the left by a specified amount, `n`,
+wrapping the truncated bits to the end of the resulting integer.
+
+Please note this isn't the same operation as `<<`!
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $rot_op, stringify!($SelfT), ";
+let m = ", $rot_result, ";
+
+assert_eq!(n.rotate_left(", $rot, "), m);
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[inline]
+            pub fn rotate_left(self, n: u32) -> Self {
+                // Protect against undefined behaviour for over-long bit shifts
+                let n = n % $BITS;
+                (self << n) | (self >> (($BITS - n) % $BITS))
+            }
         }
 
-        /// Shifts the bits to the right by a specified amount, `n`,
-        /// wrapping the truncated bits to the beginning of the resulting
-        /// integer.
-        ///
-        /// Please note this isn't the same operation as `>>`!
-        ///
-        /// # Examples
-        ///
-        /// Basic usage:
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `u64` is used here.
-        ///
-        /// ```
-        /// let n = 0x0123456789ABCDEFu64;
-        /// let m = 0xDEF0123456789ABCu64;
-        ///
-        /// assert_eq!(n.rotate_right(12), m);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn rotate_right(self, n: u32) -> Self {
-            // Protect against undefined behaviour for over-long bit shifts
-            let n = n % $BITS;
-            (self >> n) | (self << (($BITS - n) % $BITS))
+        doc_comment! {
+            concat!("Shifts the bits to the right by a specified amount, `n`,
+wrapping the truncated bits to the beginning of the resulting
+integer.
+
+Please note this isn't the same operation as `>>`!
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $rot_result, stringify!($SelfT), ";
+let m = ", $rot_op, ";
+
+assert_eq!(n.rotate_right(", $rot, "), m);
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[inline]
+            pub fn rotate_right(self, n: u32) -> Self {
+                // Protect against undefined behaviour for over-long bit shifts
+                let n = n % $BITS;
+                (self >> n) | (self << (($BITS - n) % $BITS))
+            }
         }
 
-        /// Reverses the byte order of the integer.
-        ///
-        /// # Examples
-        ///
-        /// Basic usage:
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `u16` is used here.
-        ///
-        /// ```
-        /// let n: u16 = 0b0000000_01010101;
-        /// assert_eq!(n, 85);
-        ///
-        /// let m = n.swap_bytes();
-        ///
-        /// assert_eq!(m, 0b01010101_00000000);
-        /// assert_eq!(m, 21760);
-        /// ```
-        #[stable(feature = "rust1", since = "1.0.0")]
-        #[inline]
-        pub fn swap_bytes(self) -> Self {
-            unsafe { intrinsics::bswap(self as $ActualT) as Self }
+        doc_comment! {
+            concat!("
+Reverses the byte order of the integer.
+
+# Examples
+
+Basic usage:
+
+```
+let n = ", $swap_op, stringify!($SelfT), ";
+let m = n.swap_bytes();
+
+assert_eq!(m, ", $swapped, ");
+```"),
+            #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
+            #[inline]
+            pub const fn swap_bytes(self) -> Self {
+                unsafe { intrinsics::bswap(self as $ActualT) as Self }
+            }
         }
 
-        /// Reverses the bit pattern of the integer.
-        ///
-        /// # Examples
-        ///
-        /// Basic usage:
-        ///
-        /// Please note that this example is shared between integer types.
-        /// Which explains why `u16` is used here.
-        ///
-        /// ```
-        /// #![feature(reverse_bits)]
-        ///
-        /// let n: u16 = 0b0000000_01010101;
-        /// assert_eq!(n, 85);
-        ///
-        /// let m = n.reverse_bits();
-        ///
-        /// assert_eq!(m, 0b10101010_00000000);
-        /// assert_eq!(m, 43520);
-        /// ```
-        #[unstable(feature = "reverse_bits", issue = "48763")]
-        #[cfg(not(stage0))]
-        #[inline]
-        pub fn reverse_bits(self) -> Self {
-            unsafe { intrinsics::bitreverse(self as $ActualT) as Self }
+        doc_comment! {
+            concat!("Reverses the bit pattern of the integer.
+
+# Examples
+
+Basic usage:
+
+```
+#![feature(reverse_bits)]
+
+let n = ", $swap_op, stringify!($SelfT), ";
+let m = n.reverse_bits();
+
+assert_eq!(m, ", $reversed, ");
+```"),
+            #[unstable(feature = "reverse_bits", issue = "48763")]
+            #[inline]
+            pub fn reverse_bits(self) -> Self {
+                unsafe { intrinsics::bitreverse(self as $ActualT) as Self }
+            }
         }
 
         doc_comment! {
@@ -2236,9 +2332,17 @@ if cfg!(target_endian = \"big\") {
 }", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn from_be(x: Self) -> Self {
-                if cfg!(target_endian = "big") { x } else { x.swap_bytes() }
+            pub const fn from_be(x: Self) -> Self {
+                #[cfg(target_endian = "big")]
+                {
+                    x
+                }
+                #[cfg(not(target_endian = "big"))]
+                {
+                    x.swap_bytes()
+                }
             }
         }
 
@@ -2262,9 +2366,17 @@ if cfg!(target_endian = \"little\") {
 }", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn from_le(x: Self) -> Self {
-                if cfg!(target_endian = "little") { x } else { x.swap_bytes() }
+            pub const fn from_le(x: Self) -> Self {
+                #[cfg(target_endian = "little")]
+                {
+                    x
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    x.swap_bytes()
+                }
             }
         }
 
@@ -2288,9 +2400,17 @@ if cfg!(target_endian = \"big\") {
 }", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn to_be(self) -> Self { // or not to be?
-                if cfg!(target_endian = "big") { self } else { self.swap_bytes() }
+            pub const fn to_be(self) -> Self { // or not to be?
+                #[cfg(target_endian = "big")]
+                {
+                    self
+                }
+                #[cfg(not(target_endian = "big"))]
+                {
+                    self.swap_bytes()
+                }
             }
         }
 
@@ -2314,9 +2434,17 @@ if cfg!(target_endian = \"little\") {
 }", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
+            #[rustc_const_unstable(feature = "const_int_ops")]
             #[inline]
-            pub fn to_le(self) -> Self {
-                if cfg!(target_endian = "little") { self } else { self.swap_bytes() }
+            pub const fn to_le(self) -> Self {
+                #[cfg(target_endian = "little")]
+                {
+                    self
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    self.swap_bytes()
+                }
             }
         }
 
@@ -2331,7 +2459,7 @@ Basic usage:
 ```
 ", $Feature, "assert_eq!((", stringify!($SelfT), "::max_value() - 2).checked_add(1), ",
 "Some(", stringify!($SelfT), "::max_value() - 1));
-assert_eq!((", stringify!($SelfT), "::max_value() - 2).checked_add(3),None);", $EndFeature, "
+assert_eq!((", stringify!($SelfT), "::max_value() - 2).checked_add(3), None);", $EndFeature, "
 ```"),
             #[stable(feature = "rust1", since = "1.0.0")]
             #[inline]
@@ -3419,47 +3547,143 @@ $EndFeature, "
             }
         }
 
-        /// Return the memory representation of this integer as a byte array.
-        ///
-        /// The target platform’s native endianness is used.
-        /// Portable code likely wants to use this after [`to_be`] or [`to_le`].
-        ///
-        /// [`to_be`]: #method.to_be
-        /// [`to_le`]: #method.to_le
+        doc_comment! {
+            concat!("Returns the smallest power of two greater than or equal to `n`. If
+the next power of two is greater than the type's maximum value,
+the return value is wrapped to `0`.
+
+# Examples
+
+Basic usage:
+
+```
+#![feature(wrapping_next_power_of_two)]
+", $Feature, "
+assert_eq!(2", stringify!($SelfT), ".wrapping_next_power_of_two(), 2);
+assert_eq!(3", stringify!($SelfT), ".wrapping_next_power_of_two(), 4);
+assert_eq!(", stringify!($SelfT), "::max_value().wrapping_next_power_of_two(), 0);",
+$EndFeature, "
+```"),
+            #[unstable(feature = "wrapping_next_power_of_two", issue = "32463",
+                       reason = "needs decision on wrapping behaviour")]
+            pub fn wrapping_next_power_of_two(self) -> Self {
+                self.one_less_than_next_power_of_two().wrapping_add(1)
+            }
+        }
+
+        /// Return the memory representation of this integer as a byte array in
+        /// big-endian (network) byte order.
         ///
         /// # Examples
         ///
         /// ```
         /// #![feature(int_to_from_bytes)]
         ///
-        /// let bytes = 0x1234_5678_u32.to_be().to_bytes();
+        /// let bytes =  0x12_34_56_78_i32.to_be_bytes();
         /// assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
         /// ```
-        #[unstable(feature = "int_to_from_bytes", issue = "49792")]
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
         #[inline]
-        pub fn to_bytes(self) -> [u8; mem::size_of::<Self>()] {
+        pub fn to_be_bytes(self) -> [u8; mem::size_of::<Self>()] {
+            self.to_be().to_ne_bytes()
+        }
+
+        /// Return the memory representation of this integer as a byte array in
+        /// little-endian byte order.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let bytes =  0x12_34_56_78_i32.to_le_bytes();
+        /// assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12]);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn to_le_bytes(self) -> [u8; mem::size_of::<Self>()] {
+            self.to_le().to_ne_bytes()
+        }
+
+        /// Return the memory representation of this integer as a byte array in
+        /// native byte order.
+        ///
+        /// As the target platform's native endianness is used, portable code
+        /// should use [`to_be_bytes`] or [`to_le_bytes`], as appropriate,
+        /// instead.
+        ///
+        /// [`to_be_bytes`]: #method.to_be_bytes
+        /// [`to_le_bytes`]: #method.to_le_bytes
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let bytes = i32::min_value().to_be().to_ne_bytes();
+        /// assert_eq!(bytes, [0x80, 0, 0, 0]);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn to_ne_bytes(self) -> [u8; mem::size_of::<Self>()] {
             unsafe { mem::transmute(self) }
         }
 
-        /// Create an integer value from its memory representation as a byte array.
-        ///
-        /// The target platform’s native endianness is used.
-        /// Portable code likely wants to use [`to_be`] or [`to_le`] after this.
-        ///
-        /// [`to_be`]: #method.to_be
-        /// [`to_le`]: #method.to_le
+        /// Create an integer value from its representation as a byte array in
+        /// big endian.
         ///
         /// # Examples
         ///
         /// ```
         /// #![feature(int_to_from_bytes)]
         ///
-        /// let int = u32::from_be(u32::from_bytes([0x12, 0x34, 0x56, 0x78]));
-        /// assert_eq!(int, 0x1234_5678_u32);
+        /// let int = i32::from_be_bytes([0x12, 0x34, 0x56, 0x78]);
+        /// assert_eq!(int, 0x12_34_56_78);
         /// ```
-        #[unstable(feature = "int_to_from_bytes", issue = "49792")]
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
         #[inline]
-        pub fn from_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+        pub fn from_be_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+            Self::from_be(Self::from_ne_bytes(bytes))
+        }
+
+        /// Create an integer value from its representation as a byte array in
+        /// little endian.
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let int = i32::from_le_bytes([0x12, 0x34, 0x56, 0x78]);
+        /// assert_eq!(int, 0x78_56_34_12);
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn from_le_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
+            Self::from_le(Self::from_ne_bytes(bytes))
+        }
+
+        /// Create an integer value from its memory representation as a byte
+        /// array in native endianness.
+        ///
+        /// As the target platform's native endianness is used, portable code
+        /// likely wants to use [`from_be_bytes`] or [`from_le_bytes`], as
+        /// appropriate instead.
+        ///
+        /// [`from_be_bytes`]: #method.from_be_bytes
+        /// [`from_le_bytes`]: #method.from_le_bytes
+        ///
+        /// # Examples
+        ///
+        /// ```
+        /// #![feature(int_to_from_bytes)]
+        ///
+        /// let int = i32::from_be(i32::from_ne_bytes([0x80, 0, 0, 0]));
+        /// assert_eq!(int, i32::min_value());
+        /// ```
+        #[unstable(feature = "int_to_from_bytes", issue = "52963")]
+        #[inline]
+        pub fn from_ne_bytes(bytes: [u8; mem::size_of::<Self>()]) -> Self {
             unsafe { mem::transmute(bytes) }
         }
     }
@@ -3467,7 +3691,7 @@ $EndFeature, "
 
 #[lang = "u8"]
 impl u8 {
-    uint_impl! { u8, u8, 8, 255, "", "" }
+    uint_impl! { u8, u8, 8, 255, "", "", 2, "0x82", "0xa", "0x12", "0x12", "0x48" }
 
 
     /// Checks if the value is within the ASCII range.
@@ -3607,8 +3831,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3645,8 +3867,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3683,8 +3903,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3724,8 +3942,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3762,8 +3978,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3803,8 +4017,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3845,8 +4057,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3883,8 +4093,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3938,8 +4146,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -3978,8 +4184,6 @@ impl u8 {
     /// # Examples
     ///
     /// ```
-    /// #![feature(ascii_ctype)]
-    ///
     /// let uppercase_a = b'A';
     /// let uppercase_g = b'G';
     /// let a = b'a';
@@ -4013,39 +4217,45 @@ impl u8 {
 
 #[lang = "u16"]
 impl u16 {
-    uint_impl! { u16, u16, 16, 65535, "", "" }
+    uint_impl! { u16, u16, 16, 65535, "", "", 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48" }
 }
 
 #[lang = "u32"]
 impl u32 {
-    uint_impl! { u32, u32, 32, 4294967295, "", "" }
+    uint_impl! { u32, u32, 32, 4294967295, "", "", 8, "0x10000b3", "0xb301", "0x12345678",
+        "0x78563412", "0x1e6a2c48" }
 }
 
 #[lang = "u64"]
 impl u64 {
-    uint_impl! { u64, u64, 64, 18446744073709551615, "", "" }
+    uint_impl! { u64, u64, 64, 18446744073709551615, "", "", 12, "0xaa00000000006e1", "0x6e10aa",
+        "0x1234567890123456", "0x5634129078563412", "0x6a2c48091e6a2c48" }
 }
 
 #[lang = "u128"]
 impl u128 {
-    uint_impl! { u128, u128, 128, 340282366920938463463374607431768211455, "", "" }
+    uint_impl! { u128, u128, 128, 340282366920938463463374607431768211455, "", "", 16,
+        "0x13f40000000000000000000000004f76", "0x4f7613f4", "0x12345678901234567890123456789012",
+        "0x12907856341290785634129078563412", "0x48091e6a2c48091e6a2c48091e6a2c48" }
 }
 
 #[cfg(target_pointer_width = "16")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u16, 16, 65536, "", "" }
+    uint_impl! { usize, u16, 16, 65536, "", "", 4, "0xa003", "0x3a", "0x1234", "0x3412", "0x2c48" }
 }
 #[cfg(target_pointer_width = "32")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u32, 32, 4294967295, "", "" }
+    uint_impl! { usize, u32, 32, 4294967295, "", "", 8, "0x10000b3", "0xb301", "0x12345678",
+        "0x78563412", "0x1e6a2c48" }
 }
 
 #[cfg(target_pointer_width = "64")]
 #[lang = "usize"]
 impl usize {
-    uint_impl! { usize, u64, 64, 18446744073709551615, "", "" }
+    uint_impl! { usize, u64, 64, 18446744073709551615, "", "", 12, "0xaa00000000006e1", "0x6e10aa",
+        "0x1234567890123456", "0x5634129078563412", "0x6a2c48091e6a2c48" }
 }
 
 /// A classification of floating point numbers.
@@ -4098,61 +4308,6 @@ pub enum FpCategory {
     Normal,
 }
 
-// Technically private and only exposed for coretests:
-#[doc(hidden)]
-#[unstable(feature = "float_internals",
-           reason = "internal routines only exposed for testing",
-           issue = "0")]
-pub trait Float: Sized {
-    /// Type used by `to_bits` and `from_bits`.
-    type Bits;
-
-    /// Returns `true` if this value is NaN and false otherwise.
-    fn is_nan(self) -> bool;
-
-    /// Returns `true` if this value is positive infinity or negative infinity and
-    /// false otherwise.
-    fn is_infinite(self) -> bool;
-
-    /// Returns `true` if this number is neither infinite nor NaN.
-    fn is_finite(self) -> bool;
-
-    /// Returns `true` if this number is neither zero, infinite, denormal, or NaN.
-    fn is_normal(self) -> bool;
-
-    /// Returns the category that this number falls into.
-    fn classify(self) -> FpCategory;
-
-    /// Returns `true` if `self` is positive, including `+0.0` and
-    /// `Float::infinity()`.
-    fn is_sign_positive(self) -> bool;
-
-    /// Returns `true` if `self` is negative, including `-0.0` and
-    /// `Float::neg_infinity()`.
-    fn is_sign_negative(self) -> bool;
-
-    /// Take the reciprocal (inverse) of a number, `1/x`.
-    fn recip(self) -> Self;
-
-    /// Convert radians to degrees.
-    fn to_degrees(self) -> Self;
-
-    /// Convert degrees to radians.
-    fn to_radians(self) -> Self;
-
-    /// Returns the maximum of the two numbers.
-    fn max(self, other: Self) -> Self;
-
-    /// Returns the minimum of the two numbers.
-    fn min(self, other: Self) -> Self;
-
-    /// Raw transmutation to integer.
-    fn to_bits(self) -> Self::Bits;
-
-    /// Raw transmutation from integer.
-    fn from_bits(v: Self::Bits) -> Self;
-}
-
 macro_rules! from_str_radix_int_impl {
     ($($t:ty)*) => {$(
         #[stable(feature = "rust1", since = "1.0.0")]
@@ -4168,7 +4323,7 @@ from_str_radix_int_impl! { isize i8 i16 i32 i64 i128 usize u8 u16 u32 u64 u128 }
 
 /// The error type returned when a checked integral type conversion fails.
 #[unstable(feature = "try_from", issue = "33417")]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct TryFromIntError(());
 
 impl TryFromIntError {
@@ -4194,6 +4349,21 @@ impl From<!> for TryFromIntError {
     fn from(never: !) -> TryFromIntError {
         never
     }
+}
+
+// no possible bounds violation
+macro_rules! try_from_unbounded {
+    ($source:ty, $($target:ty),*) => {$(
+        #[unstable(feature = "try_from", issue = "33417")]
+        impl TryFrom<$source> for $target {
+            type Error = TryFromIntError;
+
+            #[inline]
+            fn try_from(value: $source) -> Result<Self, Self::Error> {
+                Ok(value as $target)
+            }
+        }
+    )*}
 }
 
 // only negative bounds
@@ -4294,20 +4464,27 @@ try_from_both_bounded!(i128, u64, u32, u16, u8);
 try_from_upper_bounded!(usize, isize);
 try_from_lower_bounded!(isize, usize);
 
-try_from_upper_bounded!(usize, u8);
-try_from_upper_bounded!(usize, i8, i16);
-try_from_both_bounded!(isize, u8);
-try_from_both_bounded!(isize, i8);
-
 #[cfg(target_pointer_width = "16")]
 mod ptr_try_from_impls {
     use super::TryFromIntError;
     use convert::TryFrom;
 
-    // Fallible across platfoms, only implementation differs
+    try_from_upper_bounded!(usize, u8);
+    try_from_unbounded!(usize, u16, u32, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16);
+    try_from_unbounded!(usize, i32, i64, i128);
+
+    try_from_both_bounded!(isize, u8);
     try_from_lower_bounded!(isize, u16, u32, u64, u128);
+    try_from_both_bounded!(isize, i8);
+    try_from_unbounded!(isize, i16, i32, i64, i128);
+
+    rev!(try_from_upper_bounded, usize, u32, u64, u128);
     rev!(try_from_lower_bounded, usize, i8, i16);
     rev!(try_from_both_bounded, usize, i32, i64, i128);
+
+    rev!(try_from_upper_bounded, isize, u16, u32, u64, u128);
+    rev!(try_from_both_bounded, isize, i32, i64, i128);
 }
 
 #[cfg(target_pointer_width = "32")]
@@ -4315,11 +4492,25 @@ mod ptr_try_from_impls {
     use super::TryFromIntError;
     use convert::TryFrom;
 
-    // Fallible across platfoms, only implementation differs
-    try_from_both_bounded!(isize, u16);
+    try_from_upper_bounded!(usize, u8, u16);
+    try_from_unbounded!(usize, u32, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16, i32);
+    try_from_unbounded!(usize, i64, i128);
+
+    try_from_both_bounded!(isize, u8, u16);
     try_from_lower_bounded!(isize, u32, u64, u128);
+    try_from_both_bounded!(isize, i8, i16);
+    try_from_unbounded!(isize, i32, i64, i128);
+
+    rev!(try_from_unbounded, usize, u32);
+    rev!(try_from_upper_bounded, usize, u64, u128);
     rev!(try_from_lower_bounded, usize, i8, i16, i32);
     rev!(try_from_both_bounded, usize, i64, i128);
+
+    rev!(try_from_unbounded, isize, u16);
+    rev!(try_from_upper_bounded, isize, u32, u64, u128);
+    rev!(try_from_unbounded, isize, i32);
+    rev!(try_from_both_bounded, isize, i64, i128);
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -4327,11 +4518,25 @@ mod ptr_try_from_impls {
     use super::TryFromIntError;
     use convert::TryFrom;
 
-    // Fallible across platfoms, only implementation differs
-    try_from_both_bounded!(isize, u16, u32);
+    try_from_upper_bounded!(usize, u8, u16, u32);
+    try_from_unbounded!(usize, u64, u128);
+    try_from_upper_bounded!(usize, i8, i16, i32, i64);
+    try_from_unbounded!(usize, i128);
+
+    try_from_both_bounded!(isize, u8, u16, u32);
     try_from_lower_bounded!(isize, u64, u128);
+    try_from_both_bounded!(isize, i8, i16, i32);
+    try_from_unbounded!(isize, i64, i128);
+
+    rev!(try_from_unbounded, usize, u32, u64);
+    rev!(try_from_upper_bounded, usize, u128);
     rev!(try_from_lower_bounded, usize, i8, i16, i32, i64);
     rev!(try_from_both_bounded, usize, i128);
+
+    rev!(try_from_unbounded, isize, u16, u32);
+    rev!(try_from_upper_bounded, isize, u64, u128);
+    rev!(try_from_unbounded, isize, i32, i64);
+    rev!(try_from_both_bounded, isize, i128);
 }
 
 #[doc(hidden)]
@@ -4492,16 +4697,56 @@ pub use num::dec2flt::ParseFloatError;
 // Conversions T -> T are covered by a blanket impl and therefore excluded
 // Some conversions from and to usize/isize are not implemented due to portability concerns
 macro_rules! impl_from {
-    ($Small: ty, $Large: ty, #[$attr:meta]) => {
+    ($Small: ty, $Large: ty, #[$attr:meta], $doc: expr) => {
         #[$attr]
+        #[doc = $doc]
         impl From<$Small> for $Large {
             #[inline]
             fn from(small: $Small) -> $Large {
                 small as $Large
             }
         }
+    };
+    ($Small: ty, $Large: ty, #[$attr:meta]) => {
+        impl_from!($Small,
+                   $Large,
+                   #[$attr],
+                   concat!("Converts `",
+                           stringify!($Small),
+                           "` to `",
+                           stringify!($Large),
+                           "` losslessly."));
     }
 }
+
+macro_rules! impl_from_bool {
+    ($target: ty, #[$attr:meta]) => {
+        impl_from!(bool, $target, #[$attr], concat!("Converts a `bool` to a `",
+            stringify!($target), "`. The resulting value is `0` for `false` and `1` for `true`
+values.
+
+# Examples
+
+```
+assert_eq!(", stringify!($target), "::from(true), 1);
+assert_eq!(", stringify!($target), "::from(false), 0);
+```"));
+    };
+}
+
+// Bool -> Any
+impl_from_bool! { u8, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { u16, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { u32, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { u64, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { u128, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { usize, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { i8, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { i16, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { i32, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { i64, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { i128, #[stable(feature = "from_bool", since = "1.28.0")] }
+impl_from_bool! { isize, #[stable(feature = "from_bool", since = "1.28.0")] }
 
 // Unsigned -> Unsigned
 impl_from! { u8, u16, #[stable(feature = "lossless_int_conv", since = "1.5.0")] }

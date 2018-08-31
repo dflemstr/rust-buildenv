@@ -119,12 +119,12 @@ impl<A: Array> ArrayVec<A> {
         // the hole, and the vector length is restored to the new length.
         //
         let len = self.len();
-        let start = match range.start() {
+        let start = match range.start_bound() {
             Included(&n) => n,
             Excluded(&n) => n + 1,
             Unbounded    => 0,
         };
-        let end = match range.end() {
+        let end = match range.end_bound() {
             Included(&n) => n + 1,
             Excluded(&n) => n,
             Unbounded    => len,
@@ -139,7 +139,7 @@ impl<A: Array> ArrayVec<A> {
             // whole Drain iterator (like &mut T).
             let range_slice = {
                 let arr = &mut self.values as &mut [ManuallyDrop<<A as Array>::Element>];
-                slice::from_raw_parts_mut(arr.as_mut_ptr().offset(start as isize),
+                slice::from_raw_parts_mut(arr.as_mut_ptr().add(start),
                                           end - start)
             };
             Drain {
@@ -262,8 +262,8 @@ impl<'a, A: Array> Drop for Drain<'a, A> {
                 {
                     let arr =
                         &mut source_array_vec.values as &mut [ManuallyDrop<<A as Array>::Element>];
-                    let src = arr.as_ptr().offset(tail as isize);
-                    let dst = arr.as_mut_ptr().offset(start as isize);
+                    let src = arr.as_ptr().add(tail);
+                    let dst = arr.as_mut_ptr().add(start);
                     ptr::copy(src, dst, self.tail_len);
                 };
                 source_array_vec.set_len(start + self.tail_len);

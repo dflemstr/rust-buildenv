@@ -10,8 +10,6 @@
 
 // aux-build:two_macros.rs
 
-#![feature(use_extern_macros, proc_macro_path_invoc)]
-
 extern crate two_macros;
 
 mod foo {

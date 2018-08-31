@@ -226,7 +226,8 @@ use cstore::{MetadataRef, MetadataBlob};
 use creader::Library;
 use schema::{METADATA_HEADER, rustc_version};
 
-use rustc::hir::svh::Svh;
+use rustc_data_structures::fx::FxHashSet;
+use rustc_data_structures::svh::Svh;
 use rustc::middle::cstore::MetadataLoader;
 use rustc::session::{config, Session};
 use rustc::session::filesearch::{FileSearch, FileMatches, FileDoesntMatch};
@@ -236,10 +237,9 @@ use rustc::util::nodemap::FxHashMap;
 use errors::DiagnosticBuilder;
 use syntax::symbol::Symbol;
 use syntax_pos::Span;
-use rustc_back::target::{Target, TargetTriple};
+use rustc_target::spec::{Target, TargetTriple};
 
 use std::cmp;
-use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -273,7 +273,7 @@ pub struct Context<'a> {
     pub rejected_via_filename: Vec<CrateMismatch>,
     pub should_match_name: bool,
     pub is_proc_macro: Option<bool>,
-    pub metadata_loader: &'a MetadataLoader,
+    pub metadata_loader: &'a dyn MetadataLoader,
 }
 
 pub struct CratePaths {
@@ -308,7 +308,7 @@ impl CratePaths {
 
 impl<'a> Context<'a> {
     pub fn maybe_load_library_crate(&mut self) -> Option<Library> {
-        let mut seen_paths = HashSet::new();
+        let mut seen_paths = FxHashSet::default();
         match self.extra_filename {
             Some(s) => self.find_library_crate(s, &mut seen_paths)
                 .or_else(|| self.find_library_crate("", &mut seen_paths)),
@@ -431,7 +431,7 @@ impl<'a> Context<'a> {
 
     fn find_library_crate(&mut self,
                           extra_prefix: &str,
-                          seen_paths: &mut HashSet<PathBuf>)
+                          seen_paths: &mut FxHashSet<PathBuf>)
                           -> Option<Library> {
         // If an SVH is specified, then this is a transitive dependency that
         // must be loaded via -L plus some filtering.
@@ -451,7 +451,10 @@ impl<'a> Context<'a> {
         let rlib_prefix = format!("lib{}{}", self.crate_name, extra_prefix);
         let staticlib_prefix = format!("{}{}{}", staticpair.0, self.crate_name, extra_prefix);
 
-        let mut candidates = FxHashMap();
+        let mut candidates: FxHashMap<
+            _,
+            (FxHashMap<_, _>, FxHashMap<_, _>, FxHashMap<_, _>),
+        > = FxHashMap();
         let mut staticlibs = vec![];
 
         // First, find all possible candidate rlibs and dylibs purely based on
@@ -493,8 +496,7 @@ impl<'a> Context<'a> {
             info!("lib candidate: {}", path.display());
 
             let hash_str = hash.to_string();
-            let slot = candidates.entry(hash_str)
-                .or_insert_with(|| (FxHashMap(), FxHashMap(), FxHashMap()));
+            let slot = candidates.entry(hash_str).or_default();
             let (ref mut rlibs, ref mut rmetas, ref mut dylibs) = *slot;
             fs::canonicalize(path)
                 .map(|p| {
@@ -722,7 +724,7 @@ impl<'a> Context<'a> {
                   root.triple);
             self.rejected_via_triple.push(CrateMismatch {
                 path: libpath.to_path_buf(),
-                got: format!("{}", root.triple),
+                got: root.triple.to_string(),
             });
             return None;
         }
@@ -824,17 +826,14 @@ impl<'a> Context<'a> {
         if rlib.is_none() && rmeta.is_none() && dylib.is_none() {
             return None;
         }
-        match slot {
-            Some((_, metadata)) => {
-                Some(Library {
-                    dylib,
-                    rlib,
-                    rmeta,
-                    metadata,
-                })
+        slot.map(|(_, metadata)|
+            Library {
+                dylib,
+                rlib,
+                rmeta,
+                metadata,
             }
-            None => None,
-        }
+        )
     }
 }
 
@@ -842,7 +841,7 @@ impl<'a> Context<'a> {
 fn get_metadata_section(target: &Target,
                         flavor: CrateFlavor,
                         filename: &Path,
-                        loader: &MetadataLoader)
+                        loader: &dyn MetadataLoader)
                         -> Result<MetadataBlob, String> {
     let start = Instant::now();
     let ret = get_metadata_section_imp(target, flavor, filename, loader);
@@ -855,7 +854,7 @@ fn get_metadata_section(target: &Target,
 fn get_metadata_section_imp(target: &Target,
                             flavor: CrateFlavor,
                             filename: &Path,
-                            loader: &MetadataLoader)
+                            loader: &dyn MetadataLoader)
                             -> Result<MetadataBlob, String> {
     if !filename.exists() {
         return Err(format!("no such file: '{}'", filename.display()));
@@ -904,8 +903,8 @@ fn get_metadata_section_imp(target: &Target,
 // A diagnostic function for dumping crate metadata to an output stream
 pub fn list_file_metadata(target: &Target,
                           path: &Path,
-                          loader: &MetadataLoader,
-                          out: &mut io::Write)
+                          loader: &dyn MetadataLoader,
+                          out: &mut dyn io::Write)
                           -> io::Result<()> {
     let filename = path.file_name().unwrap().to_str().unwrap();
     let flavor = if filename.ends_with(".rlib") {

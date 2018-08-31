@@ -41,7 +41,7 @@
 //!   dictate the panic message, the file at which panic was invoked, and the
 //!   line and column inside the file. It is up to consumers of this core
 //!   library to define this panic function; it is only required to never
-//!   return. This requires a `lang` attribute named `panic_fmt`.
+//!   return. This requires a `lang` attribute named `panic_impl`.
 //!
 //! * `rust_eh_personality` - is used by the failure mechanisms of the
 //!    compiler. This is often mapped to GCC's personality function, but crates
@@ -50,6 +50,15 @@
 
 // Since libcore defines many fundamental lang items, all tests live in a
 // separate crate, libcoretest, to avoid bizarre issues.
+//
+// Here we explicitly #[cfg]-out this whole crate when testing. If we don't do
+// this, both the generated test artifact and the linked libtest (which
+// transitively includes libcore) will both define the same set of lang items,
+// and this will cause the E0152 "duplicate lang item found" error. See
+// discussion in #50466 for details.
+//
+// This cfg won't affect doc tests.
+#![cfg(not(test))]
 
 #![stable(feature = "core", since = "1.6.0")]
 #![doc(html_logo_url = "https://www.rust-lang.org/logos/rust-logo-128x128-blk-v2.png",
@@ -65,25 +74,25 @@
 #![deny(missing_debug_implementations)]
 
 #![feature(allow_internal_unstable)]
+#![feature(arbitrary_self_types)]
 #![feature(asm)]
 #![feature(associated_type_defaults)]
-#![feature(attr_literals)]
 #![feature(cfg_target_has_atomic)]
 #![feature(concat_idents)]
 #![feature(const_fn)]
-#![feature(core_float)]
+#![feature(const_int_ops)]
+#![feature(const_fn_union)]
 #![feature(custom_attribute)]
 #![feature(doc_cfg)]
 #![feature(doc_spotlight)]
 #![feature(extern_types)]
-#![feature(fn_must_use)]
 #![feature(fundamental)]
 #![feature(intrinsics)]
-#![feature(iterator_flatten)]
-#![feature(iterator_repeat_with)]
 #![feature(lang_items)]
 #![feature(link_llvm_intrinsics)]
 #![feature(never_type)]
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(exhaustive_patterns)]
 #![feature(macro_at_most_once_rep)]
 #![feature(no_core)]
@@ -94,8 +103,6 @@
 #![feature(rustc_attrs)]
 #![feature(rustc_const_unstable)]
 #![feature(simd_ffi)]
-#![feature(core_slice_ext)]
-#![feature(core_str_ext)]
 #![feature(specialization)]
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
@@ -103,17 +110,17 @@
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(doc_alias)]
-
-#![cfg_attr(not(stage0), feature(mmx_target_feature))]
-#![cfg_attr(not(stage0), feature(tbm_target_feature))]
-#![cfg_attr(not(stage0), feature(sse4a_target_feature))]
-#![cfg_attr(not(stage0), feature(arm_target_feature))]
-#![cfg_attr(not(stage0), feature(powerpc_target_feature))]
-#![cfg_attr(not(stage0), feature(mips_target_feature))]
-#![cfg_attr(not(stage0), feature(aarch64_target_feature))]
-
-#![cfg_attr(stage0, feature(target_feature))]
-#![cfg_attr(stage0, feature(cfg_target_feature))]
+#![feature(mmx_target_feature)]
+#![feature(tbm_target_feature)]
+#![feature(sse4a_target_feature)]
+#![feature(arm_target_feature)]
+#![feature(powerpc_target_feature)]
+#![feature(mips_target_feature)]
+#![feature(aarch64_target_feature)]
+#![feature(const_slice_len)]
+#![feature(const_str_as_bytes)]
+#![feature(const_str_len)]
+#![feature(non_exhaustive)]
 
 #[prelude_import]
 #[allow(unused)]
@@ -138,14 +145,14 @@ mod uint_macros;
 #[path = "num/i16.rs"]   pub mod i16;
 #[path = "num/i32.rs"]   pub mod i32;
 #[path = "num/i64.rs"]   pub mod i64;
-#[path = "num/i128.rs"]   pub mod i128;
+#[path = "num/i128.rs"]  pub mod i128;
 
 #[path = "num/usize.rs"] pub mod usize;
 #[path = "num/u8.rs"]    pub mod u8;
 #[path = "num/u16.rs"]   pub mod u16;
 #[path = "num/u32.rs"]   pub mod u32;
 #[path = "num/u64.rs"]   pub mod u64;
-#[path = "num/u128.rs"]   pub mod u128;
+#[path = "num/u128.rs"]  pub mod u128;
 
 #[path = "num/f32.rs"]   pub mod f32;
 #[path = "num/f64.rs"]   pub mod f64;
@@ -161,8 +168,8 @@ pub mod prelude;
 
 pub mod intrinsics;
 pub mod mem;
-pub mod nonzero;
 pub mod ptr;
+pub mod hint;
 
 /* Core language traits */
 
@@ -184,6 +191,7 @@ pub mod cell;
 pub mod char;
 pub mod panic;
 pub mod panicking;
+pub mod pin;
 pub mod iter;
 pub mod option;
 pub mod raw;
@@ -197,19 +205,17 @@ pub mod time;
 
 pub mod unicode;
 
+/* Async */
+pub mod future;
+pub mod task;
+
 /* Heap memory allocator trait */
 #[allow(missing_docs)]
 pub mod alloc;
 
-#[unstable(feature = "allocator_api", issue = "32838")]
-#[rustc_deprecated(since = "1.27.0", reason = "module renamed to `alloc`")]
-/// Use the `alloc` module instead.
-pub mod heap {
-    pub use alloc::*;
-}
-
 // note: does not need to be public
 mod iter_private;
+mod nonzero;
 mod tuple;
 mod unit;
 
@@ -238,9 +244,6 @@ macro_rules! vector_impl { ($([$f:ident, $($args:tt)*]),*) => { $($f!($($args)*)
 #[cfg(not(stage0))] // allow changes to how stdsimd works in stage0
 mod coresimd;
 
-#[unstable(feature = "stdsimd", issue = "48556")]
-#[cfg(not(stage0))]
-pub use coresimd::simd;
 #[stable(feature = "simd_arch", since = "1.27.0")]
 #[cfg(not(stage0))]
 pub use coresimd::arch;

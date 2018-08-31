@@ -100,6 +100,10 @@ fn main() {
         optional_components.push("hexagon");
     }
 
+    if major > 6 {
+        optional_components.push("riscv");
+    }
+
     // FIXME: surely we don't need all these components, right? Stuff like mcjit
     //        or interpreter the compiler itself never uses.
     let required_components = &["ipo",
@@ -271,5 +275,6 @@ fn main() {
     if target.contains("windows-gnu") {
         println!("cargo:rustc-link-lib=static-nobundle=gcc_s");
         println!("cargo:rustc-link-lib=static-nobundle=pthread");
+        println!("cargo:rustc-link-lib=dylib=uuid");
     }
 }

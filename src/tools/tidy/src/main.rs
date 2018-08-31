@@ -41,10 +41,12 @@ fn main() {
     features::check(&path, &mut bad, quiet);
     pal::check(&path, &mut bad);
     unstable_book::check(&path, &mut bad);
+    libcoretest::check(&path, &mut bad);
     if !args.iter().any(|s| *s == "--no-vendor") {
         deps::check(&path, &mut bad);
     }
     deps::check_whitelist(&path, &cargo, &mut bad);
+    extdeps::check(&path, &mut bad);
     ui_tests::check(&path, &mut bad);
 
     if bad {

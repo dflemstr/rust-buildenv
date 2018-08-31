@@ -11,10 +11,10 @@
 //! Inlining pass for MIR functions
 
 use rustc::hir;
-use rustc::hir::TransFnAttrFlags;
+use rustc::hir::CodegenFnAttrFlags;
 use rustc::hir::def_id::DefId;
 
-use rustc_data_structures::bitvec::BitVector;
+use rustc_data_structures::bitvec::BitArray;
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
 
 use rustc::mir::*;
@@ -28,7 +28,7 @@ use transform::{MirPass, MirSource};
 use super::simplify::{remove_dead_blocks, CfgSimplifier};
 
 use syntax::{attr};
-use syntax::abi::Abi;
+use rustc_target::spec::abi::Abi;
 
 const DEFAULT_THRESHOLD: usize = 50;
 const HINT_THRESHOLD: usize = 100;
@@ -95,7 +95,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                 let terminator = bb_data.terminator();
                 if let TerminatorKind::Call {
                     func: Operand::Constant(ref f), .. } = terminator.kind {
-                        if let ty::TyFnDef(callee_def_id, substs) = f.ty.sty {
+                        if let ty::FnDef(callee_def_id, substs) = f.ty.sty {
                             if let Some(instance) = Instance::resolve(self.tcx,
                                                                       param_env,
                                                                       callee_def_id,
@@ -126,9 +126,8 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                     continue;
                 }
 
-                let callee_mir = match ty::queries::optimized_mir::try_get(self.tcx,
-                                                                           callsite.location.span,
-                                                                           callsite.callee) {
+                let callee_mir = match self.tcx.try_optimized_mir(callsite.location.span,
+                                                                  callsite.callee) {
                     Ok(callee_mir) if self.should_inline(callsite, callee_mir) => {
                         self.tcx.subst_and_normalize_erasing_regions(
                             &callsite.substs,
@@ -159,7 +158,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                     let terminator = bb_data.terminator();
                     if let TerminatorKind::Call {
                         func: Operand::Constant(ref f), .. } = terminator.kind {
-                        if let ty::TyFnDef(callee_def_id, substs) = f.ty.sty {
+                        if let ty::FnDef(callee_def_id, substs) = f.ty.sty {
                             // Don't inline the same function multiple times.
                             if callsite.callee != callee_def_id {
                                 callsites.push_back(CallSite {
@@ -211,16 +210,16 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             return false;
         }
 
-        // Do not inline {u,i}128 lang items, trans const eval depends
+        // Do not inline {u,i}128 lang items, codegen const eval depends
         // on detecting calls to these lang items and intercepting them
         if tcx.is_binop_lang_item(callsite.callee).is_some() {
             debug!("    not inlining 128bit integer lang item");
             return false;
         }
 
-        let trans_fn_attrs = tcx.trans_fn_attrs(callsite.callee);
+        let codegen_fn_attrs = tcx.codegen_fn_attrs(callsite.callee);
 
-        let hinted = match trans_fn_attrs.inline {
+        let hinted = match codegen_fn_attrs.inline {
             // Just treat inline(always) as a hint for now,
             // there are cases that prevent inlining that we
             // need to check for first.
@@ -250,7 +249,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
         };
 
         // Significantly lower the threshold for inlining cold functions
-        if trans_fn_attrs.flags.contains(TransFnAttrFlags::COLD) {
+        if codegen_fn_attrs.flags.contains(CodegenFnAttrFlags::COLD) {
             threshold /= 5;
         }
 
@@ -272,7 +271,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
         // Traverse the MIR manually so we can account for the effects of
         // inlining on the CFG.
         let mut work_list = vec![START_BLOCK];
-        let mut visited = BitVector::new(callee_mir.basic_blocks().len());
+        let mut visited = BitArray::new(callee_mir.basic_blocks().len());
         while let Some(bb) = work_list.pop() {
             if !visited.insert(bb.index()) { continue; }
             let blk = &callee_mir.basic_blocks()[bb];
@@ -315,7 +314,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
                 }
 
                 TerminatorKind::Call {func: Operand::Constant(ref f), .. } => {
-                    if let ty::TyFnDef(def_id, _) = f.ty.sty {
+                    if let ty::FnDef(def_id, _) = f.ty.sty {
                         // Don't give intrinsics the extra penalty for calls
                         let f = tcx.fn_sig(def_id);
                         if f.abi() == Abi::RustIntrinsic || f.abi() == Abi::PlatformIntrinsic {
@@ -330,7 +329,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             }
 
             if !is_drop {
-                for &succ in &term.successors()[..] {
+                for &succ in term.successors() {
                     work_list.push(succ);
                 }
             }
@@ -355,7 +354,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             }
         }
 
-        if let attr::InlineAttr::Always = trans_fn_attrs.inline {
+        if let attr::InlineAttr::Always = codegen_fn_attrs.inline {
             debug!("INLINING {:?} because inline(always) [cost={}]", callsite, cost);
             true
         } else {
@@ -379,13 +378,11 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             TerminatorKind::Call { args, destination: Some(destination), cleanup, .. } => {
                 debug!("Inlined {:?} into {:?}", callsite.callee, self.source);
 
-                let is_box_free = Some(callsite.callee) == self.tcx.lang_items().box_free_fn();
-
                 let mut local_map = IndexVec::with_capacity(callee_mir.local_decls.len());
-                let mut scope_map = IndexVec::with_capacity(callee_mir.visibility_scopes.len());
+                let mut scope_map = IndexVec::with_capacity(callee_mir.source_scopes.len());
                 let mut promoted_map = IndexVec::with_capacity(callee_mir.promoted.len());
 
-                for mut scope in callee_mir.visibility_scopes.iter().cloned() {
+                for mut scope in callee_mir.source_scopes.iter().cloned() {
                     if scope.parent_scope.is_none() {
                         scope.parent_scope = Some(callsite.location.scope);
                         scope.span = callee_mir.span;
@@ -393,24 +390,25 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
 
                     scope.span = callsite.location.span;
 
-                    let idx = caller_mir.visibility_scopes.push(scope);
+                    let idx = caller_mir.source_scopes.push(scope);
                     scope_map.push(idx);
                 }
 
                 for loc in callee_mir.vars_and_temps_iter() {
                     let mut local = callee_mir.local_decls[loc].clone();
 
-                    local.source_info.scope = scope_map[local.source_info.scope];
+                    local.source_info.scope =
+                        scope_map[local.source_info.scope];
                     local.source_info.span = callsite.location.span;
+                    local.visibility_scope = scope_map[local.visibility_scope];
 
                     let idx = caller_mir.local_decls.push(local);
                     local_map.push(idx);
                 }
 
-                for p in callee_mir.promoted.iter().cloned() {
-                    let idx = caller_mir.promoted.push(p);
-                    promoted_map.push(idx);
-                }
+                promoted_map.extend(
+                    callee_mir.promoted.iter().cloned().map(|p| caller_mir.promoted.push(p))
+                );
 
                 // If the call is something like `a[*i] = f(i)`, where
                 // `i : &mut usize`, then just duplicating the `a[*i]`
@@ -460,24 +458,8 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
 
                 let return_block = destination.1;
 
-                let args : Vec<_> = if is_box_free {
-                    assert!(args.len() == 1);
-                    // box_free takes a Box, but is defined with a *mut T, inlining
-                    // needs to generate the cast.
-                    // FIXME: we should probably just generate correct MIR in the first place...
-
-                    let arg = if let Operand::Move(ref place) = args[0] {
-                        place.clone()
-                    } else {
-                        bug!("Constant arg to \"box_free\"");
-                    };
-
-                    let ptr_ty = args[0].ty(caller_mir, self.tcx);
-                    vec![self.cast_box_free_arg(arg, ptr_ty, &callsite, caller_mir)]
-                } else {
-                    // Copy the arguments if needed.
-                    self.make_call_args(args, &callsite, caller_mir)
-                };
+                // Copy the arguments if needed.
+                let args: Vec<_> = self.make_call_args(args, &callsite, caller_mir);
 
                 let bb_len = caller_mir.basic_blocks().len();
                 let mut integrator = Integrator {
@@ -518,49 +500,6 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
         }
     }
 
-    fn cast_box_free_arg(&self, arg: Place<'tcx>, ptr_ty: Ty<'tcx>,
-                         callsite: &CallSite<'tcx>, caller_mir: &mut Mir<'tcx>) -> Local {
-        let arg = Rvalue::Ref(
-            self.tcx.types.re_erased,
-            BorrowKind::Mut { allow_two_phase_borrow: false },
-            arg.deref());
-
-        let ty = arg.ty(caller_mir, self.tcx);
-        let ref_tmp = LocalDecl::new_temp(ty, callsite.location.span);
-        let ref_tmp = caller_mir.local_decls.push(ref_tmp);
-        let ref_tmp = Place::Local(ref_tmp);
-
-        let ref_stmt = Statement {
-            source_info: callsite.location,
-            kind: StatementKind::Assign(ref_tmp.clone(), arg)
-        };
-
-        caller_mir[callsite.bb]
-            .statements.push(ref_stmt);
-
-        let pointee_ty = match ptr_ty.sty {
-            ty::TyRawPtr(tm) | ty::TyRef(_, tm) => tm.ty,
-            _ if ptr_ty.is_box() => ptr_ty.boxed_ty(),
-            _ => bug!("Invalid type `{:?}` for call to box_free", ptr_ty)
-        };
-        let ptr_ty = self.tcx.mk_mut_ptr(pointee_ty);
-
-        let raw_ptr = Rvalue::Cast(CastKind::Misc, Operand::Move(ref_tmp), ptr_ty);
-
-        let cast_tmp = LocalDecl::new_temp(ptr_ty, callsite.location.span);
-        let cast_tmp = caller_mir.local_decls.push(cast_tmp);
-
-        let cast_stmt = Statement {
-            source_info: callsite.location,
-            kind: StatementKind::Assign(Place::Local(cast_tmp), raw_ptr)
-        };
-
-        caller_mir[callsite.bb]
-            .statements.push(cast_stmt);
-
-        cast_tmp
-    }
-
     fn make_call_args(
         &self,
         args: Vec<Operand<'tcx>>,
@@ -576,8 +515,8 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
         //     Fn::call(closure_ref, tuple_tmp)
         //
         // meanwhile the closure body expects the arguments (here, `a`, `b`, and `c`)
-        // as distinct arguments. (This is the "rust-call" ABI hack.) Normally, trans has
-        // the job of unpacking this tuple. But here, we are trans. =) So we want to create
+        // as distinct arguments. (This is the "rust-call" ABI hack.) Normally, codegen has
+        // the job of unpacking this tuple. But here, we are codegen. =) So we want to create
         // a vector like
         //
         //     [closure_ref, tuple_tmp.0, tuple_tmp.1, tuple_tmp.2]
@@ -599,7 +538,7 @@ impl<'a, 'tcx> Inliner<'a, 'tcx> {
             assert!(args.next().is_none());
 
             let tuple = Place::Local(tuple);
-            let tuple_tys = if let ty::TyTuple(s) = tuple.ty(caller_mir, tcx).to_ty(tcx).sty {
+            let tuple_tys = if let ty::Tuple(s) = tuple.ty(caller_mir, tcx).to_ty(tcx).sty {
                 s
             } else {
                 bug!("Closure arguments are not passed as a tuple");
@@ -679,7 +618,7 @@ struct Integrator<'a, 'tcx: 'a> {
     block_idx: usize,
     args: &'a [Local],
     local_map: IndexVec<Local, Local>,
-    scope_map: IndexVec<VisibilityScope, VisibilityScope>,
+    scope_map: IndexVec<SourceScope, SourceScope>,
     promoted_map: IndexVec<Promoted, Promoted>,
     _callsite: CallSite<'tcx>,
     destination: Place<'tcx>,
@@ -722,11 +661,18 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                     place: &mut Place<'tcx>,
                     _ctxt: PlaceContext<'tcx>,
                     _location: Location) {
-        if let Place::Local(RETURN_PLACE) = *place {
-            // Return pointer; update the place itself
-            *place = self.destination.clone();
-        } else {
-            self.super_place(place, _ctxt, _location);
+
+        match place {
+            Place::Local(RETURN_PLACE) => {
+                // Return pointer; update the place itself
+                *place = self.destination.clone();
+            },
+            Place::Promoted(ref mut promoted) => {
+                if let Some(p) = self.promoted_map.get(promoted.0).cloned() {
+                    promoted.0 = p;
+                }
+            },
+            _ => self.super_place(place, _ctxt, _location),
         }
     }
 
@@ -758,7 +704,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                     *unwind = Some(self.update_target(tgt));
                 } else if !self.in_cleanup_block {
                     // Unless this drop is in a cleanup block, add an unwind edge to
-                    // the orignal call's cleanup block
+                    // the original call's cleanup block
                     *unwind = self.cleanup_block;
                 }
             }
@@ -770,7 +716,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                     *cleanup = Some(self.update_target(tgt));
                 } else if !self.in_cleanup_block {
                     // Unless this call is in a cleanup block, add an unwind edge to
-                    // the orignal call's cleanup block
+                    // the original call's cleanup block
                     *cleanup = self.cleanup_block;
                 }
             }
@@ -780,7 +726,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
                     *cleanup = Some(self.update_target(tgt));
                 } else if !self.in_cleanup_block {
                     // Unless this assert is in a cleanup block, add an unwind edge to
-                    // the orignal call's cleanup block
+                    // the original call's cleanup block
                     *cleanup = self.cleanup_block;
                 }
             }
@@ -806,17 +752,7 @@ impl<'a, 'tcx> MutVisitor<'tcx> for Integrator<'a, 'tcx> {
         }
     }
 
-    fn visit_visibility_scope(&mut self, scope: &mut VisibilityScope) {
+    fn visit_source_scope(&mut self, scope: &mut SourceScope) {
         *scope = self.scope_map[*scope];
-    }
-
-    fn visit_literal(&mut self, literal: &mut Literal<'tcx>, loc: Location) {
-        if let Literal::Promoted { ref mut index } = *literal {
-            if let Some(p) = self.promoted_map.get(*index).cloned() {
-                *index = p;
-            }
-        } else {
-            self.super_literal(literal, loc);
-        }
     }
 }

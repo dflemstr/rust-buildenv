@@ -14,7 +14,7 @@ use errors::FatalError;
 use proc_macro::{TokenStream, __internal};
 use syntax::ast::{self, ItemKind, Attribute, Mac};
 use syntax::attr::{mark_used, mark_known};
-use syntax::codemap::Span;
+use syntax::source_map::Span;
 use syntax::ext::base::*;
 use syntax::visit::Visitor;
 
@@ -22,11 +22,9 @@ struct MarkAttrs<'a>(&'a [ast::Name]);
 
 impl<'a> Visitor<'a> for MarkAttrs<'a> {
     fn visit_attribute(&mut self, attr: &Attribute) {
-        if let Some(name) = attr.name() {
-            if self.0.contains(&name) {
-                mark_used(attr);
-                mark_known(attr);
-            }
+        if self.0.contains(&attr.name()) {
+            mark_used(attr);
+            mark_known(attr);
         }
     }
 
@@ -59,16 +57,17 @@ impl MultiItemModifier for ProcMacroDerive {
             Annotatable::Stmt(_) |
             Annotatable::Expr(_) => {
                 ecx.span_err(span, "proc-macro derives may only be \
-                                    applied to struct/enum items");
+                                    applied to a struct, enum, or union");
                 return Vec::new()
             }
         };
         match item.node {
             ItemKind::Struct(..) |
-            ItemKind::Enum(..) => {},
+            ItemKind::Enum(..) |
+            ItemKind::Union(..) => {},
             _ => {
                 ecx.span_err(span, "proc-macro derives may only be \
-                                    applied to struct/enum items");
+                                    applied to a struct, enum, or union");
                 return Vec::new()
             }
         }

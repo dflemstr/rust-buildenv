@@ -17,13 +17,13 @@ use super::{Pattern, PatternContext, PatternError, PatternKind};
 use rustc::middle::expr_use_visitor::{ConsumeMode, Delegate, ExprUseVisitor};
 use rustc::middle::expr_use_visitor::{LoanCause, MutateMode};
 use rustc::middle::expr_use_visitor as euv;
-use rustc::middle::mem_categorization::{cmt};
+use rustc::middle::mem_categorization::cmt_;
 use rustc::middle::region;
 use rustc::session::Session;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::subst::Substs;
 use rustc::lint;
-use rustc_errors::DiagnosticBuilder;
+use rustc_errors::{Applicability, DiagnosticBuilder};
 use rustc::util::common::ErrorReported;
 
 use rustc::hir::def::*;
@@ -98,7 +98,7 @@ impl<'a, 'tcx> Visitor<'tcx> for MatchVisitor<'a, 'tcx> {
         intravisit::walk_expr(self, ex);
 
         match ex.node {
-            hir::ExprMatch(ref scrut, ref arms, source) => {
+            hir::ExprKind::Match(ref scrut, ref arms, source) => {
                 self.check_match(scrut, arms, source);
             }
             _ => {}
@@ -140,14 +140,14 @@ impl<'a, 'tcx> PatternContext<'a, 'tcx> {
                 }
                 PatternError::FloatBug => {
                     // FIXME(#31407) this is only necessary because float parsing is buggy
-                    ::rustc::middle::const_val::struct_error(
-                        self.tcx, pat_span,
+                    ::rustc::mir::interpret::struct_error(
+                        self.tcx.at(pat_span),
                         "could not evaluate float literal (see issue #31407)",
                     ).emit();
                 }
                 PatternError::NonConstPath(span) => {
-                    ::rustc::middle::const_val::struct_error(
-                        self.tcx, span,
+                    ::rustc::mir::interpret::struct_error(
+                        self.tcx.at(span),
                         "runtime values cannot be referenced in patterns",
                     ).emit();
                 }
@@ -181,7 +181,9 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
             // Second, if there is a guard on each arm, make sure it isn't
             // assigning or borrowing anything mutably.
             if let Some(ref guard) = arm.guard {
-                check_for_mutation_in_guard(self, &guard);
+                if self.tcx.check_for_mutation_in_guard_via_ast_walk() {
+                    check_for_mutation_in_guard(self, &guard);
+                }
             }
 
             // Third, perform some lints.
@@ -256,8 +258,8 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
     fn conservative_is_uninhabited(&self, scrutinee_ty: Ty<'tcx>) -> bool {
         // "rustc-1.0-style" uncontentious uninhabitableness check
         match scrutinee_ty.sty {
-            ty::TyNever => true,
-            ty::TyAdt(def, _) => def.variants.is_empty(),
+            ty::Never => true,
+            ty::Adt(def, _) => def.variants.is_empty(),
             _ => false
         }
     }
@@ -270,7 +272,7 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
                                                 self.tables);
             let pattern = patcx.lower_pattern(pat);
             let pattern_ty = pattern.ty;
-            let pats : Matrix = vec![vec![
+            let pats: Matrix = vec![vec![
                 expand_pattern(cx, pattern)
             ]].into_iter().collect();
 
@@ -293,7 +295,7 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
             );
             let label_msg = match pat.node {
                 PatKind::Path(hir::QPath::Resolved(None, ref path))
-                        if path.segments.len() == 1 && path.segments[0].parameters.is_none() => {
+                        if path.segments.len() == 1 && path.segments[0].args.is_none() => {
                     format!("interpreted as a {} pattern, not new variable", path.def.kind_name())
                 }
                 _ => format!("pattern `{}` not covered", pattern_string),
@@ -306,32 +308,33 @@ impl<'a, 'tcx> MatchVisitor<'a, 'tcx> {
 
 fn check_for_bindings_named_the_same_as_variants(cx: &MatchVisitor, pat: &Pat) {
     pat.walk(|p| {
-        if let PatKind::Binding(_, _, name, None) = p.node {
-            let bm = *cx.tables
-                        .pat_binding_modes()
-                        .get(p.hir_id)
-                        .expect("missing binding mode");
-
-            if bm != ty::BindByValue(hir::MutImmutable) {
-                // Nothing to check.
-                return true;
-            }
-            let pat_ty = cx.tables.pat_ty(p);
-            if let ty::TyAdt(edef, _) = pat_ty.sty {
-                if edef.is_enum() && edef.variants.iter().any(|variant| {
-                    variant.name == name.node && variant.ctor_kind == CtorKind::Const
-                }) {
-                    let ty_path = cx.tcx.item_path_str(edef.did);
-                    let mut err = struct_span_warn!(cx.tcx.sess, p.span, E0170,
-                        "pattern binding `{}` is named the same as one \
-                         of the variants of the type `{}`",
-                        name.node, ty_path);
-                    help!(err,
-                        "if you meant to match on a variant, \
-                        consider making the path in the pattern qualified: `{}::{}`",
-                        ty_path, name.node);
-                    err.emit();
+        if let PatKind::Binding(_, _, ident, None) = p.node {
+            if let Some(&bm) = cx.tables.pat_binding_modes().get(p.hir_id) {
+                if bm != ty::BindByValue(hir::MutImmutable) {
+                    // Nothing to check.
+                    return true;
                 }
+                let pat_ty = cx.tables.pat_ty(p);
+                if let ty::Adt(edef, _) = pat_ty.sty {
+                    if edef.is_enum() && edef.variants.iter().any(|variant| {
+                        variant.name == ident.name && variant.ctor_kind == CtorKind::Const
+                    }) {
+                        let ty_path = cx.tcx.item_path_str(edef.did);
+                        let mut err = struct_span_warn!(cx.tcx.sess, p.span, E0170,
+                            "pattern binding `{}` is named the same as one \
+                            of the variants of the type `{}`",
+                            ident, ty_path);
+                        err.span_suggestion_with_applicability(
+                            p.span,
+                            "to match on the variant, qualify the path",
+                            format!("{}::{}", ty_path, ident),
+                            Applicability::MachineApplicable
+                        );
+                        err.emit();
+                    }
+                }
+            } else {
+                cx.tcx.sess.delay_span_bug(p.span, "missing binding mode");
             }
         }
         true
@@ -367,43 +370,56 @@ fn check_arms<'a, 'tcx>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
                 NotUseful => {
                     match source {
                         hir::MatchSource::IfLetDesugar { .. } => {
-                            if printed_if_let_err {
-                                // we already printed an irrefutable if-let pattern error.
-                                // We don't want two, that's just confusing.
+                            if cx.tcx.features().irrefutable_let_patterns {
+                                cx.tcx.lint_node(
+                                    lint::builtin::IRREFUTABLE_LET_PATTERNS,
+                                    hir_pat.id, pat.span,
+                                    "irrefutable if-let pattern");
                             } else {
-                                // find the first arm pattern so we can use its span
-                                let &(ref first_arm_pats, _) = &arms[0];
-                                let first_pat = &first_arm_pats[0];
-                                let span = first_pat.0.span;
-                                struct_span_err!(cx.tcx.sess, span, E0162,
-                                                "irrefutable if-let pattern")
-                                    .span_label(span, "irrefutable pattern")
-                                    .emit();
-                                printed_if_let_err = true;
+                                if printed_if_let_err {
+                                    // we already printed an irrefutable if-let pattern error.
+                                    // We don't want two, that's just confusing.
+                                } else {
+                                    // find the first arm pattern so we can use its span
+                                    let &(ref first_arm_pats, _) = &arms[0];
+                                    let first_pat = &first_arm_pats[0];
+                                    let span = first_pat.0.span;
+                                    struct_span_err!(cx.tcx.sess, span, E0162,
+                                                    "irrefutable if-let pattern")
+                                        .span_label(span, "irrefutable pattern")
+                                        .emit();
+                                    printed_if_let_err = true;
+                                }
                             }
-                        },
+                        }
 
                         hir::MatchSource::WhileLetDesugar => {
-                            // find the first arm pattern so we can use its span
-                            let &(ref first_arm_pats, _) = &arms[0];
-                            let first_pat = &first_arm_pats[0];
-                            let span = first_pat.0.span;
-
                             // check which arm we're on.
                             match arm_index {
                                 // The arm with the user-specified pattern.
                                 0 => {
                                     cx.tcx.lint_node(
-                                            lint::builtin::UNREACHABLE_PATTERNS,
+                                        lint::builtin::UNREACHABLE_PATTERNS,
                                         hir_pat.id, pat.span,
                                         "unreachable pattern");
                                 },
                                 // The arm with the wildcard pattern.
                                 1 => {
-                                    struct_span_err!(cx.tcx.sess, span, E0165,
-                                                     "irrefutable while-let pattern")
-                                        .span_label(span, "irrefutable pattern")
-                                        .emit();
+                                    if cx.tcx.features().irrefutable_let_patterns {
+                                        cx.tcx.lint_node(
+                                            lint::builtin::IRREFUTABLE_LET_PATTERNS,
+                                            hir_pat.id, pat.span,
+                                            "irrefutable while-let pattern");
+                                    } else {
+                                        // find the first arm pattern so we can use its span
+                                        let &(ref first_arm_pats, _) = &arms[0];
+                                        let first_pat = &first_arm_pats[0];
+                                        let span = first_pat.0.span;
+                                        struct_span_err!(cx.tcx.sess, span, E0165,
+                                                         "irrefutable while-let pattern")
+                                            .span_label(span, "irrefutable pattern")
+                                            .emit();
+                                    }
                                 },
                                 _ => bug!(),
                             }
@@ -464,7 +480,7 @@ fn check_exhaustive<'a, 'tcx>(cx: &mut MatchCheckCtxt<'a, 'tcx>,
             let joined_patterns = match witnesses.len() {
                 0 => bug!(),
                 1 => format!("`{}`", witnesses[0]),
-                2...LIMIT => {
+                2..=LIMIT => {
                     let (tail, head) = witnesses.split_last().unwrap();
                     let head: Vec<_> = head.iter().map(|w| w.to_string()).collect();
                     format!("`{}` and `{}`", head.join("`, `"), tail)
@@ -499,14 +515,13 @@ fn check_legality_of_move_bindings(cx: &MatchVisitor,
                                    pats: &[P<Pat>]) {
     let mut by_ref_span = None;
     for pat in pats {
-        pat.each_binding(|_, id, span, _path| {
-            let hir_id = cx.tcx.hir.node_to_hir_id(id);
-            let bm = *cx.tables
-                        .pat_binding_modes()
-                        .get(hir_id)
-                        .expect("missing binding mode");
-            if let ty::BindByReference(..) = bm {
-                by_ref_span = Some(span);
+        pat.each_binding(|_, hir_id, span, _path| {
+            if let Some(&bm) = cx.tables.pat_binding_modes().get(hir_id) {
+                if let ty::BindByReference(..) = bm {
+                    by_ref_span = Some(span);
+                }
+            } else {
+                cx.tcx.sess.delay_span_bug(pat.span, "missing binding mode");
             }
         })
     }
@@ -537,18 +552,18 @@ fn check_legality_of_move_bindings(cx: &MatchVisitor,
     for pat in pats {
         pat.walk(|p| {
             if let PatKind::Binding(_, _, _, ref sub) = p.node {
-                let bm = *cx.tables
-                            .pat_binding_modes()
-                            .get(p.hir_id)
-                            .expect("missing binding mode");
-                match bm {
-                    ty::BindByValue(..) => {
-                        let pat_ty = cx.tables.node_id_to_type(p.hir_id);
-                        if pat_ty.moves_by_default(cx.tcx, cx.param_env, pat.span) {
-                            check_move(p, sub.as_ref().map(|p| &**p));
+                if let Some(&bm) = cx.tables.pat_binding_modes().get(p.hir_id) {
+                    match bm {
+                        ty::BindByValue(..) => {
+                            let pat_ty = cx.tables.node_id_to_type(p.hir_id);
+                            if pat_ty.moves_by_default(cx.tcx, cx.param_env, pat.span) {
+                                check_move(p, sub.as_ref().map(|p| &**p));
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
+                } else {
+                    cx.tcx.sess.delay_span_bug(pat.span, "missing binding mode");
                 }
             }
             true
@@ -573,13 +588,13 @@ struct MutationChecker<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'tcx> Delegate<'tcx> for MutationChecker<'a, 'tcx> {
-    fn matched_pat(&mut self, _: &Pat, _: cmt, _: euv::MatchMode) {}
-    fn consume(&mut self, _: ast::NodeId, _: Span, _: cmt, _: ConsumeMode) {}
-    fn consume_pat(&mut self, _: &Pat, _: cmt, _: ConsumeMode) {}
+    fn matched_pat(&mut self, _: &Pat, _: &cmt_, _: euv::MatchMode) {}
+    fn consume(&mut self, _: ast::NodeId, _: Span, _: &cmt_, _: ConsumeMode) {}
+    fn consume_pat(&mut self, _: &Pat, _: &cmt_, _: ConsumeMode) {}
     fn borrow(&mut self,
               _: ast::NodeId,
               span: Span,
-              _: cmt,
+              _: &cmt_,
               _: ty::Region<'tcx>,
               kind:ty:: BorrowKind,
               _: LoanCause) {
@@ -594,7 +609,7 @@ impl<'a, 'tcx> Delegate<'tcx> for MutationChecker<'a, 'tcx> {
         }
     }
     fn decl_without_init(&mut self, _: ast::NodeId, _: Span) {}
-    fn mutate(&mut self, _: ast::NodeId, span: Span, _: cmt, mode: MutateMode) {
+    fn mutate(&mut self, _: ast::NodeId, span: Span, _: &cmt_, mode: MutateMode) {
         match mode {
             MutateMode::JustWrite | MutateMode::WriteAndRead => {
                 struct_span_err!(self.cx.tcx.sess, span, E0302, "cannot assign in a pattern guard")

@@ -13,15 +13,15 @@ use std::env;
 
 use ast;
 use ast::{Ident, Name};
-use codemap;
+use source_map;
 use syntax_pos::Span;
 use ext::base::{ExtCtxt, MacEager, MacResult};
 use ext::build::AstBuilder;
 use parse::token;
 use ptr::P;
+use OneVector;
 use symbol::{keywords, Symbol};
 use tokenstream::{TokenTree};
-use util::small_vector::SmallVector;
 
 use diagnostics::metadata::output_metadata;
 
@@ -42,7 +42,7 @@ pub type ErrorMap = BTreeMap<Name, ErrorInfo>;
 pub fn expand_diagnostic_used<'cx>(ecx: &'cx mut ExtCtxt,
                                    span: Span,
                                    token_tree: &[TokenTree])
-                                   -> Box<MacResult+'cx> {
+                                   -> Box<dyn MacResult+'cx> {
     let code = match (token_tree.len(), token_tree.get(0)) {
         (1, Some(&TokenTree::Token(_, token::Ident(code, _)))) => code,
         _ => unreachable!()
@@ -75,7 +75,7 @@ pub fn expand_diagnostic_used<'cx>(ecx: &'cx mut ExtCtxt,
 pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
                                        span: Span,
                                        token_tree: &[TokenTree])
-                                       -> Box<MacResult+'cx> {
+                                       -> Box<dyn MacResult+'cx> {
     let (code, description) = match (
         token_tree.len(),
         token_tree.get(0),
@@ -131,7 +131,7 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
     let sym = Ident::with_empty_ctxt(Symbol::gensym(&format!(
         "__register_diagnostic_{}", code
     )));
-    MacEager::items(SmallVector::many(vec![
+    MacEager::items(OneVector::from_vec(vec![
         ecx.item_mod(
             span,
             span,
@@ -145,7 +145,7 @@ pub fn expand_register_diagnostic<'cx>(ecx: &'cx mut ExtCtxt,
 pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
                                           span: Span,
                                           token_tree: &[TokenTree])
-                                          -> Box<MacResult+'cx> {
+                                          -> Box<dyn MacResult+'cx> {
     assert_eq!(token_tree.len(), 3);
     let (crate_name, name) = match (&token_tree[0], &token_tree[2]) {
         (
@@ -162,7 +162,7 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
         ecx.parse_sess.registered_diagnostics.with_lock(|diagnostics| {
             if let Err(e) = output_metadata(ecx,
                                             &target_triple,
-                                            &crate_name.name.as_str(),
+                                            &crate_name.as_str(),
                                             diagnostics) {
                 ecx.span_bug(span, &format!(
                     "error writing metadata for triple `{}` and crate `{}`, error: {}, \
@@ -207,11 +207,14 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
                 span,
                 ast::TyKind::Tup(vec![ty_str.clone(), ty_str])
             ),
-            ecx.expr_usize(span, count),
+            ast::AnonConst {
+                id: ast::DUMMY_NODE_ID,
+                value: ecx.expr_usize(span, count),
+            },
         ),
     );
 
-    MacEager::items(SmallVector::many(vec![
+    MacEager::items(OneVector::from_vec(vec![
         P(ast::Item {
             ident: *name,
             attrs: Vec::new(),
@@ -220,7 +223,7 @@ pub fn expand_build_diagnostic_array<'cx>(ecx: &'cx mut ExtCtxt,
                 ty,
                 expr,
             ),
-            vis: codemap::respan(span.shrink_to_lo(), ast::VisibilityKind::Public),
+            vis: source_map::respan(span.shrink_to_lo(), ast::VisibilityKind::Public),
             span,
             tokens: None,
         })

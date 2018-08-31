@@ -15,13 +15,10 @@ use dataflow::{on_all_children_bits, on_all_drop_children_bits};
 use dataflow::{drop_flag_effects_for_location, on_lookup_result_bits};
 use dataflow::MoveDataParamEnv;
 use dataflow::{self, do_dataflow, DebugFormatted};
-use rustc::hir;
 use rustc::ty::{self, TyCtxt};
 use rustc::mir::*;
-use rustc::middle::const_val::ConstVal;
-use rustc::mir::interpret::{Value, PrimVal};
 use rustc::util::nodemap::FxHashMap;
-use rustc_data_structures::indexed_set::IdxSetBuf;
+use rustc_data_structures::indexed_set::IdxSet;
 use rustc_data_structures::indexed_vec::Idx;
 use transform::{MirPass, MirSource};
 use util::patch::MirPatch;
@@ -42,16 +39,22 @@ impl MirPass for ElaborateDrops {
     {
         debug!("elaborate_drops({:?} @ {:?})", src, mir.span);
 
-        // Don't run on constant MIR, because trans might not be able to
-        // evaluate the modified MIR.
-        // FIXME(eddyb) Remove check after miri is merged.
         let id = tcx.hir.as_local_node_id(src.def_id).unwrap();
-        match (tcx.hir.body_owner_kind(id), src.promoted) {
-            (hir::BodyOwnerKind::Fn, None) => {},
-            _ => return
-        }
-        let param_env = tcx.param_env(src.def_id);
-        let move_data = MoveData::gather_moves(mir, tcx).unwrap();
+        let param_env = tcx.param_env(src.def_id).with_reveal_all();
+        let move_data = match MoveData::gather_moves(mir, tcx) {
+            Ok(move_data) => move_data,
+            Err((move_data, _move_errors)) => {
+                // The only way we should be allowing any move_errors
+                // in here is if we are in the migration path for the
+                // NLL-based MIR-borrowck.
+                //
+                // If we are in the migration path, we have already
+                // reported these errors as warnings to the user. So
+                // we will just ignore them here.
+                assert!(tcx.migrate_borrowck());
+                move_data
+            }
+        };
         let elaborate_patch = {
             let mir = &*mir;
             let env = MoveDataParamEnv {
@@ -90,12 +93,12 @@ fn find_dead_unwinds<'a, 'tcx>(
     mir: &Mir<'tcx>,
     id: ast::NodeId,
     env: &MoveDataParamEnv<'tcx, 'tcx>)
-    -> IdxSetBuf<BasicBlock>
+    -> IdxSet<BasicBlock>
 {
     debug!("find_dead_unwinds({:?})", mir.span);
     // We only need to do this pass once, because unwind edges can only
     // reach cleanup blocks, which can't have unwind edges themselves.
-    let mut dead_unwinds = IdxSetBuf::new_empty(mir.basic_blocks().len());
+    let mut dead_unwinds = IdxSet::new_empty(mir.basic_blocks().len());
     let flow_inits =
         do_dataflow(tcx, mir, id, &[], &dead_unwinds,
                     MaybeInitializedPlaces::new(tcx, mir, &env),
@@ -109,7 +112,7 @@ fn find_dead_unwinds<'a, 'tcx>(
 
         let mut init_data = InitializationData {
             live: flow_inits.sets().on_entry_set_for(bb.index()).to_owned(),
-            dead: IdxSetBuf::new_empty(env.move_data.move_paths.len()),
+            dead: IdxSet::new_empty(env.move_data.move_paths.len()),
         };
         debug!("find_dead_unwinds @ {:?}: {:?}; init_data={:?}",
                bb, bb_data, init_data.live);
@@ -144,8 +147,8 @@ fn find_dead_unwinds<'a, 'tcx>(
 }
 
 struct InitializationData {
-    live: IdxSetBuf<MovePathIndex>,
-    dead: IdxSetBuf<MovePathIndex>
+    live: IdxSet<MovePathIndex>,
+    dead: IdxSet<MovePathIndex>
 }
 
 impl InitializationData {
@@ -182,7 +185,7 @@ struct Elaborator<'a, 'b: 'a, 'tcx: 'b> {
 }
 
 impl<'a, 'b, 'tcx> fmt::Debug for Elaborator<'a, 'b, 'tcx> {
-    fn fmt(&self, _f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+    fn fmt(&self, _f: &mut fmt::Formatter) -> fmt::Result {
         Ok(())
     }
 }
@@ -452,7 +455,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     /// Elaborate a MIR `replace` terminator. This instruction
-    /// is not directly handled by translation, and therefore
+    /// is not directly handled by codegen, and therefore
     /// must be desugared.
     ///
     /// The desugaring drops the location if needed, and then writes
@@ -540,12 +543,8 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         Rvalue::Use(Operand::Constant(Box::new(Constant {
             span,
             ty: self.tcx.types.bool,
-            literal: Literal::Value {
-                value: self.tcx.mk_const(ty::Const {
-                    val: ConstVal::Value(Value::ByVal(PrimVal::Bytes(val as u128))),
-                    ty: self.tcx.types.bool
-                })
-            }
+            user_ty: None,
+            literal: ty::Const::from_bool(self.tcx, val),
         })))
     }
 
@@ -558,7 +557,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_on_init(&mut self) {
-        let loc = Location { block: START_BLOCK, statement_index: 0 };
+        let loc = Location::START;
         let span = self.patch.source_info_for_location(self.mir, loc).span;
         let false_ = self.constant_bool(span, false);
         for flag in self.drop_flags.values() {
@@ -584,7 +583,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
     }
 
     fn drop_flags_for_args(&mut self) {
-        let loc = Location { block: START_BLOCK, statement_index: 0 };
+        let loc = Location::START;
         dataflow::drop_flag_effects_for_function_entry(
             self.tcx, self.mir, self.env, |path, ds| {
                 self.set_drop_flag(loc, path, ds);

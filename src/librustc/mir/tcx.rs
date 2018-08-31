@@ -68,12 +68,12 @@ impl<'a, 'gcx, 'tcx> PlaceTy<'tcx> {
                 let ty = self.to_ty(tcx);
                 PlaceTy::Ty {
                     ty: match ty.sty {
-                        ty::TyArray(inner, size) => {
-                            let size = size.val.unwrap_u64();
+                        ty::Array(inner, size) => {
+                            let size = size.unwrap_usize(tcx);
                             let len = size - (from as u64) - (to as u64);
                             tcx.mk_array(inner, len)
                         }
-                        ty::TySlice(..) => ty,
+                        ty::Slice(..) => ty,
                         _ => {
                             bug!("cannot subslice non-array type: `{:?}`", self)
                         }
@@ -82,7 +82,7 @@ impl<'a, 'gcx, 'tcx> PlaceTy<'tcx> {
             }
             ProjectionElem::Downcast(adt_def1, index) =>
                 match self.to_ty(tcx).sty {
-                    ty::TyAdt(adt_def, substs) => {
+                    ty::Adt(adt_def, substs) => {
                         assert!(adt_def.is_enum());
                         assert!(index < adt_def.variants.len());
                         assert_eq!(adt_def, adt_def1);
@@ -113,10 +113,46 @@ impl<'tcx> Place<'tcx> {
         match *self {
             Place::Local(index) =>
                 PlaceTy::Ty { ty: local_decls.local_decls()[index].ty },
+            Place::Promoted(ref data) => PlaceTy::Ty { ty: data.1 },
             Place::Static(ref data) =>
                 PlaceTy::Ty { ty: data.ty },
             Place::Projection(ref proj) =>
                 proj.base.ty(local_decls, tcx).projection_ty(tcx, &proj.elem),
+        }
+    }
+
+    /// If this is a field projection, and the field is being projected from a closure type,
+    /// then returns the index of the field being projected. Note that this closure will always
+    /// be `self` in the current MIR, because that is the only time we directly access the fields
+    /// of a closure type.
+    pub fn is_upvar_field_projection<'cx, 'gcx>(&self, mir: &'cx Mir<'tcx>,
+                                                tcx: &TyCtxt<'cx, 'gcx, 'tcx>) -> Option<Field> {
+        let (place, by_ref) = if let Place::Projection(ref proj) = self {
+            if let ProjectionElem::Deref = proj.elem {
+                (&proj.base, true)
+            } else {
+                (self, false)
+            }
+        } else {
+            (self, false)
+        };
+
+        match place {
+            Place::Projection(ref proj) => match proj.elem {
+                ProjectionElem::Field(field, _ty) => {
+                    let base_ty = proj.base.ty(mir, *tcx).to_ty(*tcx);
+
+                    if (base_ty.is_closure() || base_ty.is_generator()) &&
+                        (!by_ref || mir.upvar_decls[field.index()].by_ref)
+                    {
+                        Some(field)
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
+            _ => None,
         }
     }
 }
@@ -163,7 +199,7 @@ impl<'tcx> Rvalue<'tcx> {
             }
             Rvalue::Discriminant(ref place) => {
                 let ty = place.ty(local_decls, tcx).to_ty(tcx);
-                if let ty::TyAdt(adt_def, _) = ty.sty {
+                if let ty::Adt(adt_def, _) = ty.sty {
                     adt_def.repr.discr_type().to_ty(tcx)
                 } else {
                     // This can only be `0`, for now, so `u8` will suffice.
@@ -180,14 +216,14 @@ impl<'tcx> Rvalue<'tcx> {
                     AggregateKind::Tuple => {
                         tcx.mk_tup(ops.iter().map(|op| op.ty(local_decls, tcx)))
                     }
-                    AggregateKind::Adt(def, _, substs, _) => {
+                    AggregateKind::Adt(def, _, substs, _, _) => {
                         tcx.type_of(def.did).subst(tcx, substs)
                     }
                     AggregateKind::Closure(did, substs) => {
-                        tcx.mk_closure_from_closure_substs(did, substs)
+                        tcx.mk_closure(did, substs)
                     }
-                    AggregateKind::Generator(did, substs, interior) => {
-                        tcx.mk_generator(did, substs, interior)
+                    AggregateKind::Generator(did, substs, movability) => {
+                        tcx.mk_generator(did, substs, movability)
                     }
                 }
             }
@@ -256,24 +292,24 @@ impl BorrowKind {
 }
 
 impl BinOp {
-    pub fn to_hir_binop(self) -> hir::BinOp_ {
+    pub fn to_hir_binop(self) -> hir::BinOpKind {
         match self {
-            BinOp::Add => hir::BinOp_::BiAdd,
-            BinOp::Sub => hir::BinOp_::BiSub,
-            BinOp::Mul => hir::BinOp_::BiMul,
-            BinOp::Div => hir::BinOp_::BiDiv,
-            BinOp::Rem => hir::BinOp_::BiRem,
-            BinOp::BitXor => hir::BinOp_::BiBitXor,
-            BinOp::BitAnd => hir::BinOp_::BiBitAnd,
-            BinOp::BitOr => hir::BinOp_::BiBitOr,
-            BinOp::Shl => hir::BinOp_::BiShl,
-            BinOp::Shr => hir::BinOp_::BiShr,
-            BinOp::Eq => hir::BinOp_::BiEq,
-            BinOp::Ne => hir::BinOp_::BiNe,
-            BinOp::Lt => hir::BinOp_::BiLt,
-            BinOp::Gt => hir::BinOp_::BiGt,
-            BinOp::Le => hir::BinOp_::BiLe,
-            BinOp::Ge => hir::BinOp_::BiGe,
+            BinOp::Add => hir::BinOpKind::Add,
+            BinOp::Sub => hir::BinOpKind::Sub,
+            BinOp::Mul => hir::BinOpKind::Mul,
+            BinOp::Div => hir::BinOpKind::Div,
+            BinOp::Rem => hir::BinOpKind::Rem,
+            BinOp::BitXor => hir::BinOpKind::BitXor,
+            BinOp::BitAnd => hir::BinOpKind::BitAnd,
+            BinOp::BitOr => hir::BinOpKind::BitOr,
+            BinOp::Shl => hir::BinOpKind::Shl,
+            BinOp::Shr => hir::BinOpKind::Shr,
+            BinOp::Eq => hir::BinOpKind::Eq,
+            BinOp::Ne => hir::BinOpKind::Ne,
+            BinOp::Lt => hir::BinOpKind::Lt,
+            BinOp::Gt => hir::BinOpKind::Gt,
+            BinOp::Le => hir::BinOpKind::Le,
+            BinOp::Ge => hir::BinOpKind::Ge,
             BinOp::Offset => unreachable!()
         }
     }

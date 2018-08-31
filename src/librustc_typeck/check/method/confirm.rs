@@ -12,17 +12,18 @@ use super::{probe, MethodCallee};
 
 use astconv::AstConv;
 use check::{FnCtxt, PlaceOp, callee, Needs};
+use hir::GenericArg;
 use hir::def_id::DefId;
 use rustc::ty::subst::Substs;
 use rustc::traits;
-use rustc::ty::{self, Ty};
+use rustc::ty::{self, Ty, GenericParamDefKind};
 use rustc::ty::subst::Subst;
 use rustc::ty::adjustment::{Adjustment, Adjust, OverloadedDeref};
 use rustc::ty::adjustment::{AllowTwoPhase, AutoBorrow, AutoBorrowMutability};
 use rustc::ty::fold::TypeFoldable;
 use rustc::infer::{self, InferOk};
-use syntax_pos::Span;
 use rustc::hir;
+use syntax_pos::Span;
 
 use std::ops::Deref;
 
@@ -46,18 +47,21 @@ pub struct ConfirmResult<'tcx> {
 }
 
 impl<'a, 'gcx, 'tcx> FnCtxt<'a, 'gcx, 'tcx> {
-    pub fn confirm_method(&self,
-                          span: Span,
-                          self_expr: &'gcx hir::Expr,
-                          call_expr: &'gcx hir::Expr,
-                          unadjusted_self_ty: Ty<'tcx>,
-                          pick: probe::Pick<'tcx>,
-                          segment: &hir::PathSegment)
-                          -> ConfirmResult<'tcx> {
-        debug!("confirm(unadjusted_self_ty={:?}, pick={:?}, generic_args={:?})",
-               unadjusted_self_ty,
-               pick,
-               segment.parameters);
+    pub fn confirm_method(
+        &self,
+        span: Span,
+        self_expr: &'gcx hir::Expr,
+        call_expr: &'gcx hir::Expr,
+        unadjusted_self_ty: Ty<'tcx>,
+        pick: probe::Pick<'tcx>,
+        segment: &hir::PathSegment,
+    ) -> ConfirmResult<'tcx> {
+        debug!(
+            "confirm(unadjusted_self_ty={:?}, pick={:?}, generic_args={:?})",
+            unadjusted_self_ty,
+            pick,
+            segment.args,
+        );
 
         let mut confirm_cx = ConfirmContext::new(self, span, self_expr, call_expr);
         confirm_cx.confirm(unadjusted_self_ty, pick, segment)
@@ -78,11 +82,12 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         }
     }
 
-    fn confirm(&mut self,
-               unadjusted_self_ty: Ty<'tcx>,
-               pick: probe::Pick<'tcx>,
-               segment: &hir::PathSegment)
-               -> ConfirmResult<'tcx> {
+    fn confirm(
+        &mut self,
+        unadjusted_self_ty: Ty<'tcx>,
+        pick: probe::Pick<'tcx>,
+        segment: &hir::PathSegment,
+    ) -> ConfirmResult<'tcx> {
         // Adjust the self expression the user provided and obtain the adjusted type.
         let self_ty = self.adjust_self_ty(unadjusted_self_ty, &pick);
 
@@ -125,7 +130,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         // We won't add these if we encountered an illegal sized bound, so that we can use
         // a custom error in that case.
         if !illegal_sized_bound {
-            let method_ty = self.tcx.mk_fn_ptr(ty::Binder(method_sig));
+            let method_ty = self.tcx.mk_fn_ptr(ty::Binder::bind(method_sig));
             self.add_obligations(method_ty, all_substs, &method_predicates);
         }
 
@@ -288,7 +293,7 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             .include_raw_pointers()
             .filter_map(|(ty, _)| {
                 match ty.sty {
-                    ty::TyDynamic(ref data, ..) => data.principal().map(|p| closure(self, ty, p)),
+                    ty::Dynamic(ref data, ..) => data.principal().map(|p| closure(self, ty, p)),
                     _ => None,
                 }
             })
@@ -300,46 +305,58 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             })
     }
 
-    fn instantiate_method_substs(&mut self,
-                                 pick: &probe::Pick<'tcx>,
-                                 segment: &hir::PathSegment,
-                                 parent_substs: &Substs<'tcx>)
-                                 -> &'tcx Substs<'tcx> {
+    fn instantiate_method_substs(
+        &mut self,
+        pick: &probe::Pick<'tcx>,
+        seg: &hir::PathSegment,
+        parent_substs: &Substs<'tcx>,
+    ) -> &'tcx Substs<'tcx> {
         // Determine the values for the generic parameters of the method.
         // If they were not explicitly supplied, just construct fresh
         // variables.
-        let method_generics = self.tcx.generics_of(pick.item.def_id);
-        let mut fn_segment = Some((segment, method_generics));
-        self.fcx.check_path_parameter_count(self.span, &mut fn_segment, true, false);
+        let generics = self.tcx.generics_of(pick.item.def_id);
+        AstConv::check_generic_arg_count_for_call(
+            self.tcx,
+            self.span,
+            &generics,
+            &seg,
+            true, // `is_method_call`
+        );
 
         // Create subst for early-bound lifetime parameters, combining
         // parameters from the type and those from the method.
-        assert_eq!(method_generics.parent_count(), parent_substs.len());
-        let provided = &segment.parameters;
-        Substs::for_item(self.tcx, pick.item.def_id, |def, _| {
-            let i = def.index as usize;
-            if i < parent_substs.len() {
-                parent_substs.region_at(i)
-            } else if let Some(lifetime)
-                    = provided.as_ref().and_then(|p| p.lifetimes.get(i - parent_substs.len())) {
-                AstConv::ast_region_to_region(self.fcx, lifetime, Some(def))
-            } else {
-                self.region_var_for_def(self.span, def)
-            }
-        }, |def, _cur_substs| {
-            let i = def.index as usize;
-            if i < parent_substs.len() {
-                parent_substs.type_at(i)
-            } else if let Some(ast_ty)
-                = provided.as_ref().and_then(|p| {
-                    p.types.get(i - parent_substs.len() - method_generics.regions.len())
-                })
-            {
-                self.to_ty(ast_ty)
-            } else {
-                self.type_var_for_def(self.span, def)
-            }
-        })
+        assert_eq!(generics.parent_count, parent_substs.len());
+
+        AstConv::create_substs_for_generic_args(
+            self.tcx,
+            pick.item.def_id,
+            parent_substs,
+            false,
+            None,
+            // Provide the generic args, and whether types should be inferred.
+            |_| {
+                // The last argument of the returned tuple here is unimportant.
+                if let Some(ref data) = seg.args {
+                    (Some(data), false)
+                } else {
+                    (None, false)
+                }
+            },
+            // Provide substitutions for parameters for which (valid) arguments have been provided.
+            |param, arg| {
+                match (&param.kind, arg) {
+                    (GenericParamDefKind::Lifetime, GenericArg::Lifetime(lt)) => {
+                        AstConv::ast_region_to_region(self.fcx, lt, Some(param)).into()
+                    }
+                    (GenericParamDefKind::Type { .. }, GenericArg::Type(ty)) => {
+                        self.to_ty(ty).into()
+                    }
+                    _ => unreachable!(),
+                }
+            },
+            // Provide substitutions for parameters for which arguments are inferred.
+            |_, param, _| self.var_for_def(self.span, param),
+        )
     }
 
     fn unify_receivers(&mut self, self_ty: Ty<'tcx>, method_self_ty: Ty<'tcx>) {
@@ -432,9 +449,9 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         loop {
             let last = exprs[exprs.len() - 1];
             match last.node {
-                hir::ExprField(ref expr, _) |
-                hir::ExprIndex(ref expr, _) |
-                hir::ExprUnary(hir::UnDeref, ref expr) => exprs.push(&expr),
+                hir::ExprKind::Field(ref expr, _) |
+                hir::ExprKind::Index(ref expr, _) |
+                hir::ExprKind::Unary(hir::UnDeref, ref expr) => exprs.push(&expr),
                 _ => break,
             }
         }
@@ -462,10 +479,10 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
                     if let Adjust::Deref(Some(ref mut deref)) = adjustment.kind {
                         if let Some(ok) = self.try_overloaded_deref(expr.span, source, needs) {
                             let method = self.register_infer_ok_obligations(ok);
-                            if let ty::TyRef(region, mt) = method.sig.output().sty {
+                            if let ty::Ref(region, _, mutbl) = method.sig.output().sty {
                                 *deref = OverloadedDeref {
                                     region,
-                                    mutbl: mt.mutbl
+                                    mutbl,
                                 };
                             }
                         }
@@ -476,12 +493,12 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
             }
 
             match expr.node {
-                hir::ExprIndex(ref base_expr, ref index_expr) => {
+                hir::ExprKind::Index(ref base_expr, ref index_expr) => {
                     let index_expr_ty = self.node_ty(index_expr.hir_id);
                     self.convert_place_op_to_mutable(
                         PlaceOp::Index, expr, base_expr, &[index_expr_ty]);
                 }
-                hir::ExprUnary(hir::UnDeref, ref base_expr) => {
+                hir::ExprKind::Unary(hir::UnDeref, ref base_expr) => {
                     self.convert_place_op_to_mutable(
                         PlaceOp::Deref, expr, base_expr, &[]);
                 }
@@ -521,8 +538,8 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
         debug!("convert_place_op_to_mutable: method={:?}", method);
         self.write_method_call(expr.hir_id, method);
 
-        let (region, mutbl) = if let ty::TyRef(r, mt) = method.sig.inputs()[0].sty {
-            (r, mt.mutbl)
+        let (region, mutbl) = if let ty::Ref(r, _, mutbl) = method.sig.inputs()[0].sty {
+            (r, mutbl)
         } else {
             span_bug!(expr.span, "input to place op is not a ref?");
         };
@@ -587,8 +604,8 @@ impl<'a, 'gcx, 'tcx> ConfirmContext<'a, 'gcx, 'tcx> {
                 }
             })
             .any(|trait_pred| {
-                match trait_pred.0.self_ty().sty {
-                    ty::TyDynamic(..) => true,
+                match trait_pred.skip_binder().self_ty().sty {
+                    ty::Dynamic(..) => true,
                     _ => false,
                 }
             })

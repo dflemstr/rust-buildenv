@@ -34,13 +34,13 @@ impl<'cx, 'tcx, 'v> ItemLikeVisitor<'v> for OrphanChecker<'cx, 'tcx> {
     fn visit_item(&mut self, item: &hir::Item) {
         let def_id = self.tcx.hir.local_def_id(item.id);
         match item.node {
-            hir::ItemImpl(.., Some(_), _, _) => {
+            hir::ItemKind::Impl(.., Some(_), _, _) => {
                 // "Trait" impl
                 debug!("coherence2::orphan check: trait impl {}",
                        self.tcx.hir.node_to_string(item.id));
                 let trait_ref = self.tcx.impl_trait_ref(def_id).unwrap();
                 let trait_def_id = trait_ref.def_id;
-                let cm = self.tcx.sess.codemap();
+                let cm = self.tcx.sess.source_map();
                 let sp = cm.def_span(item.span);
                 match traits::orphan_check(self.tcx, def_id) {
                     Ok(()) => {}
@@ -114,8 +114,8 @@ impl<'cx, 'tcx, 'v> ItemLikeVisitor<'v> for OrphanChecker<'cx, 'tcx> {
                    !trait_def_id.is_local() {
                     let self_ty = trait_ref.self_ty();
                     let opt_self_def_id = match self_ty.sty {
-                        ty::TyAdt(self_def, _) => Some(self_def.did),
-                        ty::TyForeign(did) => Some(did),
+                        ty::Adt(self_def, _) => Some(self_def.did),
+                        ty::Foreign(did) => Some(did),
                         _ => None,
                     };
 
