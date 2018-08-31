@@ -13,17 +13,11 @@
 use std::fmt::{Debug, Display};
 use std::borrow::Borrow;
 
-#[rustc_dump_program_clauses] //~ ERROR Implemented(Self: Foo<'a, 'b, S, T, U>) :-
-                              //~| ERROR FromEnv
-                              //~| ERROR FromEnv
-                              //~| ERROR FromEnv
-                              //~| ERROR FromEnv
-                              //~| ERROR RegionOutlives
-                              //~| ERROR TypeOutlives
+#[rustc_dump_program_clauses] //~ ERROR program clause dump
 trait Foo<'a, 'b, S, T, U> where S: Debug, T: Borrow<U>, U: ?Sized, 'a: 'b, U: 'b {
-    fn s(S) -> S;
-    fn t(T) -> T;
-    fn u(U) -> U;
+    fn s(_: S) -> S;
+    fn t(_: T) -> T;
+    fn u(_: U) -> U;
 }
 
 fn main() {

@@ -18,12 +18,13 @@
        html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
        html_root_url = "https://doc.rust-lang.org/nightly/")]
 
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(rustc_diagnostic_macros)]
 
 #[macro_use]
 extern crate rustc;
 extern crate rustc_mir;
-extern crate rustc_const_math;
 extern crate rustc_data_structures;
 
 #[macro_use]
@@ -33,7 +34,7 @@ extern crate syntax;
 extern crate syntax_pos;
 extern crate rustc_errors as errors;
 
-use rustc::ty::maps::Providers;
+use rustc::ty::query::Providers;
 
 mod diagnostics;
 

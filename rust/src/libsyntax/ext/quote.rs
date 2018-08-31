@@ -9,7 +9,7 @@
 // except according to those terms.
 
 use ast::{self, Arg, Arm, Block, Expr, Item, Pat, Stmt, Ty};
-use codemap::respan;
+use source_map::respan;
 use syntax_pos::Span;
 use ext::base::ExtCtxt;
 use ext::base;
@@ -28,18 +28,19 @@ use tokenstream::{TokenStream, TokenTree};
 
 pub mod rt {
     use ast;
-    use codemap::Spanned;
+    use source_map::Spanned;
     use ext::base::ExtCtxt;
     use parse::{self, classify};
     use parse::token::{self, Token};
     use ptr::P;
     use symbol::Symbol;
+    use ThinVec;
 
     use tokenstream::{self, TokenTree, TokenStream};
 
     pub use parse::new_parser_from_tts;
     pub use syntax_pos::{BytePos, Span, DUMMY_SP, FileName};
-    pub use codemap::{dummy_spanned};
+    pub use source_map::{dummy_spanned};
 
     pub trait ToTokens {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree>;
@@ -274,7 +275,7 @@ pub mod rt {
                 id: ast::DUMMY_NODE_ID,
                 node: ast::ExprKind::Lit(P(self.clone())),
                 span: DUMMY_SP,
-                attrs: ast::ThinVec::new(),
+                attrs: ThinVec::new(),
             }).to_tokens(cx)
         }
     }
@@ -305,7 +306,7 @@ pub mod rt {
                         id: ast::DUMMY_NODE_ID,
                         node: ast::ExprKind::Lit(P(dummy_spanned(lit))),
                         span: DUMMY_SP,
-                        attrs: ast::ThinVec::new(),
+                        attrs: ThinVec::new(),
                     });
                     if *self >= 0 {
                         return lit.to_tokens(cx);
@@ -314,7 +315,7 @@ pub mod rt {
                         id: ast::DUMMY_NODE_ID,
                         node: ast::ExprKind::Unary(ast::UnOp::Neg, lit),
                         span: DUMMY_SP,
-                        attrs: ast::ThinVec::new(),
+                        attrs: ThinVec::new(),
                     }).to_tokens(cx)
                 }
             }
@@ -452,7 +453,7 @@ pub fn parse_path_panic(parser: &mut Parser, mode: PathStyle) -> ast::Path {
 pub fn expand_quote_tokens<'cx>(cx: &'cx mut ExtCtxt,
                                 sp: Span,
                                 tts: &[TokenTree])
-                                -> Box<base::MacResult+'cx> {
+                                -> Box<dyn base::MacResult+'cx> {
     let (cx_expr, expr) = expand_tts(cx, sp, tts);
     let expanded = expand_wrapper(cx, sp, cx_expr, expr, &[&["syntax", "ext", "quote", "rt"]]);
     base::MacEager::expr(expanded)
@@ -461,7 +462,7 @@ pub fn expand_quote_tokens<'cx>(cx: &'cx mut ExtCtxt,
 pub fn expand_quote_expr<'cx>(cx: &'cx mut ExtCtxt,
                               sp: Span,
                               tts: &[TokenTree])
-                              -> Box<base::MacResult+'cx> {
+                              -> Box<dyn base::MacResult+'cx> {
     let expanded = expand_parse_call(cx, sp, "parse_expr_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -469,7 +470,7 @@ pub fn expand_quote_expr<'cx>(cx: &'cx mut ExtCtxt,
 pub fn expand_quote_item<'cx>(cx: &'cx mut ExtCtxt,
                               sp: Span,
                               tts: &[TokenTree])
-                              -> Box<base::MacResult+'cx> {
+                              -> Box<dyn base::MacResult+'cx> {
     let expanded = expand_parse_call(cx, sp, "parse_item_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -477,7 +478,7 @@ pub fn expand_quote_item<'cx>(cx: &'cx mut ExtCtxt,
 pub fn expand_quote_pat<'cx>(cx: &'cx mut ExtCtxt,
                              sp: Span,
                              tts: &[TokenTree])
-                             -> Box<base::MacResult+'cx> {
+                             -> Box<dyn base::MacResult+'cx> {
     let expanded = expand_parse_call(cx, sp, "parse_pat_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -485,7 +486,7 @@ pub fn expand_quote_pat<'cx>(cx: &'cx mut ExtCtxt,
 pub fn expand_quote_arm(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
-                        -> Box<base::MacResult+'static> {
+                        -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_arm_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -493,7 +494,7 @@ pub fn expand_quote_arm(cx: &mut ExtCtxt,
 pub fn expand_quote_ty(cx: &mut ExtCtxt,
                        sp: Span,
                        tts: &[TokenTree])
-                       -> Box<base::MacResult+'static> {
+                       -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_ty_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -501,7 +502,7 @@ pub fn expand_quote_ty(cx: &mut ExtCtxt,
 pub fn expand_quote_stmt(cx: &mut ExtCtxt,
                          sp: Span,
                          tts: &[TokenTree])
-                         -> Box<base::MacResult+'static> {
+                         -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_stmt_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -509,7 +510,7 @@ pub fn expand_quote_stmt(cx: &mut ExtCtxt,
 pub fn expand_quote_attr(cx: &mut ExtCtxt,
                          sp: Span,
                          tts: &[TokenTree])
-                         -> Box<base::MacResult+'static> {
+                         -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_attribute_panic",
                                     vec![cx.expr_bool(sp, true)], tts);
 
@@ -519,7 +520,7 @@ pub fn expand_quote_attr(cx: &mut ExtCtxt,
 pub fn expand_quote_arg(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
-                        -> Box<base::MacResult+'static> {
+                        -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_arg_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -527,7 +528,7 @@ pub fn expand_quote_arg(cx: &mut ExtCtxt,
 pub fn expand_quote_block(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
-                        -> Box<base::MacResult+'static> {
+                        -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_block_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -535,7 +536,7 @@ pub fn expand_quote_block(cx: &mut ExtCtxt,
 pub fn expand_quote_meta_item(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
-                        -> Box<base::MacResult+'static> {
+                        -> Box<dyn base::MacResult+'static> {
     let expanded = expand_parse_call(cx, sp, "parse_meta_item_panic", vec![], tts);
     base::MacEager::expr(expanded)
 }
@@ -543,7 +544,7 @@ pub fn expand_quote_meta_item(cx: &mut ExtCtxt,
 pub fn expand_quote_path(cx: &mut ExtCtxt,
                         sp: Span,
                         tts: &[TokenTree])
-                        -> Box<base::MacResult+'static> {
+                        -> Box<dyn base::MacResult+'static> {
     let mode = mk_parser_path(cx, sp, &["PathStyle", "Type"]);
     let expanded = expand_parse_call(cx, sp, "parse_path_panic", vec![mode], tts);
     base::MacEager::expr(expanded)
@@ -711,6 +712,7 @@ fn expr_mk_token(cx: &ExtCtxt, sp: Span, tok: &token::Token) -> P<ast::Expr> {
         token::Pound        => "Pound",
         token::Dollar       => "Dollar",
         token::Question     => "Question",
+        token::SingleQuote  => "SingleQuote",
         token::Eof          => "Eof",
 
         token::Whitespace | token::Comment | token::Shebang(_) => {
@@ -800,7 +802,7 @@ fn mk_stmts_let(cx: &ExtCtxt, sp: Span) -> Vec<ast::Stmt> {
     // they happen to have a compiler on hand). Over all, the phase distinction
     // just makes quotes "hard to attribute". Possibly this could be fixed
     // by recreating some of the original qq machinery in the tt regime
-    // (pushing fake FileMaps onto the parser to account for original sites
+    // (pushing fake SourceFiles onto the parser to account for original sites
     // of quotes, for example) but at this point it seems not likely to be
     // worth the hassle.
 

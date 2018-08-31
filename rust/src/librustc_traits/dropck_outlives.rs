@@ -8,19 +8,27 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc::infer::canonical::{Canonical, QueryResult};
 use rustc::hir::def_id::DefId;
-use rustc::traits::{FulfillmentContext, Normalized, ObligationCause};
+use rustc::infer::canonical::{Canonical, QueryResult};
+use rustc::traits::query::dropck_outlives::{DropckOutlivesResult, DtorckConstraint};
 use rustc::traits::query::{CanonicalTyGoal, NoSolution};
-use rustc::traits::query::dropck_outlives::{DtorckConstraint, DropckOutlivesResult};
+use rustc::traits::{FulfillmentContext, Normalized, ObligationCause, TraitEngineExt};
+use rustc::ty::query::Providers;
+use rustc::ty::subst::{Subst, Substs};
 use rustc::ty::{self, ParamEnvAnd, Ty, TyCtxt};
-use rustc::ty::subst::Subst;
 use rustc::util::nodemap::FxHashSet;
 use rustc_data_structures::sync::Lrc;
-use syntax::codemap::{Span, DUMMY_SP};
-use util;
+use syntax::source_map::{Span, DUMMY_SP};
 
-crate fn dropck_outlives<'tcx>(
+crate fn provide(p: &mut Providers) {
+    *p = Providers {
+        dropck_outlives,
+        adt_dtorck_constraint,
+        ..*p
+    };
+}
+
+fn dropck_outlives<'tcx>(
     tcx: TyCtxt<'_, 'tcx, 'tcx>,
     goal: CanonicalTyGoal<'tcx>,
 ) -> Result<Lrc<Canonical<'tcx, QueryResult<'tcx, DropckOutlivesResult<'tcx>>>>, NoSolution> {
@@ -36,7 +44,10 @@ crate fn dropck_outlives<'tcx>(
             canonical_inference_vars,
         ) = infcx.instantiate_canonical_with_fresh_inference_vars(DUMMY_SP, &goal);
 
-        let mut result = DropckOutlivesResult { kinds: vec![], overflows: vec![] };
+        let mut result = DropckOutlivesResult {
+            kinds: vec![],
+            overflows: vec![],
+        };
 
         // A stack of types left to process. Each round, we pop
         // something from the stack and invoke
@@ -70,7 +81,7 @@ crate fn dropck_outlives<'tcx>(
         // into the types of its fields `(B, Vec<A>)`. These will get
         // pushed onto the stack. Eventually, expanding `Vec<A>` will
         // lead to us trying to push `A` a second time -- to prevent
-        // infinite recusion, we notice that `A` was already pushed
+        // infinite recursion, we notice that `A` was already pushed
         // once and stop.
         let mut ty_stack = vec![(for_ty, 0)];
 
@@ -108,11 +119,11 @@ crate fn dropck_outlives<'tcx>(
                         match ty.sty {
                             // All parameters live for the duration of the
                             // function.
-                            ty::TyParam(..) => {}
+                            ty::Param(..) => {}
 
                             // A projection that we couldn't resolve - it
                             // might have a destructor.
-                            ty::TyProjection(..) | ty::TyAnon(..) => {
+                            ty::Projection(..) | ty::Anon(..) => {
                                 result.kinds.push(ty.into());
                             }
 
@@ -135,7 +146,7 @@ crate fn dropck_outlives<'tcx>(
 
         debug!("dropck_outlives: result = {:#?}", result);
 
-        util::make_query_response(infcx, canonical_inference_vars, result, fulfill_cx)
+        infcx.make_canonicalized_query_result(canonical_inference_vars, result, fulfill_cx)
     })
 }
 
@@ -162,48 +173,76 @@ fn dtorck_constraint_for_ty<'a, 'gcx, 'tcx>(
     }
 
     let result = match ty.sty {
-        ty::TyBool
-        | ty::TyChar
-        | ty::TyInt(_)
-        | ty::TyUint(_)
-        | ty::TyFloat(_)
-        | ty::TyStr
-        | ty::TyNever
-        | ty::TyForeign(..)
-        | ty::TyRawPtr(..)
-        | ty::TyRef(..)
-        | ty::TyFnDef(..)
-        | ty::TyFnPtr(_)
-        | ty::TyGeneratorWitness(..) => {
+        ty::Bool
+        | ty::Char
+        | ty::Int(_)
+        | ty::Uint(_)
+        | ty::Float(_)
+        | ty::Str
+        | ty::Never
+        | ty::Foreign(..)
+        | ty::RawPtr(..)
+        | ty::Ref(..)
+        | ty::FnDef(..)
+        | ty::FnPtr(_)
+        | ty::GeneratorWitness(..) => {
             // these types never have a destructor
             Ok(DtorckConstraint::empty())
         }
 
-        ty::TyArray(ety, _) | ty::TySlice(ety) => {
+        ty::Array(ety, _) | ty::Slice(ety) => {
             // single-element containers, behave like their element
             dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ety)
         }
 
-        ty::TyTuple(tys) => tys.iter()
+        ty::Tuple(tys) => tys
+            .iter()
             .map(|ty| dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty))
             .collect(),
 
-        ty::TyClosure(def_id, substs) => substs
+        ty::Closure(def_id, substs) => substs
             .upvar_tys(def_id, tcx)
             .map(|ty| dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty))
             .collect(),
 
-        ty::TyGenerator(def_id, substs, _) => {
-            // Note that the interior types are ignored here.
-            // Any type reachable inside the interior must also be reachable
-            // through the upvars.
-            substs
-                .upvar_tys(def_id, tcx)
-                .map(|ty| dtorck_constraint_for_ty(tcx, span, for_ty, depth + 1, ty))
-                .collect()
+        ty::Generator(def_id, substs, _movability) => {
+            // rust-lang/rust#49918: types can be constructed, stored
+            // in the interior, and sit idle when generator yields
+            // (and is subsequently dropped).
+            //
+            // It would be nice to descend into interior of a
+            // generator to determine what effects dropping it might
+            // have (by looking at any drop effects associated with
+            // its interior).
+            //
+            // However, the interior's representation uses things like
+            // GeneratorWitness that explicitly assume they are not
+            // traversed in such a manner. So instead, we will
+            // simplify things for now by treating all generators as
+            // if they were like trait objects, where its upvars must
+            // all be alive for the generator's (potential)
+            // destructor.
+            //
+            // In particular, skipping over `_interior` is safe
+            // because any side-effects from dropping `_interior` can
+            // only take place through references with lifetimes
+            // derived from lifetimes attached to the upvars, and we
+            // *do* incorporate the upvars here.
+
+            let constraint = DtorckConstraint {
+                outlives: substs.upvar_tys(def_id, tcx).map(|t| t.into()).collect(),
+                dtorck_types: vec![],
+                overflows: vec![],
+            };
+            debug!(
+                "dtorck_constraint: generator {:?} => {:?}",
+                def_id, constraint
+            );
+
+            Ok(constraint)
         }
 
-        ty::TyAdt(def, substs) => {
+        ty::Adt(def, substs) => {
             let DtorckConstraint {
                 dtorck_types,
                 outlives,
@@ -220,20 +259,20 @@ fn dtorck_constraint_for_ty<'a, 'gcx, 'tcx>(
 
         // Objects must be alive in order for their destructor
         // to be called.
-        ty::TyDynamic(..) => Ok(DtorckConstraint {
+        ty::Dynamic(..) => Ok(DtorckConstraint {
             outlives: vec![ty.into()],
             dtorck_types: vec![],
             overflows: vec![],
         }),
 
         // Types that can't be resolved. Pass them forward.
-        ty::TyProjection(..) | ty::TyAnon(..) | ty::TyParam(..) => Ok(DtorckConstraint {
+        ty::Projection(..) | ty::Anon(..) | ty::Param(..) => Ok(DtorckConstraint {
             outlives: vec![],
             dtorck_types: vec![ty],
             overflows: vec![],
         }),
 
-        ty::TyInfer(..) | ty::TyError => {
+        ty::Infer(..) | ty::Error => {
             // By the time this code runs, all type variables ought to
             // be fully resolved.
             Err(NoSolution)
@@ -254,16 +293,21 @@ crate fn adt_dtorck_constraint<'a, 'tcx>(
     debug!("dtorck_constraint: {:?}", def);
 
     if def.is_phantom_data() {
+        // The first generic parameter here is guaranteed to be a type because it's
+        // `PhantomData`.
+        let substs = Substs::identity_for_item(tcx, def_id);
+        assert_eq!(substs.len(), 1);
         let result = DtorckConstraint {
             outlives: vec![],
-            dtorck_types: vec![tcx.mk_param_from_def(&tcx.generics_of(def_id).types[0])],
+            dtorck_types: vec![substs.type_at(0)],
             overflows: vec![],
         };
         debug!("dtorck_constraint: {:?} => {:?}", def, result);
         return Ok(result);
     }
 
-    let mut result = def.all_fields()
+    let mut result = def
+        .all_fields()
         .map(|field| tcx.type_of(field.did))
         .map(|fty| dtorck_constraint_for_ty(tcx, span, fty, 0, fty))
         .collect::<Result<DtorckConstraint, NoSolution>>()?;

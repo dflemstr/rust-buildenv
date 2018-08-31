@@ -97,7 +97,7 @@ h1, h2, h3:not(.impl):not(.method):not(.type):not(.tymethod):not(.important), h4
 h1.fqn {
 	border-bottom: 1px dashed;
 	margin-top: 0;
-	position: relative;
+	overflow: auto;
 }
 h2, h3:not(.impl):not(.method):not(.type):not(.tymethod), h4:not(.method):not(.type):not(.tymethod):not(.associatedconstant) {
 	border-bottom: 1px solid;
@@ -352,14 +352,11 @@ nav.sub {
 }
 
 .content .out-of-band {
+	float: right;
 	font-size: 23px;
 	margin: 0px;
 	padding: 0px;
-	text-align: right;
-	display: inline-block;
 	font-weight: normal;
-	position: absolute;
-	right: 0;
 }
 
 h3.impl > .out-of-band {
@@ -407,31 +404,27 @@ h4 > code, h3 > code, .invisible > code {
 
 .content table:not(.table-display) {
 	border-spacing: 0 5px;
-	border-collapse: separate;
 }
 .content td { vertical-align: top; }
 .content td:first-child { padding-right: 20px; }
 .content td p:first-child { margin-top: 0; }
 .content td h1, .content td h2 { margin-left: 0; font-size: 1.1em; }
+.content tr:first-child td { border-top: 0; }
 
 .docblock table {
-	border: 1px solid;
 	margin: .5em 0;
-	border-collapse: collapse;
 	width: 100%;
 }
 
 .docblock table td {
 	padding: .5em;
-	border-top: 1px dashed;
-	border-bottom: 1px dashed;
+	border: 1px dashed;
 }
 
 .docblock table th {
 	padding: .5em;
 	text-align: left;
-	border-top: 1px solid;
-	border-bottom: 1px solid;
+	border: 1px solid;
 }
 
 .fields + table {
@@ -474,15 +467,55 @@ h4 > code, h3 > code, .invisible > code {
 	margin-bottom: 15px;
 }
 
+.content .impl-items .method, .content .impl-items > .type, .impl-items > .associatedconstant {
+	margin-left: 20px;
+}
 .content .impl-items .docblock, .content .impl-items .stability {
 	margin-bottom: .6em;
 }
-.content .impl-items .method, .content .impl-items > .type, .impl-items > .associatedconstant {
+.content .docblock > .impl-items {
 	margin-left: 20px;
+	margin-top: -34px;
+}
+.content .docblock > .impl-items > h4 {
+	border-bottom: 0;
+}
+.content .docblock >.impl-items .table-display {
+	margin: 0;
+}
+.content .docblock >.impl-items table td {
+	padding: 0;
+}
+.toggle-wrapper.marg-left > .collapse-toggle {
+	left: -24px;
+}
+.content .docblock > .impl-items .table-display, .impl-items table td {
+	border: none;
 }
 
 .content .stability code {
 	font-size: 90%;
+}
+
+.content .stability {
+	position: relative;
+	margin-left: 33px;
+	margin-top: -13px;
+}
+
+.content .stability::before {
+	content: '˪';
+	font-size: 30px;
+	position: absolute;
+	top: -9px;
+	left: -13px;
+}
+.methods > .stability {
+	margin-top: -8px;
+}
+
+#main > .stability {
+	margin-top: 0;
 }
 
 nav {
@@ -533,23 +566,30 @@ a {
 	left: -5px;
 }
 .small-section-header > .anchor {
-	left: -20px;
-}
-.small-section-header > .anchor:not(.field) {
 	left: -28px;
+	padding-right: 10px; /* avoid gap that causes hover to disappear */
 }
 .anchor:before {
 	content: '\2002\00a7\2002';
 }
 
-.docblock a:hover, .docblock-short a:hover, .stability a {
+.docblock a:not(.srclink):not(.test-arrow):hover,
+.docblock-short a:not(.srclink):not(.test-arrow):hover, .stability a {
 	text-decoration: underline;
 }
 
 .block a.current.crate { font-weight: 500; }
 
+.search-container {
+	position: relative;
+}
+.search-container > .top-button {
+	position: absolute;
+	right: 0;
+	top: 10px;
+}
 .search-input {
-	width: 100%;
+	width: calc(100% - 34px);
 	/* Override Normalize.css: we have margins and do
 	 not want to overflow - the `moz` attribute is necessary
 	 until Firefox 29, too early to drop at this point */
@@ -586,10 +626,15 @@ a {
 
 .content .search-results td:first-child {
 	padding-right: 0;
-	width: 75%;
+	width: 50%;
 }
 .content .search-results td:first-child a {
 	padding-right: 10px;
+}
+.content .search-results td:first-child a:after {
+    clear: both;
+    content: "";
+    display: block;
 }
 .content .search-results td:first-child a span {
 	float: left;
@@ -597,6 +642,11 @@ a {
 
 tr.result span.primitive::after {
 	content: ' (primitive type)';
+	font-style: italic;
+}
+
+tr.result span.keyword::after {
+	content: ' (keyword)';
 	font-style: italic;
 }
 
@@ -714,6 +764,7 @@ a.test-arrow:hover{
 .section-header:hover a:before {
 	position: absolute;
 	left: -25px;
+	padding-right: 10px; /* avoid gap that causes hover to disappear */
 	content: '\2002\00a7\2002';
 }
 
@@ -744,7 +795,7 @@ h3 > .collapse-toggle, h4 > .collapse-toggle {
 
 .toggle-wrapper {
 	position: relative;
-	margin-top: 5px;
+	margin-top: 0;
 }
 
 .toggle-wrapper.collapsed {
@@ -827,10 +878,19 @@ span.since {
 
 .attributes {
 	display: block;
-	margin: 0px 0px 0px 30px !important;
+	margin-top: 0px !important;
+	margin-right: 0px;
+	margin-bottom: 0px !important;
+	margin-left: 30px;
 }
 .toggle-attributes.collapsed {
-	margin-bottom: 5px;
+	margin-bottom: 0;
+}
+.impl-items > .toggle-attributes {
+	margin-left: 20px;
+}
+.impl-items .attributes {
+	font-weight: 500;
 }
 
 :target > code {
@@ -1002,6 +1062,8 @@ span.since {
 
 pre.rust {
 	position: relative;
+	tab-width: 4;
+	-moz-tab-width: 4;
 }
 
 .search-failed {
@@ -1224,7 +1286,14 @@ kbd {
 	outline: none;
 }
 
-#theme-picker {
+#settings-menu {
+	position: absolute;
+	right: 0;
+	top: 10px;
+	outline: none;
+}
+
+#theme-picker, #settings-menu {
 	padding: 4px;
 	width: 27px;
 	height: 29px;
@@ -1311,4 +1380,8 @@ kbd {
 }
 #all-types > p {
 	margin: 5px 0;
+}
+
+.non-exhaustive {
+	margin-bottom: 1em;
 }

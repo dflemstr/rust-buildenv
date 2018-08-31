@@ -25,7 +25,7 @@ use ty;
 use mir;
 
 impl<'a, 'gcx, T> HashStable<StableHashingContext<'a>>
-for &'gcx ty::Slice<T>
+for &'gcx ty::List<T>
     where T: HashStable<StableHashingContext<'a>> {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
@@ -53,7 +53,7 @@ for &'gcx ty::Slice<T>
     }
 }
 
-impl<'a, 'gcx, T> ToStableHashKey<StableHashingContext<'a>> for &'gcx ty::Slice<T>
+impl<'a, 'gcx, T> ToStableHashKey<StableHashingContext<'a>> for &'gcx ty::List<T>
     where T: HashStable<StableHashingContext<'a>>
 {
     type KeyType = Fingerprint;
@@ -104,16 +104,16 @@ for ty::RegionKind {
                 c.hash_stable(hcx, hasher);
             }
             ty::ReLateBound(db, ty::BrAnon(i)) => {
-                db.depth.hash_stable(hcx, hasher);
+                db.hash_stable(hcx, hasher);
                 i.hash_stable(hcx, hasher);
             }
             ty::ReLateBound(db, ty::BrNamed(def_id, name)) => {
-                db.depth.hash_stable(hcx, hasher);
+                db.hash_stable(hcx, hasher);
                 def_id.hash_stable(hcx, hasher);
                 name.hash_stable(hcx, hasher);
             }
             ty::ReLateBound(db, ty::BrEnv) => {
-                db.depth.hash_stable(hcx, hasher);
+                db.hash_stable(hcx, hasher);
             }
             ty::ReEarlyBound(ty::EarlyBoundRegion { def_id, index, name }) => {
                 def_id.hash_stable(hcx, hasher);
@@ -132,7 +132,7 @@ for ty::RegionKind {
             ty::ReLateBound(..) |
             ty::ReVar(..) |
             ty::ReSkolemized(..) => {
-                bug!("TypeIdHasher: unexpected region {:?}", *self)
+                bug!("StableHasher: unexpected region {:?}", *self)
             }
         }
     }
@@ -262,8 +262,7 @@ impl<'a, 'gcx, T> HashStable<StableHashingContext<'a>> for ty::Binder<T>
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        let ty::Binder(ref inner) = *self;
-        inner.hash_stable(hcx, hasher);
+        self.skip_binder().hash_stable(hcx, hasher);
     }
 }
 
@@ -360,16 +359,16 @@ impl_stable_hash_for!(enum ty::VariantDiscr {
 
 impl_stable_hash_for!(struct ty::FieldDef {
     did,
-    name,
-    vis
+    ident -> (ident.name),
+    vis,
 });
 
 impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
-for ::middle::const_val::ConstVal<'gcx> {
+for ::mir::interpret::ConstValue<'gcx> {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        use middle::const_val::ConstVal::*;
+        use mir::interpret::ConstValue::*;
 
         mem::discriminant(self).hash_stable(hcx, hasher);
 
@@ -378,33 +377,30 @@ for ::middle::const_val::ConstVal<'gcx> {
                 def_id.hash_stable(hcx, hasher);
                 substs.hash_stable(hcx, hasher);
             }
-            Value(ref value) => {
-                value.hash_stable(hcx, hasher);
+            Scalar(val) => {
+                val.hash_stable(hcx, hasher);
+            }
+            ScalarPair(a, b) => {
+                a.hash_stable(hcx, hasher);
+                b.hash_stable(hcx, hasher);
+            }
+            ByRef(id, alloc, offset) => {
+                id.hash_stable(hcx, hasher);
+                alloc.hash_stable(hcx, hasher);
+                offset.hash_stable(hcx, hasher);
             }
         }
     }
 }
 
-impl_stable_hash_for!(enum mir::interpret::Value {
-    ByVal(v),
-    ByValPair(a, b),
-    ByRef(ptr, align)
+impl_stable_hash_for!(enum mir::interpret::ScalarMaybeUndef {
+    Scalar(v),
+    Undef
 });
 
-impl_stable_hash_for!(struct mir::interpret::MemoryPointer {
+impl_stable_hash_for!(struct mir::interpret::Pointer {
     alloc_id,
     offset
-});
-
-enum AllocDiscriminant {
-    Alloc,
-    Static,
-    Function,
-}
-impl_stable_hash_for!(enum self::AllocDiscriminant {
-    Alloc,
-    Static,
-    Function
 });
 
 impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::AllocId {
@@ -416,27 +412,26 @@ impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::AllocId {
         ty::tls::with_opt(|tcx| {
             trace!("hashing {:?}", *self);
             let tcx = tcx.expect("can't hash AllocIds during hir lowering");
-            if let Some(def_id) = tcx.interpret_interner.get_static(*self) {
-                AllocDiscriminant::Static.hash_stable(hcx, hasher);
-                trace!("hashing {:?} as static {:?}", *self, def_id);
-                def_id.hash_stable(hcx, hasher);
-            } else if let Some(alloc) = tcx.interpret_interner.get_alloc(*self) {
-                AllocDiscriminant::Alloc.hash_stable(hcx, hasher);
-                if hcx.alloc_id_recursion_tracker.insert(*self) {
-                    trace!("hashing {:?} as alloc {:#?}", *self, alloc);
-                    alloc.hash_stable(hcx, hasher);
-                    assert!(hcx.alloc_id_recursion_tracker.remove(self));
-                } else {
-                    trace!("skipping hashing of {:?} due to recursion", *self);
-                }
-            } else if let Some(inst) = tcx.interpret_interner.get_fn(*self) {
-                trace!("hashing {:?} as fn {:#?}", *self, inst);
-                AllocDiscriminant::Function.hash_stable(hcx, hasher);
-                inst.hash_stable(hcx, hasher);
-            } else {
-                bug!("no allocation for {}", self);
-            }
+            let alloc_kind = tcx.alloc_map.lock().get(*self).expect("no value for AllocId");
+            alloc_kind.hash_stable(hcx, hasher);
         });
+    }
+}
+
+impl<'a, 'gcx, M: HashStable<StableHashingContext<'a>>> HashStable<StableHashingContext<'a>>
+for mir::interpret::AllocType<'gcx, M> {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        use mir::interpret::AllocType::*;
+
+        mem::discriminant(self).hash_stable(hcx, hasher);
+
+        match *self {
+            Function(instance) => instance.hash_stable(hcx, hasher),
+            Static(def_id) => def_id.hash_stable(hcx, hasher),
+            Memory(ref mem) => mem.hash_stable(hcx, hasher),
+        }
     }
 }
 
@@ -452,7 +447,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::Allocation {
         }
         self.undef_mask.hash_stable(hcx, hasher);
         self.align.hash_stable(hcx, hasher);
-        self.runtime_mutability.hash_stable(hcx, hasher);
+        self.mutability.hash_stable(hcx, hasher);
     }
 }
 
@@ -461,93 +456,72 @@ impl_stable_hash_for!(enum ::syntax::ast::Mutability {
     Mutable
 });
 
-impl_stable_hash_for!(struct mir::interpret::Pointer{primval});
 
-impl_stable_hash_for!(enum mir::interpret::PrimVal {
-    Bytes(b),
-    Ptr(p),
-    Undef
-});
+impl<'a> HashStable<StableHashingContext<'a>>
+for ::mir::interpret::Scalar {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        use mir::interpret::Scalar::*;
+
+        mem::discriminant(self).hash_stable(hcx, hasher);
+        match *self {
+            Bits { bits, size } => {
+                bits.hash_stable(hcx, hasher);
+                size.hash_stable(hcx, hasher);
+            },
+            Ptr(ptr) => ptr.hash_stable(hcx, hasher),
+        }
+    }
+}
 
 impl_stable_hash_for!(struct ty::Const<'tcx> {
     ty,
     val
 });
 
-impl_stable_hash_for!(struct ::middle::const_val::ConstEvalErr<'tcx> {
+impl_stable_hash_for!(struct ::mir::interpret::ConstEvalErr<'tcx> {
     span,
-    kind
+    stacktrace,
+    error
 });
 
-impl_stable_hash_for!(struct ::middle::const_val::FrameInfo {
+impl_stable_hash_for!(struct ::mir::interpret::FrameInfo {
     span,
+    lint_root,
     location
 });
 
-impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
-for ::middle::const_val::ErrKind<'gcx> {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        use middle::const_val::ErrKind::*;
-
-        mem::discriminant(self).hash_stable(hcx, hasher);
-
-        match *self {
-            NonConstPath |
-            TypeckError |
-            CheckMatchError => {
-                // nothing to do
-            }
-            UnimplementedConstVal(s) => {
-                s.hash_stable(hcx, hasher);
-            }
-            IndexOutOfBounds { len, index } => {
-                len.hash_stable(hcx, hasher);
-                index.hash_stable(hcx, hasher);
-            }
-            Math(ref const_math_err) => {
-                const_math_err.hash_stable(hcx, hasher);
-            }
-            LayoutError(ref layout_error) => {
-                layout_error.hash_stable(hcx, hasher);
-            }
-            Miri(ref err, ref trace) => {
-                err.hash_stable(hcx, hasher);
-                trace.hash_stable(hcx, hasher);
-            },
-        }
-    }
-}
-
 impl_stable_hash_for!(struct ty::ClosureSubsts<'tcx> { substs });
-
-impl_stable_hash_for!(struct ty::GeneratorInterior<'tcx> { witness, movable });
+impl_stable_hash_for!(struct ty::GeneratorSubsts<'tcx> { substs });
 
 impl_stable_hash_for!(struct ty::GenericPredicates<'tcx> {
     parent,
     predicates
 });
 
-impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
-for ::mir::interpret::EvalError<'gcx> {
+impl_stable_hash_for!(struct ::mir::interpret::EvalError<'tcx> { kind });
+
+impl<'a, 'gcx, O: HashStable<StableHashingContext<'a>>> HashStable<StableHashingContext<'a>>
+for ::mir::interpret::EvalErrorKind<'gcx, O> {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         use mir::interpret::EvalErrorKind::*;
 
-        mem::discriminant(&self.kind).hash_stable(hcx, hasher);
+        mem::discriminant(&self).hash_stable(hcx, hasher);
 
-        match self.kind {
+        match *self {
+            FunctionArgCountMismatch |
             DanglingPointerDeref |
             DoubleFree |
             InvalidMemoryAccess |
             InvalidFunctionPointer |
             InvalidBool |
-            InvalidDiscriminant |
             InvalidNullPointerUsage |
             ReadPointerAsBytes |
             ReadBytesAsPointer |
+            ReadForeignStatic |
             InvalidPointerMath |
             ReadUndefBytes |
             DeadLocal |
@@ -563,16 +537,33 @@ for ::mir::interpret::EvalError<'gcx> {
             DeallocateNonBasePtr |
             HeapAllocZeroBytes |
             Unreachable |
-            Panic |
             ReadFromReturnPointer |
             UnimplementedTraitSelection |
             TypeckError |
+            TooGeneric |
+            CheckMatchError |
             DerefFunctionPointer |
             ExecuteMemory |
-            ReferencedConstant |
-            OverflowingMath => {}
+            OverflowNeg |
+            RemainderByZero |
+            DivisionByZero |
+            GeneratorResumedAfterReturn |
+            GeneratorResumedAfterPanic |
+            InfiniteLoop => {}
+            InvalidDiscriminant(val) => val.hash_stable(hcx, hasher),
+            Panic { ref msg, ref file, line, col } => {
+                msg.hash_stable(hcx, hasher);
+                file.hash_stable(hcx, hasher);
+                line.hash_stable(hcx, hasher);
+                col.hash_stable(hcx, hasher);
+            },
+            ReferencedConstant(ref err) => err.hash_stable(hcx, hasher),
             MachineError(ref err) => err.hash_stable(hcx, hasher),
-            FunctionPointerTyMismatch(a, b) => {
+            FunctionAbiMismatch(a, b) => {
+                a.hash_stable(hcx, hasher);
+                b.hash_stable(hcx, hasher)
+            },
+            FunctionArgMismatch(a, b) => {
                 a.hash_stable(hcx, hasher);
                 b.hash_stable(hcx, hasher)
             },
@@ -589,14 +580,9 @@ for ::mir::interpret::EvalError<'gcx> {
             },
             InvalidBoolOp(bop) => bop.hash_stable(hcx, hasher),
             Unimplemented(ref s) => s.hash_stable(hcx, hasher),
-            ArrayIndexOutOfBounds(sp, a, b) => {
-                sp.hash_stable(hcx, hasher);
-                a.hash_stable(hcx, hasher);
-                b.hash_stable(hcx, hasher)
-            },
-            Math(sp, ref err) => {
-                sp.hash_stable(hcx, hasher);
-                err.hash_stable(hcx, hasher)
+            BoundsCheck { ref len, ref index } => {
+                len.hash_stable(hcx, hasher);
+                index.hash_stable(hcx, hasher)
             },
             Intrinsic(ref s) => s.hash_stable(hcx, hasher),
             InvalidChar(c) => c.hash_stable(hcx, hasher),
@@ -669,6 +655,7 @@ for ::mir::interpret::EvalError<'gcx> {
             Layout(lay) => lay.hash_stable(hcx, hasher),
             HeapAllocNonPowerOfTwoAlignment(n) => n.hash_stable(hcx, hasher),
             PathNotFound(ref v) => v.hash_stable(hcx, hasher),
+            Overflow(op) => op.hash_stable(hcx, hasher),
         }
     }
 }
@@ -700,62 +687,43 @@ impl_stable_hash_for!(enum ty::adjustment::CustomCoerceUnsized {
     Struct(index)
 });
 
-impl<'a> HashStable<StableHashingContext<'a>> for ty::Generics {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::Generics {
-            parent,
-            parent_regions,
-            parent_types,
-            ref regions,
-            ref types,
+impl_stable_hash_for!(struct ty::Generics {
+    parent,
+    parent_count,
+    params,
+    // Reverse map to each param's `index` field, from its `def_id`.
+    param_def_id_to_index -> _, // Don't hash this
+    has_self,
+    has_late_bound_regions,
+});
 
-            // Reverse map to each `TypeParameterDef`'s `index` field, from
-            // `def_id.index` (`def_id.krate` is the same as the item's).
-            type_param_to_index: _, // Don't hash this
-            has_self,
-            has_late_bound_regions,
-        } = *self;
-
-        parent.hash_stable(hcx, hasher);
-        parent_regions.hash_stable(hcx, hasher);
-        parent_types.hash_stable(hcx, hasher);
-        regions.hash_stable(hcx, hasher);
-        types.hash_stable(hcx, hasher);
-        has_self.hash_stable(hcx, hasher);
-        has_late_bound_regions.hash_stable(hcx, hasher);
-    }
-}
-
-impl<'a> HashStable<StableHashingContext<'a>>
-for ty::RegionParameterDef {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::RegionParameterDef {
-            name,
-            def_id,
-            index,
-            pure_wrt_drop
-        } = *self;
-
-        name.hash_stable(hcx, hasher);
-        def_id.hash_stable(hcx, hasher);
-        index.hash_stable(hcx, hasher);
-        pure_wrt_drop.hash_stable(hcx, hasher);
-    }
-}
-
-impl_stable_hash_for!(struct ty::TypeParameterDef {
+impl_stable_hash_for!(struct ty::GenericParamDef {
     name,
     def_id,
     index,
-    has_default,
-    object_lifetime_default,
     pure_wrt_drop,
-    synthetic
+    kind
 });
+
+impl<'a> HashStable<StableHashingContext<'a>> for ty::GenericParamDefKind {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        mem::discriminant(self).hash_stable(hcx, hasher);
+        match *self {
+            ty::GenericParamDefKind::Lifetime => {}
+            ty::GenericParamDefKind::Type {
+                has_default,
+                ref object_lifetime_default,
+                ref synthetic,
+            } => {
+                has_default.hash_stable(hcx, hasher);
+                object_lifetime_default.hash_stable(hcx, hasher);
+                synthetic.hash_stable(hcx, hasher);
+            }
+        }
+    }
+}
 
 impl<'a, 'gcx, T> HashStable<StableHashingContext<'a>>
 for ::middle::resolve_lifetime::Set1<T>
@@ -790,10 +758,6 @@ impl_stable_hash_for!(enum ::middle::resolve_lifetime::Region {
     LateBound(db_index, decl, is_in_band),
     LateBoundAnon(db_index, anon_index),
     Free(call_site_scope_data, decl)
-});
-
-impl_stable_hash_for!(struct ty::DebruijnIndex {
-    depth
 });
 
 impl_stable_hash_for!(enum ty::cast::CastKind {
@@ -844,89 +808,90 @@ impl_stable_hash_for!(enum ty::BoundRegion {
 });
 
 impl<'a, 'gcx> HashStable<StableHashingContext<'a>>
-for ty::TypeVariants<'gcx>
+for ty::TyKind<'gcx>
 {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        use ty::TypeVariants::*;
+        use ty::TyKind::*;
 
         mem::discriminant(self).hash_stable(hcx, hasher);
         match *self {
-            TyBool  |
-            TyChar  |
-            TyStr   |
-            TyError |
-            TyNever => {
+            Bool  |
+            Char  |
+            Str   |
+            Error |
+            Never => {
                 // Nothing more to hash.
             }
-            TyInt(int_ty) => {
+            Int(int_ty) => {
                 int_ty.hash_stable(hcx, hasher);
             }
-            TyUint(uint_ty) => {
+            Uint(uint_ty) => {
                 uint_ty.hash_stable(hcx, hasher);
             }
-            TyFloat(float_ty)  => {
+            Float(float_ty)  => {
                 float_ty.hash_stable(hcx, hasher);
             }
-            TyAdt(adt_def, substs) => {
+            Adt(adt_def, substs) => {
                 adt_def.hash_stable(hcx, hasher);
                 substs.hash_stable(hcx, hasher);
             }
-            TyArray(inner_ty, len) => {
+            Array(inner_ty, len) => {
                 inner_ty.hash_stable(hcx, hasher);
                 len.hash_stable(hcx, hasher);
             }
-            TySlice(inner_ty) => {
+            Slice(inner_ty) => {
                 inner_ty.hash_stable(hcx, hasher);
             }
-            TyRawPtr(pointee_ty) => {
+            RawPtr(pointee_ty) => {
                 pointee_ty.hash_stable(hcx, hasher);
             }
-            TyRef(region, pointee_ty) => {
+            Ref(region, pointee_ty, mutbl) => {
                 region.hash_stable(hcx, hasher);
                 pointee_ty.hash_stable(hcx, hasher);
+                mutbl.hash_stable(hcx, hasher);
             }
-            TyFnDef(def_id, substs) => {
+            FnDef(def_id, substs) => {
                 def_id.hash_stable(hcx, hasher);
                 substs.hash_stable(hcx, hasher);
             }
-            TyFnPtr(ref sig) => {
+            FnPtr(ref sig) => {
                 sig.hash_stable(hcx, hasher);
             }
-            TyDynamic(ref existential_predicates, region) => {
+            Dynamic(ref existential_predicates, region) => {
                 existential_predicates.hash_stable(hcx, hasher);
                 region.hash_stable(hcx, hasher);
             }
-            TyClosure(def_id, closure_substs) => {
+            Closure(def_id, closure_substs) => {
                 def_id.hash_stable(hcx, hasher);
                 closure_substs.hash_stable(hcx, hasher);
             }
-            TyGenerator(def_id, closure_substs, interior) => {
+            Generator(def_id, generator_substs, movability) => {
                 def_id.hash_stable(hcx, hasher);
-                closure_substs.hash_stable(hcx, hasher);
-                interior.hash_stable(hcx, hasher);
+                generator_substs.hash_stable(hcx, hasher);
+                movability.hash_stable(hcx, hasher);
             }
-            TyGeneratorWitness(types) => {
+            GeneratorWitness(types) => {
                 types.hash_stable(hcx, hasher)
             }
-            TyTuple(inner_tys) => {
+            Tuple(inner_tys) => {
                 inner_tys.hash_stable(hcx, hasher);
             }
-            TyProjection(ref projection_ty) => {
+            Projection(ref projection_ty) => {
                 projection_ty.hash_stable(hcx, hasher);
             }
-            TyAnon(def_id, substs) => {
+            Anon(def_id, substs) => {
                 def_id.hash_stable(hcx, hasher);
                 substs.hash_stable(hcx, hasher);
             }
-            TyParam(param_ty) => {
+            Param(param_ty) => {
                 param_ty.hash_stable(hcx, hasher);
             }
-            TyForeign(def_id) => {
+            Foreign(def_id) => {
                 def_id.hash_stable(hcx, hasher);
             }
-            TyInfer(infer_ty) => {
+            Infer(infer_ty) => {
                 infer_ty.hash_stable(hcx, hasher);
             }
         }
@@ -951,7 +916,7 @@ for ty::TyVid
                                           _hasher: &mut StableHasher<W>) {
         // TyVid values are confined to an inference context and hence
         // should not be hashed.
-        bug!("ty::TypeVariants::hash_stable() - can't hash a TyVid {:?}.", *self)
+        bug!("ty::TyKind::hash_stable() - can't hash a TyVid {:?}.", *self)
     }
 }
 
@@ -963,7 +928,7 @@ for ty::IntVid
                                           _hasher: &mut StableHasher<W>) {
         // IntVid values are confined to an inference context and hence
         // should not be hashed.
-        bug!("ty::TypeVariants::hash_stable() - can't hash an IntVid {:?}.", *self)
+        bug!("ty::TyKind::hash_stable() - can't hash an IntVid {:?}.", *self)
     }
 }
 
@@ -975,7 +940,7 @@ for ty::FloatVid
                                           _hasher: &mut StableHasher<W>) {
         // FloatVid values are confined to an inference context and hence
         // should not be hashed.
-        bug!("ty::TypeVariants::hash_stable() - can't hash a FloatVid {:?}.", *self)
+        bug!("ty::TyKind::hash_stable() - can't hash a FloatVid {:?}.", *self)
     }
 }
 
@@ -1062,61 +1027,34 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for ty::InstanceDef<'gcx> {
     }
 }
 
-impl<'a> HashStable<StableHashingContext<'a>> for ty::TraitDef {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::TraitDef {
-            // We already have the def_path_hash below, no need to hash it twice
-            def_id: _,
-            unsafety,
-            paren_sugar,
-            has_auto_impl,
-            def_path_hash,
-        } = *self;
-
-        unsafety.hash_stable(hcx, hasher);
-        paren_sugar.hash_stable(hcx, hasher);
-        has_auto_impl.hash_stable(hcx, hasher);
-        def_path_hash.hash_stable(hcx, hasher);
-    }
-}
+impl_stable_hash_for!(struct ty::TraitDef {
+    // We already have the def_path_hash below, no need to hash it twice
+    def_id -> _,
+    unsafety,
+    paren_sugar,
+    has_auto_impl,
+    def_path_hash,
+});
 
 impl_stable_hash_for!(struct ty::Destructor {
     did
 });
 
-impl<'a> HashStable<StableHashingContext<'a>> for ty::CrateVariancesMap {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::CrateVariancesMap {
-            ref variances,
-            // This is just an irrelevant helper value.
-            empty_variance: _,
-        } = *self;
+impl_stable_hash_for!(struct ty::CrateVariancesMap {
+    variances,
+    // This is just an irrelevant helper value.
+    empty_variance -> _,
+});
 
-        variances.hash_stable(hcx, hasher);
-    }
-}
-
-impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for ty::CratePredicatesMap<'gcx> {
-    fn hash_stable<W: StableHasherResult>(&self,
-                                          hcx: &mut StableHashingContext<'a>,
-                                          hasher: &mut StableHasher<W>) {
-        let ty::CratePredicatesMap {
-            ref predicates,
-            // This is just an irrelevant helper value.
-            empty_predicate: _,
-        } = *self;
-
-        predicates.hash_stable(hcx, hasher);
-    }
-}
+impl_stable_hash_for!(struct ty::CratePredicatesMap<'tcx> {
+    predicates,
+    // This is just an irrelevant helper value.
+    empty_predicate -> _,
+});
 
 impl_stable_hash_for!(struct ty::AssociatedItem {
     def_id,
-    name,
+    ident -> (ident.name),
     kind,
     vis,
     defaultness,
@@ -1127,6 +1065,7 @@ impl_stable_hash_for!(struct ty::AssociatedItem {
 impl_stable_hash_for!(enum ty::AssociatedKind {
     Const,
     Method,
+    Existential,
     Type
 });
 
@@ -1158,6 +1097,7 @@ impl_stable_hash_for!(enum traits::Reveal {
 });
 
 impl_stable_hash_for!(enum ::middle::privacy::AccessLevel {
+    ReachableFromImplTrait,
     Reachable,
     Exported,
     Public
@@ -1309,11 +1249,11 @@ for traits::VtableGeneratorData<'gcx, N> where N: HashStable<StableHashingContex
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
         let traits::VtableGeneratorData {
-            closure_def_id,
+            generator_def_id,
             substs,
             ref nested,
         } = *self;
-        closure_def_id.hash_stable(hcx, hasher);
+        generator_def_id.hash_stable(hcx, hasher);
         substs.hash_stable(hcx, hasher);
         nested.hash_stable(hcx, hasher);
     }
@@ -1352,24 +1292,50 @@ impl_stable_hash_for!(
     }
 );
 
-impl_stable_hash_for!(struct infer::canonical::QueryRegionConstraints<'tcx> {
-    region_outlives, ty_outlives
-});
-
 impl_stable_hash_for!(enum infer::canonical::Certainty {
     Proven, Ambiguous
 });
 
-impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::WhereClauseAtom<'tcx> {
+impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::WhereClause<'tcx> {
     fn hash_stable<W: StableHasherResult>(&self,
                                           hcx: &mut StableHashingContext<'a>,
                                           hasher: &mut StableHasher<W>) {
-        use traits::WhereClauseAtom::*;
+        use traits::WhereClause::*;
 
         mem::discriminant(self).hash_stable(hcx, hasher);
         match self {
             Implemented(trait_ref) => trait_ref.hash_stable(hcx, hasher),
             ProjectionEq(projection) => projection.hash_stable(hcx, hasher),
+            TypeOutlives(ty_outlives) => ty_outlives.hash_stable(hcx, hasher),
+            RegionOutlives(region_outlives) => region_outlives.hash_stable(hcx, hasher),
+        }
+    }
+}
+
+impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::WellFormed<'tcx> {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        use traits::WellFormed::*;
+
+        mem::discriminant(self).hash_stable(hcx, hasher);
+        match self {
+            Trait(trait_ref) => trait_ref.hash_stable(hcx, hasher),
+            Ty(ty) => ty.hash_stable(hcx, hasher),
+        }
+    }
+}
+
+impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::FromEnv<'tcx> {
+    fn hash_stable<W: StableHasherResult>(&self,
+                                          hcx: &mut StableHashingContext<'a>,
+                                          hasher: &mut StableHasher<W>) {
+        use traits::FromEnv::*;
+
+        mem::discriminant(self).hash_stable(hcx, hasher);
+        match self {
+            Trait(trait_ref) => trait_ref.hash_stable(hcx, hasher),
+            Ty(ty) => ty.hash_stable(hcx, hasher),
         }
     }
 }
@@ -1382,15 +1348,10 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::DomainGoal<'tcx>
 
         mem::discriminant(self).hash_stable(hcx, hasher);
         match self {
-            Holds(where_clause) |
-            WellFormed(where_clause) |
-            FromEnv(where_clause) => where_clause.hash_stable(hcx, hasher),
-
-            WellFormedTy(ty) => ty.hash_stable(hcx, hasher),
+            Holds(wc) => wc.hash_stable(hcx, hasher),
+            WellFormed(wf) => wf.hash_stable(hcx, hasher),
+            FromEnv(from_env) => from_env.hash_stable(hcx, hasher),
             Normalize(projection) => projection.hash_stable(hcx, hasher),
-            FromEnvTy(ty) => ty.hash_stable(hcx, hasher),
-            RegionOutlives(predicate) => predicate.hash_stable(hcx, hasher),
-            TypeOutlives(predicate) => predicate.hash_stable(hcx, hasher),
         }
     }
 }
@@ -1417,6 +1378,7 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for traits::Goal<'tcx> {
                 quantifier.hash_stable(hcx, hasher);
                 goal.hash_stable(hcx, hasher);
             },
+            CannotProve => { },
         }
     }
 }

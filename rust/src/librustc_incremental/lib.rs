@@ -14,14 +14,18 @@
       html_favicon_url = "https://doc.rust-lang.org/favicon.ico",
       html_root_url = "https://doc.rust-lang.org/nightly/")]
 
-#![feature(fs_read_write)]
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(specialization)]
+
+#![recursion_limit="256"]
 
 extern crate graphviz;
 #[macro_use] extern crate rustc;
 extern crate rustc_data_structures;
 extern crate serialize as rustc_serialize;
 extern crate rand;
+extern crate rustc_fs_util;
 
 #[macro_use] extern crate log;
 extern crate syntax;
@@ -36,9 +40,9 @@ pub use persist::dep_graph_tcx_init;
 pub use persist::load_dep_graph;
 pub use persist::load_query_result_cache;
 pub use persist::LoadResult;
+pub use persist::copy_cgu_workproducts_to_incr_comp_cache_dir;
 pub use persist::save_dep_graph;
-pub use persist::save_trans_partition;
-pub use persist::save_work_products;
+pub use persist::save_work_product_index;
 pub use persist::in_incr_comp_dir;
 pub use persist::prepare_session_directory;
 pub use persist::finalize_session_directory;

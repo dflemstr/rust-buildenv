@@ -75,8 +75,15 @@ impl FileDesc {
         unsafe fn cvt_pread64(fd: c_int, buf: *mut c_void, count: usize, offset: i64)
             -> io::Result<isize>
         {
+            use convert::TryInto;
             use libc::pread64;
-            cvt(pread64(fd, buf, count, offset as i32))
+            // pread64 on emscripten actually takes a 32 bit offset
+            if let Ok(o) = offset.try_into() {
+                cvt(pread64(fd, buf, count, o))
+            } else {
+                Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                   "cannot pread >2GB"))
+            }
         }
 
         #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
@@ -116,8 +123,15 @@ impl FileDesc {
         unsafe fn cvt_pwrite64(fd: c_int, buf: *const c_void, count: usize, offset: i64)
             -> io::Result<isize>
         {
+            use convert::TryInto;
             use libc::pwrite64;
-            cvt(pwrite64(fd, buf, count, offset as i32))
+            // pwrite64 on emscripten actually takes a 32 bit offset
+            if let Ok(o) = offset.try_into() {
+                cvt(pwrite64(fd, buf, count, o))
+            } else {
+                Err(io::Error::new(io::ErrorKind::InvalidInput,
+                                   "cannot pwrite >2GB"))
+            }
         }
 
         #[cfg(not(any(target_os = "android", target_os = "emscripten")))]
@@ -137,6 +151,13 @@ impl FileDesc {
                          cmp::min(buf.len(), max_len()),
                          offset as i64)
                 .map(|n| n as usize)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn get_cloexec(&self) -> io::Result<bool> {
+        unsafe {
+            Ok((cvt(libc::fcntl(self.fd, libc::F_GETFD))? & libc::FD_CLOEXEC) != 0)
         }
     }
 
@@ -261,7 +282,7 @@ impl Drop for FileDesc {
         // reason for this is that if an error occurs we don't actually know if
         // the file descriptor was closed or not, and if we retried (for
         // something like EINTR), we might close another valid file descriptor
-        // (opened after we closed ours.
+        // opened after we closed ours.
         let _ = unsafe { libc::close(self.fd) };
     }
 }

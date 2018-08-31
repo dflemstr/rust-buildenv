@@ -10,8 +10,8 @@
 
 #![sanitizer_runtime]
 #![feature(alloc_system)]
-#![feature(allocator_api)]
-#![feature(global_allocator)]
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(sanitizer_runtime)]
 #![feature(staged_api)]
 #![no_std]

@@ -214,7 +214,10 @@ impl SocketAddr {
         let path = unsafe { mem::transmute::<&[libc::c_char], &[u8]>(&self.addr.sun_path) };
 
         // macOS seems to return a len of 16 and a zeroed sun_path for unnamed addresses
-        if len == 0 || (cfg!(not(target_os = "linux")) && self.addr.sun_path[0] == 0) {
+        if len == 0
+            || (cfg!(not(any(target_os = "linux", target_os = "android")))
+                && self.addr.sun_path[0] == 0)
+        {
             AddressKind::Unnamed
         } else if self.addr.sun_path[0] == 0 {
             AddressKind::Abstract(&path[1..len])
@@ -521,6 +524,9 @@ impl UnixStream {
     ///     println!("Got error: {:?}", err);
     /// }
     /// ```
+    ///
+    /// # Platform specific
+    /// On Redox this always returns None.
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         self.0.take_error()
@@ -843,6 +849,9 @@ impl UnixListener {
     ///     println!("Got error: {:?}", err);
     /// }
     /// ```
+    ///
+    /// # Platform specific
+    /// On Redox this always returns None.
     #[stable(feature = "unix_socket", since = "1.10.0")]
     pub fn take_error(&self) -> io::Result<Option<io::Error>> {
         self.0.take_error()

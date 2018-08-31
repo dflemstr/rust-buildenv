@@ -13,7 +13,7 @@ use ty::context::TyCtxt;
 use ty::{AdtDef, VariantDef, FieldDef, Ty, TyS};
 use ty::{DefId, Substs};
 use ty::{AdtKind, Visibility};
-use ty::TypeVariants::*;
+use ty::TyKind::*;
 
 pub use self::def_id_forest::DefIdForest;
 
@@ -226,9 +226,9 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
         tcx: TyCtxt<'a, 'gcx, 'tcx>) -> DefIdForest
     {
         match self.sty {
-            TyAdt(def, substs) => {
+            Adt(def, substs) => {
                 {
-                    let substs_set = visited.entry(def.did).or_insert(FxHashSet::default());
+                    let substs_set = visited.entry(def.did).or_default();
                     if !substs_set.insert(substs) {
                         // We are already calculating the inhabitedness of this type.
                         // The type must contain a reference to itself. Break the
@@ -255,22 +255,22 @@ impl<'a, 'gcx, 'tcx> TyS<'tcx> {
                 ret
             },
 
-            TyNever => DefIdForest::full(tcx),
-            TyTuple(ref tys) => {
+            Never => DefIdForest::full(tcx),
+            Tuple(ref tys) => {
                 DefIdForest::union(tcx, tys.iter().map(|ty| {
                     ty.uninhabited_from(visited, tcx)
                 }))
             },
-            TyArray(ty, len) => {
-                match len.val.to_raw_bits() {
+            Array(ty, len) => {
+                match len.assert_usize(tcx) {
                     // If the array is definitely non-empty, it's uninhabited if
                     // the type of its elements is uninhabited.
                     Some(n) if n != 0 => ty.uninhabited_from(visited, tcx),
                     _ => DefIdForest::empty()
                 }
             }
-            TyRef(_, ref tm) => {
-                tm.ty.uninhabited_from(visited, tcx)
+            Ref(_, ty, _) => {
+                ty.uninhabited_from(visited, tcx)
             }
 
             _ => DefIdForest::empty(),

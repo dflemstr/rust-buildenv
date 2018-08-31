@@ -15,9 +15,9 @@ use rustc::mir::visit::Visitor;
 use dataflow::BitDenotation;
 
 /// This calculates if any part of a MIR local could have previously been borrowed.
-/// This means that once a local has been borrowed, its bit will always be set
-/// from that point and onwards, even if the borrow ends. You could also think of this
-/// as computing the lifetimes of infinite borrows.
+/// This means that once a local has been borrowed, its bit will be set
+/// from that point and onwards, until we see a StorageDead statement for the local,
+/// at which points there is no memory associated with the local, so it cannot be borrowed.
 /// This is used to compute which locals are live during a yield expression for
 /// immovable generators.
 #[derive(Copy, Clone)]
@@ -50,9 +50,17 @@ impl<'a, 'tcx> BitDenotation for HaveBeenBorrowedLocals<'a, 'tcx> {
     fn statement_effect(&self,
                         sets: &mut BlockSets<Local>,
                         loc: Location) {
+        let stmt = &self.mir[loc.block].statements[loc.statement_index];
+
         BorrowedLocalsVisitor {
             sets,
-        }.visit_statement(loc.block, &self.mir[loc.block].statements[loc.statement_index], loc);
+        }.visit_statement(loc.block, stmt, loc);
+
+        // StorageDead invalidates all borrows and raw pointers to a local
+        match stmt.kind {
+            StatementKind::StorageDead(l) => sets.kill(&l),
+            _ => (),
+        }
     }
 
     fn terminator_effect(&self,
@@ -74,7 +82,7 @@ impl<'a, 'tcx> BitDenotation for HaveBeenBorrowedLocals<'a, 'tcx> {
 
 impl<'a, 'tcx> BitwiseOperator for HaveBeenBorrowedLocals<'a, 'tcx> {
     #[inline]
-    fn join(&self, pred1: usize, pred2: usize) -> usize {
+    fn join(&self, pred1: Word, pred2: Word) -> Word {
         pred1 | pred2 // "maybe" means we union effects of both preds
     }
 }
@@ -93,6 +101,7 @@ struct BorrowedLocalsVisitor<'b, 'c: 'b> {
 fn find_local<'tcx>(place: &Place<'tcx>) -> Option<Local> {
     match *place {
         Place::Local(l) => Some(l),
+        Place::Promoted(_) |
         Place::Static(..) => None,
         Place::Projection(ref proj) => {
             match proj.elem {

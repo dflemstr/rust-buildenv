@@ -11,8 +11,6 @@
 // aux-build:attribute-with-error.rs
 // ignore-stage1
 
-#![feature(proc_macro)]
-
 extern crate attribute_with_error;
 
 use attribute_with_error::foo;

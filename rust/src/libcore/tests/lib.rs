@@ -8,29 +8,23 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![feature(ascii_ctype)]
 #![feature(box_syntax)]
-#![feature(core_float)]
+#![feature(cell_update)]
 #![feature(core_private_bignum)]
 #![feature(core_private_diy_float)]
 #![feature(dec2flt)]
-#![feature(decode_utf8)]
+#![feature(euclidean_division)]
 #![feature(exact_size_is_empty)]
 #![feature(fixed_size_array)]
-#![feature(float_internals)]
 #![feature(flt2dec)]
 #![feature(fmt_internals)]
 #![feature(hashmap_internals)]
-#![feature(iterator_step_by)]
-#![feature(iterator_flatten)]
-#![feature(iterator_repeat_with)]
-#![feature(nonzero)]
 #![feature(pattern)]
 #![feature(range_is_empty)]
 #![feature(raw)]
+#![feature(refcell_map_split)]
 #![feature(refcell_replace_swap)]
 #![feature(slice_patterns)]
-#![feature(slice_rotate)]
 #![feature(sort_internals)]
 #![feature(specialization)]
 #![feature(step_trait)]
@@ -40,10 +34,12 @@
 #![feature(try_from)]
 #![feature(try_trait)]
 #![feature(exact_chunks)]
-#![cfg_attr(stage0, feature(atomic_nand))]
+#![feature(slice_align_to)]
+#![feature(align_offset)]
 #![feature(reverse_bits)]
-#![feature(inclusive_range_fields)]
-#![feature(iterator_find_map)]
+#![feature(inner_deref)]
+#![feature(slice_internals)]
+#![feature(option_replace)]
 
 extern crate core;
 extern crate test;
@@ -61,6 +57,7 @@ mod fmt;
 mod hash;
 mod intrinsics;
 mod iter;
+mod manually_drop;
 mod mem;
 mod nonzero;
 mod num;
@@ -72,4 +69,5 @@ mod result;
 mod slice;
 mod str;
 mod str_lossy;
+mod time;
 mod tuple;

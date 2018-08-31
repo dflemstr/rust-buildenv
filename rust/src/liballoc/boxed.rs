@@ -58,16 +58,20 @@
 use core::any::Any;
 use core::borrow;
 use core::cmp::Ordering;
+use core::convert::From;
 use core::fmt;
+use core::future::{Future, FutureObj, LocalFutureObj, UnsafeFutureObj};
 use core::hash::{Hash, Hasher};
 use core::iter::FusedIterator;
 use core::marker::{Unpin, Unsize};
-use core::mem::{self, Pin};
+use core::mem;
+use core::pin::PinMut;
 use core::ops::{CoerceUnsized, Deref, DerefMut, Generator, GeneratorState};
 use core::ptr::{self, NonNull, Unique};
-use core::convert::From;
+use core::task::{Context, Poll, Spawn, SpawnErrorKind, SpawnObjError};
 
 use raw_vec::RawVec;
+use pin::PinBox;
 use str::from_boxed_utf8_unchecked;
 
 /// A pointer type for heap allocation.
@@ -124,7 +128,9 @@ impl<T: ?Sized> Box<T> {
         Box(Unique::new_unchecked(raw))
     }
 
-    /// Consumes the `Box`, returning the wrapped raw pointer.
+    /// Consumes the `Box`, returning a wrapped raw pointer.
+    ///
+    /// The pointer will be properly aligned and non-null.
     ///
     /// After calling this function, the caller is responsible for the
     /// memory previously managed by the `Box`. In particular, the
@@ -184,6 +190,7 @@ impl<T: ?Sized> Box<T> {
 
     #[unstable(feature = "ptr_internals", issue = "0", reason = "use into_raw_non_null instead")]
     #[inline]
+    #[doc(hidden)]
     pub fn into_unique(b: Box<T>) -> Unique<T> {
         let unique = b.0;
         mem::forget(b);
@@ -191,7 +198,9 @@ impl<T: ?Sized> Box<T> {
     }
 
     /// Consumes and leaks the `Box`, returning a mutable reference,
-    /// `&'a mut T`. Here, the lifetime `'a` may be chosen to be `'static`.
+    /// `&'a mut T`. Note that the type `T` must outlive the chosen lifetime
+    /// `'a`. If the type has only static references, or none at all, then this
+    /// may be chosen to be `'static`.
     ///
     /// This function is mainly useful for data that lives for the remainder of
     /// the program's life. Dropping the returned reference will cause a memory
@@ -443,7 +452,7 @@ impl From<Box<str>> for Box<[u8]> {
     }
 }
 
-impl Box<Any> {
+impl Box<dyn Any> {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     /// Attempt to downcast the box to a concrete type.
@@ -465,10 +474,10 @@ impl Box<Any> {
     ///     print_if_string(Box::new(0i8));
     /// }
     /// ```
-    pub fn downcast<T: Any>(self) -> Result<Box<T>, Box<Any>> {
+    pub fn downcast<T: Any>(self) -> Result<Box<T>, Box<dyn Any>> {
         if self.is::<T>() {
             unsafe {
-                let raw: *mut Any = Box::into_raw(self);
+                let raw: *mut dyn Any = Box::into_raw(self);
                 Ok(Box::from_raw(raw as *mut T))
             }
         } else {
@@ -477,7 +486,7 @@ impl Box<Any> {
     }
 }
 
-impl Box<Any + Send> {
+impl Box<dyn Any + Send> {
     #[inline]
     #[stable(feature = "rust1", since = "1.0.0")]
     /// Attempt to downcast the box to a concrete type.
@@ -499,10 +508,10 @@ impl Box<Any + Send> {
     ///     print_if_string(Box::new(0i8));
     /// }
     /// ```
-    pub fn downcast<T: Any>(self) -> Result<Box<T>, Box<Any + Send>> {
-        <Box<Any>>::downcast(self).map_err(|s| unsafe {
+    pub fn downcast<T: Any>(self) -> Result<Box<T>, Box<dyn Any + Send>> {
+        <Box<dyn Any>>::downcast(self).map_err(|s| unsafe {
             // reapply the Send marker
-            Box::from_raw(Box::into_raw(s) as *mut (Any + Send))
+            Box::from_raw(Box::into_raw(s) as *mut (dyn Any + Send))
         })
     }
 }
@@ -640,7 +649,7 @@ impl<A, F> FnBox<A> for F
 
 #[unstable(feature = "fnbox",
            reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
-impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + 'a> {
+impl<'a, A, R> FnOnce<A> for Box<dyn FnBox<A, Output = R> + 'a> {
     type Output = R;
 
     extern "rust-call" fn call_once(self, args: A) -> R {
@@ -650,7 +659,7 @@ impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + 'a> {
 
 #[unstable(feature = "fnbox",
            reason = "will be deprecated if and when `Box<FnOnce>` becomes usable", issue = "28796")]
-impl<'a, A, R> FnOnce<A> for Box<FnBox<A, Output = R> + Send + 'a> {
+impl<'a, A, R> FnOnce<A> for Box<dyn FnBox<A, Output = R> + Send + 'a> {
     type Output = R;
 
     extern "rust-call" fn call_once(self, args: A) -> R {
@@ -699,7 +708,7 @@ impl<T: Clone> Clone for Box<[T]> {
         impl<T> Drop for BoxBuilder<T> {
             fn drop(&mut self) {
                 let mut data = self.data.ptr();
-                let max = unsafe { data.offset(self.len as isize) };
+                let max = unsafe { data.add(self.len) };
 
                 while data != max {
                     unsafe {
@@ -751,102 +760,67 @@ impl<T> Generator for Box<T>
     }
 }
 
-/// A pinned, heap allocated reference.
-#[unstable(feature = "pin", issue = "49150")]
-#[fundamental]
-pub struct PinBox<T: ?Sized> {
-    inner: Box<T>,
-}
+#[unstable(feature = "futures_api", issue = "50547")]
+impl<F: ?Sized + Future + Unpin> Future for Box<F> {
+    type Output = F::Output;
 
-#[unstable(feature = "pin", issue = "49150")]
-impl<T> PinBox<T> {
-    /// Allocate memory on the heap, move the data into it and pin it.
-    #[unstable(feature = "pin", issue = "49150")]
-    pub fn new(data: T) -> PinBox<T> {
-        PinBox { inner: Box::new(data) }
+    fn poll(mut self: PinMut<Self>, cx: &mut Context) -> Poll<Self::Output> {
+        PinMut::new(&mut **self).poll(cx)
     }
 }
 
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: ?Sized> PinBox<T> {
-    /// Get a pinned reference to the data in this PinBox.
-    pub fn as_pin<'a>(&'a mut self) -> Pin<'a, T> {
-        unsafe { Pin::new_unchecked(&mut *self.inner) }
+#[unstable(feature = "futures_api", issue = "50547")]
+unsafe impl<'a, T, F> UnsafeFutureObj<'a, T> for Box<F>
+    where F: Future<Output = T> + 'a
+{
+    fn into_raw(self) -> *mut () {
+        Box::into_raw(self) as *mut ()
     }
 
-    /// Get a mutable reference to the data inside this PinBox.
-    ///
-    /// This function is unsafe. Users must guarantee that the data is never
-    /// moved out of this reference.
-    pub unsafe fn get_mut<'a>(this: &'a mut PinBox<T>) -> &'a mut T {
-        &mut *this.inner
+    unsafe fn poll(ptr: *mut (), cx: &mut Context) -> Poll<T> {
+        let ptr = ptr as *mut F;
+        let pin: PinMut<F> = PinMut::new_unchecked(&mut *ptr);
+        pin.poll(cx)
     }
 
-    /// Convert this PinBox into an unpinned Box.
-    ///
-    /// This function is unsafe. Users must guarantee that the data is never
-    /// moved out of the box.
-    pub unsafe fn unpin(this: PinBox<T>) -> Box<T> {
-        this.inner
+    unsafe fn drop(ptr: *mut ()) {
+        drop(Box::from_raw(ptr as *mut F))
     }
 }
 
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: ?Sized> From<Box<T>> for PinBox<T> {
-    fn from(boxed: Box<T>) -> PinBox<T> {
-        PinBox { inner: boxed }
+#[unstable(feature = "futures_api", issue = "50547")]
+impl<Sp> Spawn for Box<Sp>
+    where Sp: Spawn + ?Sized
+{
+    fn spawn_obj(
+        &mut self,
+        future: FutureObj<'static, ()>,
+    ) -> Result<(), SpawnObjError> {
+        (**self).spawn_obj(future)
+    }
+
+    fn status(&self) -> Result<(), SpawnErrorKind> {
+        (**self).status()
+    }
+}
+
+#[unstable(feature = "futures_api", issue = "50547")]
+impl<'a, F: Future<Output = ()> + Send + 'a> From<Box<F>> for FutureObj<'a, ()> {
+    fn from(boxed: Box<F>) -> Self {
+        FutureObj::new(boxed)
+    }
+}
+
+#[unstable(feature = "futures_api", issue = "50547")]
+impl<'a, F: Future<Output = ()> + 'a> From<Box<F>> for LocalFutureObj<'a, ()> {
+    fn from(boxed: Box<F>) -> Self {
+        LocalFutureObj::new(boxed)
     }
 }
 
 #[unstable(feature = "pin", issue = "49150")]
 impl<T: Unpin + ?Sized> From<PinBox<T>> for Box<T> {
     fn from(pinned: PinBox<T>) -> Box<T> {
-        pinned.inner
+        unsafe { PinBox::unpin(pinned) }
     }
 }
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: ?Sized> Deref for PinBox<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &*self.inner
-    }
-}
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: Unpin + ?Sized> DerefMut for PinBox<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut *self.inner
-    }
-}
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: fmt::Display + ?Sized> fmt::Display for PinBox<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Display::fmt(&*self.inner, f)
-    }
-}
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: fmt::Debug + ?Sized> fmt::Debug for PinBox<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        fmt::Debug::fmt(&*self.inner, f)
-    }
-}
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: ?Sized> fmt::Pointer for PinBox<T> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        // It's not possible to extract the inner Uniq directly from the Box,
-        // instead we cast it to a *const which aliases the Unique
-        let ptr: *const T = &*self.inner;
-        fmt::Pointer::fmt(&ptr, f)
-    }
-}
-
-#[unstable(feature = "pin", issue = "49150")]
-impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<PinBox<U>> for PinBox<T> {}
-
-#[unstable(feature = "pin", issue = "49150")]
-unsafe impl<T: ?Sized> Unpin for PinBox<T> {}

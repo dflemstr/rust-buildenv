@@ -24,6 +24,7 @@ use std::hash::Hash;
 use std::intrinsics;
 use ty::{self, Ty, TyCtxt};
 use ty::subst::Substs;
+use mir::interpret::Allocation;
 
 /// The shorthand encoding uses an enum's variant index `usize`
 /// and is offset by this value so it never matches a real variant.
@@ -36,7 +37,7 @@ pub trait EncodableWithShorthand: Clone + Eq + Hash {
 }
 
 impl<'tcx> EncodableWithShorthand for Ty<'tcx> {
-    type Variant = ty::TypeVariants<'tcx>;
+    type Variant = ty::TyKind<'tcx>;
     fn variant(&self) -> &Self::Variant {
         &self.sty
     }
@@ -53,7 +54,7 @@ pub trait TyEncoder: Encoder {
     fn position(&self) -> usize;
 }
 
-impl<'buf> TyEncoder for opaque::Encoder<'buf> {
+impl TyEncoder for opaque::Encoder {
     #[inline]
     fn position(&self) -> usize {
         self.position()
@@ -163,7 +164,7 @@ pub fn decode_ty<'a, 'tcx, D>(decoder: &mut D) -> Result<Ty<'tcx>, D::Error>
         })
     } else {
         let tcx = decoder.tcx();
-        Ok(tcx.mk_ty(ty::TypeVariants::decode(decoder)?))
+        Ok(tcx.mk_ty(ty::TyKind::decode(decoder)?))
     }
 }
 
@@ -211,7 +212,7 @@ pub fn decode_region<'a, 'tcx, D>(decoder: &mut D) -> Result<ty::Region<'tcx>, D
 
 #[inline]
 pub fn decode_ty_slice<'a, 'tcx, D>(decoder: &mut D)
-                                    -> Result<&'tcx ty::Slice<Ty<'tcx>>, D::Error>
+                                    -> Result<&'tcx ty::List<Ty<'tcx>>, D::Error>
     where D: TyDecoder<'a, 'tcx>,
           'tcx: 'a,
 {
@@ -231,7 +232,7 @@ pub fn decode_adt_def<'a, 'tcx, D>(decoder: &mut D)
 
 #[inline]
 pub fn decode_existential_predicate_slice<'a, 'tcx, D>(decoder: &mut D)
-    -> Result<&'tcx ty::Slice<ty::ExistentialPredicate<'tcx>>, D::Error>
+    -> Result<&'tcx ty::List<ty::ExistentialPredicate<'tcx>>, D::Error>
     where D: TyDecoder<'a, 'tcx>,
           'tcx: 'a,
 {
@@ -260,6 +261,15 @@ pub fn decode_const<'a, 'tcx, D>(decoder: &mut D)
           'tcx: 'a,
 {
     Ok(decoder.tcx().mk_const(Decodable::decode(decoder)?))
+}
+
+#[inline]
+pub fn decode_allocation<'a, 'tcx, D>(decoder: &mut D)
+                                 -> Result<&'tcx Allocation, D::Error>
+    where D: TyDecoder<'a, 'tcx>,
+          'tcx: 'a,
+{
+    Ok(decoder.tcx().intern_const_alloc(Decodable::decode(decoder)?))
 }
 
 #[macro_export]
@@ -356,10 +366,10 @@ macro_rules! implement_ty_decoder {
                 }
             }
 
-            impl<$($typaram),*> SpecializedDecoder<&'tcx ty::Slice<ty::Ty<'tcx>>>
+            impl<$($typaram),*> SpecializedDecoder<&'tcx ty::List<ty::Ty<'tcx>>>
             for $DecoderName<$($typaram),*> {
                 fn specialized_decode(&mut self)
-                                      -> Result<&'tcx ty::Slice<ty::Ty<'tcx>>, Self::Error> {
+                                      -> Result<&'tcx ty::List<ty::Ty<'tcx>>, Self::Error> {
                     decode_ty_slice(self)
                 }
             }
@@ -371,10 +381,10 @@ macro_rules! implement_ty_decoder {
                 }
             }
 
-            impl<$($typaram),*> SpecializedDecoder<&'tcx ty::Slice<ty::ExistentialPredicate<'tcx>>>
+            impl<$($typaram),*> SpecializedDecoder<&'tcx ty::List<ty::ExistentialPredicate<'tcx>>>
                 for $DecoderName<$($typaram),*> {
                 fn specialized_decode(&mut self)
-                    -> Result<&'tcx ty::Slice<ty::ExistentialPredicate<'tcx>>, Self::Error> {
+                    -> Result<&'tcx ty::List<ty::ExistentialPredicate<'tcx>>, Self::Error> {
                     decode_existential_predicate_slice(self)
                 }
             }
@@ -391,6 +401,15 @@ macro_rules! implement_ty_decoder {
             for $DecoderName<$($typaram),*> {
                 fn specialized_decode(&mut self) -> Result<&'tcx ty::Const<'tcx>, Self::Error> {
                     decode_const(self)
+                }
+            }
+
+            impl<$($typaram),*> SpecializedDecoder<&'tcx $crate::mir::interpret::Allocation>
+            for $DecoderName<$($typaram),*> {
+                fn specialized_decode(
+                    &mut self
+                ) -> Result<&'tcx $crate::mir::interpret::Allocation, Self::Error> {
+                    decode_allocation(self)
                 }
             }
         }

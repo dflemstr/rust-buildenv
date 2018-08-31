@@ -12,8 +12,10 @@ use hir::{self, Local, Pat, Body, HirId};
 use hir::intravisit::{self, Visitor, NestedVisitorMap};
 use infer::InferCtxt;
 use infer::type_variable::TypeVariableOrigin;
-use ty::{self, Ty, TyInfer, TyVar};
+use ty::{self, Ty, Infer, TyVar};
+use syntax::source_map::CompilerDesugaringKind;
 use syntax_pos::Span;
+use errors::DiagnosticBuilder;
 
 struct FindLocalByTypeVisitor<'a, 'gcx: 'a + 'tcx, 'tcx: 'a> {
     infcx: &'a InferCtxt<'a, 'gcx, 'tcx>,
@@ -33,7 +35,7 @@ impl<'a, 'gcx, 'tcx> FindLocalByTypeVisitor<'a, 'gcx, 'tcx> {
                 let ty = self.infcx.resolve_type_vars_if_possible(&ty);
                 ty.walk().any(|inner_ty| {
                     inner_ty == *self.target_ty || match (&inner_ty.sty, &self.target_ty.sty) {
-                        (&TyInfer(TyVar(a_vid)), &TyInfer(TyVar(b_vid))) => {
+                        (&Infer(TyVar(a_vid)), &Infer(TyVar(b_vid))) => {
                             self.infcx
                                 .type_variables
                                 .borrow_mut()
@@ -72,8 +74,8 @@ impl<'a, 'gcx, 'tcx> Visitor<'gcx> for FindLocalByTypeVisitor<'a, 'gcx, 'tcx> {
 
 
 impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
-    fn extract_type_name(&self, ty: &'a Ty<'tcx>) -> String {
-        if let ty::TyInfer(ty::TyVar(ty_vid)) = (*ty).sty {
+    pub fn extract_type_name(&self, ty: &'a Ty<'tcx>) -> String {
+        if let ty::Infer(ty::TyVar(ty_vid)) = (*ty).sty {
             let ty_vars = self.type_variables.borrow();
             if let TypeVariableOrigin::TypeParameterDefinition(_, name) =
                 *ty_vars.var_origin(ty_vid) {
@@ -86,12 +88,23 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
         }
     }
 
-    pub fn need_type_info(&self, body_id: Option<hir::BodyId>, span: Span, ty: Ty<'tcx>) {
+    pub fn need_type_info_err(&self,
+                            body_id: Option<hir::BodyId>,
+                            span: Span,
+                            ty: Ty<'tcx>)
+                            -> DiagnosticBuilder<'gcx> {
         let ty = self.resolve_type_vars_if_possible(&ty);
         let name = self.extract_type_name(&ty);
 
         let mut err_span = span;
-        let mut labels = vec![(span, format!("cannot infer type for `{}`", name))];
+        let mut labels = vec![(
+            span,
+            if &name == "_" {
+                "cannot infer type".to_string()
+            } else {
+                format!("cannot infer type for `{}`", name)
+            },
+        )];
 
         let mut local_visitor = FindLocalByTypeVisitor {
             infcx: &self,
@@ -124,12 +137,21 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             //          ^ consider giving this closure parameter a type
             // ```
             labels.clear();
-            labels.push((pattern.span, format!("consider giving this closure parameter a type")));
+            labels.push(
+                (pattern.span, "consider giving this closure parameter a type".to_string()));
         } else if let Some(pattern) = local_visitor.found_local_pattern {
-            if let Some(simple_name) = pattern.simple_name() {
-                labels.push((pattern.span, format!("consider giving `{}` a type", simple_name)));
+            if let Some(simple_ident) = pattern.simple_ident() {
+                match pattern.span.compiler_desugaring_kind() {
+                    None => labels.push((pattern.span,
+                                         format!("consider giving `{}` a type", simple_ident))),
+                    Some(CompilerDesugaringKind::ForLoop) => labels.push((
+                        pattern.span,
+                        "the element type for this iterator is not specified".to_string(),
+                    )),
+                    _ => {}
+                }
             } else {
-                labels.push((pattern.span, format!("consider giving the pattern a type")));
+                labels.push((pattern.span, "consider giving the pattern a type".to_string()));
             }
         }
 
@@ -142,6 +164,6 @@ impl<'a, 'gcx, 'tcx> InferCtxt<'a, 'gcx, 'tcx> {
             err.span_label(target_span, label_message);
         }
 
-        err.emit();
+        err
     }
 }

@@ -8,10 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use std::vec;
-
-use rustc_data_structures::bitvec::BitVector;
-use rustc_data_structures::indexed_vec::Idx;
+use rustc_data_structures::bitvec::BitArray;
 
 use super::*;
 
@@ -35,7 +32,7 @@ use super::*;
 #[derive(Clone)]
 pub struct Preorder<'a, 'tcx: 'a> {
     mir: &'a Mir<'tcx>,
-    visited: BitVector,
+    visited: BitArray<BasicBlock>,
     worklist: Vec<BasicBlock>,
 }
 
@@ -45,7 +42,7 @@ impl<'a, 'tcx> Preorder<'a, 'tcx> {
 
         Preorder {
             mir,
-            visited: BitVector::new(mir.basic_blocks().len()),
+            visited: BitArray::new(mir.basic_blocks().len()),
             worklist,
         }
     }
@@ -60,16 +57,14 @@ impl<'a, 'tcx> Iterator for Preorder<'a, 'tcx> {
 
     fn next(&mut self) -> Option<(BasicBlock, &'a BasicBlockData<'tcx>)> {
         while let Some(idx) = self.worklist.pop() {
-            if !self.visited.insert(idx.index()) {
+            if !self.visited.insert(idx) {
                 continue;
             }
 
             let data = &self.mir[idx];
 
             if let Some(ref term) = data.terminator {
-                for &succ in term.successors().iter() {
-                    self.worklist.push(succ);
-                }
+                self.worklist.extend(term.successors());
             }
 
             return Some((idx, data));
@@ -109,15 +104,15 @@ impl<'a, 'tcx> ExactSizeIterator for Preorder<'a, 'tcx> {}
 /// A Postorder traversal of this graph is `D B C A` or `D C B A`
 pub struct Postorder<'a, 'tcx: 'a> {
     mir: &'a Mir<'tcx>,
-    visited: BitVector,
-    visit_stack: Vec<(BasicBlock, vec::IntoIter<BasicBlock>)>
+    visited: BitArray<BasicBlock>,
+    visit_stack: Vec<(BasicBlock, Successors<'a>)>
 }
 
 impl<'a, 'tcx> Postorder<'a, 'tcx> {
     pub fn new(mir: &'a Mir<'tcx>, root: BasicBlock) -> Postorder<'a, 'tcx> {
         let mut po = Postorder {
             mir,
-            visited: BitVector::new(mir.basic_blocks().len()),
+            visited: BitArray::new(mir.basic_blocks().len()),
             visit_stack: Vec::new()
         };
 
@@ -125,11 +120,8 @@ impl<'a, 'tcx> Postorder<'a, 'tcx> {
         let data = &po.mir[root];
 
         if let Some(ref term) = data.terminator {
-            po.visited.insert(root.index());
-
-            let succs = term.successors().into_owned().into_iter();
-
-            po.visit_stack.push((root, succs));
+            po.visited.insert(root);
+            po.visit_stack.push((root, term.successors()));
             po.traverse_successor();
         }
 
@@ -179,14 +171,14 @@ impl<'a, 'tcx> Postorder<'a, 'tcx> {
         //      (A, [C])]
         //
         // Now that the top of the stack has no successors we can traverse, each item will
-        // be popped off during iteration until we get back to `A`. This yeilds [E, D, B].
+        // be popped off during iteration until we get back to `A`. This yields [E, D, B].
         //
         // When we yield `B` and call `traverse_successor`, we push `C` to the stack, but
         // since we've already visited `E`, that child isn't added to the stack. The last
         // two iterations yield `C` and finally `A` for a final traversal of [E, D, B, C, A]
         loop {
             let bb = if let Some(&mut (_, ref mut iter)) = self.visit_stack.last_mut() {
-                if let Some(bb) = iter.next() {
+                if let Some(&bb) = iter.next() {
                     bb
                 } else {
                     break;
@@ -195,10 +187,9 @@ impl<'a, 'tcx> Postorder<'a, 'tcx> {
                 break;
             };
 
-            if self.visited.insert(bb.index()) {
-                if let Some(ref term) = self.mir[bb].terminator {
-                    let succs = term.successors().into_owned().into_iter();
-                    self.visit_stack.push((bb, succs));
+            if self.visited.insert(bb) {
+                if let Some(term) = &self.mir[bb].terminator {
+                    self.visit_stack.push((bb, term.successors()));
                 }
             }
         }

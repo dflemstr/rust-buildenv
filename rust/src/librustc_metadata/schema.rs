@@ -19,11 +19,12 @@ use rustc::middle::lang_items;
 use rustc::mir;
 use rustc::session::CrateDisambiguator;
 use rustc::ty::{self, Ty, ReprOptions};
-use rustc_back::PanicStrategy;
-use rustc_back::target::TargetTriple;
+use rustc_target::spec::{PanicStrategy, TargetTriple};
+use rustc_data_structures::svh::Svh;
 
 use rustc_serialize as serialize;
 use syntax::{ast, attr};
+use syntax::edition::Edition;
 use syntax::symbol::Symbol;
 use syntax_pos::{self, Span};
 
@@ -187,9 +188,10 @@ pub struct CrateRoot {
     pub name: Symbol,
     pub triple: TargetTriple,
     pub extra_filename: String,
-    pub hash: hir::svh::Svh,
+    pub hash: Svh,
     pub disambiguator: CrateDisambiguator,
     pub panic_strategy: PanicStrategy,
+    pub edition: Edition,
     pub has_global_allocator: bool,
     pub has_default_lib_allocator: bool,
     pub plugin_registrar_fn: Option<DefIndex>,
@@ -197,24 +199,32 @@ pub struct CrateRoot {
 
     pub crate_deps: LazySeq<CrateDep>,
     pub dylib_dependency_formats: LazySeq<Option<LinkagePreference>>,
+    pub lib_features: LazySeq<(Symbol, Option<Symbol>)>,
     pub lang_items: LazySeq<(DefIndex, usize)>,
     pub lang_items_missing: LazySeq<lang_items::LangItem>,
     pub native_libraries: LazySeq<NativeLibrary>,
     pub foreign_modules: LazySeq<ForeignModule>,
-    pub codemap: LazySeq<syntax_pos::FileMap>,
+    pub source_map: LazySeq<syntax_pos::SourceFile>,
     pub def_path_table: Lazy<hir::map::definitions::DefPathTable>,
     pub impls: LazySeq<TraitImpls>,
     pub exported_symbols: EncodedExportedSymbols,
-    pub wasm_custom_sections: LazySeq<DefIndex>,
     pub interpret_alloc_index: LazySeq<u32>,
 
     pub index: LazySeq<index::Index>,
+
+    pub compiler_builtins: bool,
+    pub needs_allocator: bool,
+    pub needs_panic_runtime: bool,
+    pub no_builtins: bool,
+    pub panic_runtime: bool,
+    pub profiler_runtime: bool,
+    pub sanitizer_runtime: bool,
 }
 
 #[derive(RustcEncodable, RustcDecodable)]
 pub struct CrateDep {
     pub name: ast::Name,
-    pub hash: hir::svh::Svh,
+    pub hash: Svh,
     pub kind: DepKind,
     pub extra_filename: String,
 }
@@ -264,6 +274,7 @@ pub struct Entry<'tcx> {
     pub variances: LazySeq<ty::Variance>,
     pub generics: Option<Lazy<ty::Generics>>,
     pub predicates: Option<Lazy<ty::GenericPredicates<'tcx>>>,
+    pub predicates_defined_on: Option<Lazy<ty::GenericPredicates<'tcx>>>,
 
     pub mir: Option<Lazy<mir::Mir<'tcx>>>,
 }
@@ -281,6 +292,7 @@ impl_stable_hash_for!(struct Entry<'tcx> {
     variances,
     generics,
     predicates,
+    predicates_defined_on,
     mir
 });
 
@@ -295,6 +307,7 @@ pub enum EntryKind<'tcx> {
     ForeignType,
     GlobalAsm,
     Type,
+    Existential,
     Enum(ReprOptions),
     Field,
     Variant(Lazy<VariantData<'tcx>>),
@@ -310,6 +323,7 @@ pub enum EntryKind<'tcx> {
     Impl(Lazy<ImplData<'tcx>>),
     Method(Lazy<MethodData<'tcx>>),
     AssociatedType(AssociatedContainer),
+    AssociatedExistential(AssociatedContainer),
     AssociatedConst(AssociatedContainer, ConstQualif, Lazy<RenderedConst>),
 }
 
@@ -327,6 +341,7 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for EntryKind<'gcx> {
             EntryKind::GlobalAsm        |
             EntryKind::ForeignType      |
             EntryKind::Field |
+            EntryKind::Existential |
             EntryKind::Type => {
                 // Nothing else to hash here.
             }
@@ -370,12 +385,14 @@ impl<'a, 'gcx> HashStable<StableHashingContext<'a>> for EntryKind<'gcx> {
             EntryKind::Method(ref method_data) => {
                 method_data.hash_stable(hcx, hasher);
             }
+            EntryKind::AssociatedExistential(associated_container) |
             EntryKind::AssociatedType(associated_container) => {
                 associated_container.hash_stable(hcx, hasher);
             }
-            EntryKind::AssociatedConst(associated_container, qualif, _) => {
+            EntryKind::AssociatedConst(associated_container, qualif, ref const_data) => {
                 associated_container.hash_stable(hcx, hasher);
                 qualif.hash_stable(hcx, hasher);
+                const_data.hash_stable(hcx, hasher);
             }
         }
     }

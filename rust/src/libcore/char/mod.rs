@@ -50,17 +50,15 @@ pub use self::decode::{decode_utf16, DecodeUtf16, DecodeUtf16Error};
 pub use unicode::tables::UNICODE_VERSION;
 #[unstable(feature = "unicode_version", issue = "49726")]
 pub use unicode::version::UnicodeVersion;
-#[unstable(feature = "decode_utf8", issue = "33906")]
-pub use self::decode::{decode_utf8, DecodeUtf8, InvalidSequence};
 
 use fmt::{self, Write};
 use iter::FusedIterator;
 
 // UTF-8 ranges and tags for encoding characters
-const TAG_CONT: u8    = 0b1000_0000;
-const TAG_TWO_B: u8   = 0b1100_0000;
-const TAG_THREE_B: u8 = 0b1110_0000;
-const TAG_FOUR_B: u8  = 0b1111_0000;
+const TAG_CONT: u8     = 0b1000_0000;
+const TAG_TWO_B: u8    = 0b1100_0000;
+const TAG_THREE_B: u8  = 0b1110_0000;
+const TAG_FOUR_B: u8   = 0b1111_0000;
 const MAX_ONE_B: u32   =     0x80;
 const MAX_TWO_B: u32   =    0x800;
 const MAX_THREE_B: u32 =  0x10000;
@@ -314,8 +312,8 @@ impl Iterator for EscapeDefault {
                     None
                 }
             },
-            EscapeDefaultState::Done => return None,
-            EscapeDefaultState::Unicode(ref mut i) => return i.nth(n),
+            EscapeDefaultState::Done => None,
+            EscapeDefaultState::Unicode(ref mut i) => i.nth(n),
         }
     }
 

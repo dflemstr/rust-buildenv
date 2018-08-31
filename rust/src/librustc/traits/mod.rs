@@ -10,24 +10,27 @@
 
 //! Trait Resolution. See [rustc guide] for more info on how this works.
 //!
-//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/trait-resolution.html
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/traits/resolution.html
 
 pub use self::SelectionError::*;
 pub use self::FulfillmentErrorCode::*;
 pub use self::Vtable::*;
 pub use self::ObligationCauseCode::*;
 
+use chalk_engine;
 use hir;
 use hir::def_id::DefId;
 use infer::outlives::env::OutlivesEnvironment;
 use middle::region;
-use middle::const_val::ConstEvalErr;
+use mir::interpret::ConstEvalErr;
 use ty::subst::Substs;
-use ty::{self, AdtKind, Slice, Ty, TyCtxt, TypeFoldable, ToPredicate};
+use ty::{self, AdtKind, List, Ty, TyCtxt, GenericParamDefKind, ToPredicate};
 use ty::error::{ExpectedFound, TypeError};
+use ty::fold::{TypeFolder, TypeFoldable, TypeVisitor};
 use infer::{InferCtxt};
 
 use rustc_data_structures::sync::Lrc;
+use std::fmt::Debug;
 use std::rc::Rc;
 use syntax::ast;
 use syntax_pos::{Span, DUMMY_SP};
@@ -41,10 +44,10 @@ pub use self::object_safety::ObjectSafetyViolation;
 pub use self::object_safety::MethodViolationCode;
 pub use self::on_unimplemented::{OnUnimplementedDirective, OnUnimplementedNote};
 pub use self::select::{EvaluationCache, SelectionContext, SelectionCache};
-pub use self::select::IntercrateAmbiguityCause;
+pub use self::select::{EvaluationResult, IntercrateAmbiguityCause, OverflowError};
 pub use self::specialize::{OverlapError, specialization_graph, translate_substs};
 pub use self::specialize::{SpecializesCache, find_associated_item};
-pub use self::engine::TraitEngine;
+pub use self::engine::{TraitEngine, TraitEngineExt};
 pub use self::util::elaborate_predicates;
 pub use self::util::supertraits;
 pub use self::util::Supertraits;
@@ -52,6 +55,8 @@ pub use self::util::supertrait_def_ids;
 pub use self::util::SupertraitDefIds;
 pub use self::util::transitive_bounds;
 
+#[allow(dead_code)]
+pub mod auto_trait;
 mod coherence;
 pub mod error_reporting;
 mod engine;
@@ -62,7 +67,7 @@ mod on_unimplemented;
 mod select;
 mod specialize;
 mod structural_impls;
-pub mod trans;
+pub mod codegen;
 mod util;
 
 pub mod query;
@@ -72,6 +77,19 @@ pub mod query;
 pub enum IntercrateMode {
     Issue43355,
     Fixed
+}
+
+// The mode that trait queries run in
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum TraitQueryMode {
+    // Standard/un-canonicalized queries get accurate
+    // spans etc. passed in and hence can do reasonable
+    // error reporting on their own.
+    Standard,
+    // Canonicalized queries get dummy spans and hence
+    // must generally propagate errors to
+    // pre-canonicalization callsites.
+    Canonical,
 }
 
 /// An `Obligation` represents some trait reference (e.g. `int:Eq`) for
@@ -124,7 +142,7 @@ impl<'tcx> ObligationCause<'tcx> {
             ObligationCauseCode::CompareImplMethodObligation { .. } |
             ObligationCauseCode::MainFunctionType |
             ObligationCauseCode::StartFunctionType => {
-                tcx.sess.codemap().def_span(self.span)
+                tcx.sess.source_map().def_span(self.span)
             }
             _ => self.span,
         }
@@ -167,6 +185,8 @@ pub enum ObligationCauseCode<'tcx> {
     StructInitializerSized,
     /// Type of each variable must be Sized
     VariableType(ast::NodeId),
+    /// Argument type must be Sized
+    SizedArgumentType,
     /// Return type must be Sized
     SizedReturnType,
     /// Yield type must be Sized
@@ -174,8 +194,8 @@ pub enum ObligationCauseCode<'tcx> {
     /// [T,..n] --> T must be Copy
     RepeatVec,
 
-    /// Types of fields (other than the last) in a struct must be sized.
-    FieldSized(AdtKind),
+    /// Types of fields (other than the last, except for packed structs) in a struct must be sized.
+    FieldSized { adt_kind: AdtKind, last: bool },
 
     /// Constant expressions must be sized.
     ConstSized,
@@ -228,6 +248,9 @@ pub enum ObligationCauseCode<'tcx> {
 
     /// Block implicit return
     BlockTailExpression(ast::NodeId),
+
+    /// #[feature(trivial_bounds)] is not enabled
+    TrivialBound,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -247,7 +270,9 @@ pub type PredicateObligations<'tcx> = Vec<PredicateObligation<'tcx>>;
 pub type TraitObligations<'tcx> = Vec<TraitObligation<'tcx>>;
 
 /// The following types:
-/// * `WhereClauseAtom`
+/// * `WhereClause`
+/// * `WellFormed`
+/// * `FromEnv`
 /// * `DomainGoal`
 /// * `Goal`
 /// * `Clause`
@@ -255,21 +280,31 @@ pub type TraitObligations<'tcx> = Vec<TraitObligation<'tcx>>;
 /// logic programming clauses. They are part of the interface
 /// for the chalk SLG solver.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum WhereClauseAtom<'tcx> {
+pub enum WhereClause<'tcx> {
     Implemented(ty::TraitPredicate<'tcx>),
     ProjectionEq(ty::ProjectionPredicate<'tcx>),
+    RegionOutlives(ty::RegionOutlivesPredicate<'tcx>),
+    TypeOutlives(ty::TypeOutlivesPredicate<'tcx>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum WellFormed<'tcx> {
+    Trait(ty::TraitPredicate<'tcx>),
+    Ty(Ty<'tcx>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum FromEnv<'tcx> {
+    Trait(ty::TraitPredicate<'tcx>),
+    Ty(Ty<'tcx>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DomainGoal<'tcx> {
-    Holds(WhereClauseAtom<'tcx>),
-    WellFormed(WhereClauseAtom<'tcx>),
-    FromEnv(WhereClauseAtom<'tcx>),
-    WellFormedTy(Ty<'tcx>),
+    Holds(WhereClause<'tcx>),
+    WellFormed(WellFormed<'tcx>),
+    FromEnv(FromEnv<'tcx>),
     Normalize(ty::ProjectionPredicate<'tcx>),
-    FromEnvTy(Ty<'tcx>),
-    RegionOutlives(ty::RegionOutlivesPredicate<'tcx>),
-    TypeOutlives(ty::TypeOutlivesPredicate<'tcx>),
 }
 
 pub type PolyDomainGoal<'tcx> = ty::Binder<DomainGoal<'tcx>>;
@@ -282,11 +317,20 @@ pub enum QuantifierKind {
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Goal<'tcx> {
-    Implies(&'tcx Slice<Clause<'tcx>>, &'tcx Goal<'tcx>),
+    Implies(Clauses<'tcx>, &'tcx Goal<'tcx>),
     And(&'tcx Goal<'tcx>, &'tcx Goal<'tcx>),
     Not(&'tcx Goal<'tcx>),
     DomainGoal(DomainGoal<'tcx>),
-    Quantified(QuantifierKind, ty::Binder<&'tcx Goal<'tcx>>)
+    Quantified(QuantifierKind, ty::Binder<&'tcx Goal<'tcx>>),
+    CannotProve,
+}
+
+pub type Goals<'tcx> = &'tcx List<Goal<'tcx>>;
+
+impl<'tcx> DomainGoal<'tcx> {
+    pub fn into_goal(self) -> Goal<'tcx> {
+        Goal::DomainGoal(self)
+    }
 }
 
 impl<'tcx> Goal<'tcx> {
@@ -295,18 +339,12 @@ impl<'tcx> Goal<'tcx> {
         tcx: TyCtxt<'a, 'tcx, 'tcx>,
     ) -> Goal<'tcx> {
         match domain_goal.no_late_bound_regions() {
-            Some(p) => p.into(),
+            Some(p) => p.into_goal(),
             None => Goal::Quantified(
                 QuantifierKind::Universal,
-                domain_goal.map_bound(|p| tcx.mk_goal(Goal::from(p)))
+                domain_goal.map_bound(|p| tcx.mk_goal(p.into_goal()))
             ),
         }
-    }
-}
-
-impl<'tcx> From<DomainGoal<'tcx>> for Goal<'tcx> {
-    fn from(domain_goal: DomainGoal<'tcx>) -> Self {
-        Goal::DomainGoal(domain_goal)
     }
 }
 
@@ -317,6 +355,9 @@ pub enum Clause<'tcx> {
     Implies(ProgramClause<'tcx>),
     ForAll(ty::Binder<ProgramClause<'tcx>>),
 }
+
+/// Multiple clauses.
+pub type Clauses<'tcx> = &'tcx List<Clause<'tcx>>;
 
 /// A "program clause" has the form `D :- G1, ..., Gn`. It is saying
 /// that the domain goal `D` is true if `G1...Gn` are provable. This
@@ -330,7 +371,7 @@ pub struct ProgramClause<'tcx> {
     pub goal: DomainGoal<'tcx>,
 
     /// ...if we can prove these hypotheses (there may be no hypotheses at all):
-    pub hypotheses: &'tcx Slice<Goal<'tcx>>,
+    pub hypotheses: Goals<'tcx>,
 }
 
 pub type Selection<'tcx> = Vtable<'tcx, PredicateObligation<'tcx>>;
@@ -342,7 +383,8 @@ pub enum SelectionError<'tcx> {
                                 ty::PolyTraitRef<'tcx>,
                                 ty::error::TypeError<'tcx>),
     TraitNotObjectSafe(DefId),
-    ConstEvalFailure(ConstEvalErr<'tcx>),
+    ConstEvalFailure(Lrc<ConstEvalErr<'tcx>>),
+    Overflow,
 }
 
 pub struct FulfillmentError<'tcx> {
@@ -448,8 +490,8 @@ pub enum Vtable<'tcx, N> {
 ///
 /// The type parameter `N` indicates the type used for "nested
 /// obligations" that are required by the impl. During type check, this
-/// is `Obligation`, as one might expect. During trans, however, this
-/// is `()`, because trans only requires a shallow resolution of an
+/// is `Obligation`, as one might expect. During codegen, however, this
+/// is `()`, because codegen only requires a shallow resolution of an
 /// impl, and nested obligations are satisfied later.
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub struct VtableImplData<'tcx, N> {
@@ -460,8 +502,8 @@ pub struct VtableImplData<'tcx, N> {
 
 #[derive(Clone, PartialEq, Eq, RustcEncodable, RustcDecodable)]
 pub struct VtableGeneratorData<'tcx, N> {
-    pub closure_def_id: DefId,
-    pub substs: ty::ClosureSubsts<'tcx>,
+    pub generator_def_id: DefId,
+    pub substs: ty::GeneratorSubsts<'tcx>,
     /// Nested obligations. This can be non-empty if the generator
     /// signature contains associated types.
     pub nested: Vec<N>
@@ -544,8 +586,7 @@ pub fn type_known_to_meet_bound<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx
         predicate: trait_ref.to_predicate(),
     };
 
-    let result = SelectionContext::new(infcx)
-        .evaluate_obligation_conservatively(&obligation);
+    let result = infcx.predicate_must_hold(&obligation);
     debug!("type_known_to_meet_ty={:?} bound={} => {:?}",
            ty, infcx.tcx.item_path_str(def_id), result);
 
@@ -620,16 +661,7 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     let predicates: Vec<_> =
         util::elaborate_predicates(tcx, unnormalized_env.caller_bounds.to_vec())
-        .filter(|p| !p.is_global()) // (*)
         .collect();
-
-    // (*) Any predicate like `i32: Trait<u32>` or whatever doesn't
-    // need to be in the *environment* to be proven, so screen those
-    // out. This is important for the soundness of inter-fn
-    // caching. Note though that we should probably check that these
-    // predicates hold at the point where the environment is
-    // constructed, but I am not currently doing so out of laziness.
-    // -nmatsakis
 
     debug!("normalize_param_env_or_error: elaborated-predicates={:?}",
            predicates);
@@ -653,7 +685,7 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // we move over to lazy normalization *anyway*.
         let fulfill_cx = FulfillmentContext::new_ignoring_regions();
 
-        let predicates = match fully_normalize_with_fulfillcx(
+        let predicates = match fully_normalize(
             &infcx,
             fulfill_cx,
             cause,
@@ -713,31 +745,7 @@ pub fn normalize_param_env_or_error<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     })
 }
 
-pub fn fully_normalize<'a, 'gcx, 'tcx, T>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
-                                          cause: ObligationCause<'tcx>,
-                                          param_env: ty::ParamEnv<'tcx>,
-                                          value: &T)
-                                          -> Result<T, Vec<FulfillmentError<'tcx>>>
-    where T : TypeFoldable<'tcx>
-{
-    // FIXME (@jroesch) ISSUE 26721
-    // I'm not sure if this is a bug or not, needs further investigation.
-    // It appears that by reusing the fulfillment_cx here we incur more
-    // obligations and later trip an assertion on regionck.rs line 337.
-    //
-    // The two possibilities I see is:
-    //      - normalization is not actually fully happening and we
-    //        have a bug else where
-    //      - we are adding a duplicate bound into the list causing
-    //        its size to change.
-    //
-    // I think we should probably land this refactor and then come
-    // back to this is a follow-up patch.
-    let fulfillcx = FulfillmentContext::new();
-    fully_normalize_with_fulfillcx(infcx, fulfillcx, cause, param_env, value)
-}
-
-pub fn fully_normalize_with_fulfillcx<'a, 'gcx, 'tcx, T>(
+pub fn fully_normalize<'a, 'gcx, 'tcx, T>(
     infcx: &InferCtxt<'a, 'gcx, 'tcx>,
     mut fulfill_cx: FulfillmentContext<'tcx>,
     cause: ObligationCause<'tcx>,
@@ -758,13 +766,7 @@ pub fn fully_normalize_with_fulfillcx<'a, 'gcx, 'tcx, T>(
     }
 
     debug!("fully_normalize: select_all_or_error start");
-    match fulfill_cx.select_all_or_error(infcx) {
-        Ok(()) => { }
-        Err(e) => {
-            debug!("fully_normalize: error={:?}", e);
-            return Err(e);
-        }
-    }
+    fulfill_cx.select_all_or_error(infcx)?;
     debug!("fully_normalize: select_all_or_error complete");
     let resolved_value = infcx.resolve_type_vars_if_possible(&normalized_value);
     debug!("fully_normalize: resolved_value={:?}", resolved_value);
@@ -849,22 +851,29 @@ fn vtable_methods<'a, 'tcx>(
 
                 // the method may have some early-bound lifetimes, add
                 // regions for those
-                let substs = Substs::for_item(tcx, def_id,
-                                              |_, _| tcx.types.re_erased,
-                                              |def, _| trait_ref.substs().type_for_def(def));
+                let substs = trait_ref.map_bound(|trait_ref| {
+                    Substs::for_item(tcx, def_id, |param, _| {
+                        match param.kind {
+                            GenericParamDefKind::Lifetime => tcx.types.re_erased.into(),
+                            GenericParamDefKind::Type {..} => {
+                                trait_ref.substs[param.index as usize]
+                            }
+                        }
+                    })
+                });
 
                 // the trait type may have higher-ranked lifetimes in it;
                 // so erase them if they appear, so that we get the type
                 // at some particular call site
                 let substs = tcx.normalize_erasing_late_bound_regions(
                     ty::ParamEnv::reveal_all(),
-                    &ty::Binder(substs),
+                    &substs
                 );
 
                 // It's possible that the method relies on where clauses that
                 // do not hold for this particular set of type parameters.
                 // Note that this method could then never be called, so we
-                // do not want to try and trans it, in that case (see #23435).
+                // do not want to try and codegen it, in that case (see #23435).
                 let predicates = tcx.predicates_of(def_id).instantiate_own(tcx, substs);
                 if !normalize_and_test_predicates(tcx, predicates.predicates) {
                     debug!("vtable_methods: predicates do not hold");
@@ -967,7 +976,7 @@ impl<'tcx, N> Vtable<'tcx, N> {
                 nested: p.nested.into_iter().map(f).collect(),
             }),
             VtableGenerator(c) => VtableGenerator(VtableGeneratorData {
-                closure_def_id: c.closure_def_id,
+                generator_def_id: c.generator_def_id,
                 substs: c.substs,
                 nested: c.nested.into_iter().map(f).collect(),
             }),
@@ -991,18 +1000,45 @@ impl<'tcx> FulfillmentError<'tcx> {
 
 impl<'tcx> TraitObligation<'tcx> {
     fn self_ty(&self) -> ty::Binder<Ty<'tcx>> {
-        ty::Binder(self.predicate.skip_binder().self_ty())
+        self.predicate.map_bound(|p| p.self_ty())
     }
 }
 
-pub fn provide(providers: &mut ty::maps::Providers) {
-    *providers = ty::maps::Providers {
+pub fn provide(providers: &mut ty::query::Providers) {
+    *providers = ty::query::Providers {
         is_object_safe: object_safety::is_object_safe_provider,
         specialization_graph_of: specialize::specialization_graph_provider,
         specializes: specialize::specializes,
-        trans_fulfill_obligation: trans::trans_fulfill_obligation,
+        codegen_fulfill_obligation: codegen::codegen_fulfill_obligation,
         vtable_methods,
         substitute_normalize_and_test_predicates,
         ..*providers
     };
+}
+
+pub trait ExClauseFold<'tcx>
+where
+    Self: chalk_engine::context::Context + Clone,
+{
+    fn fold_ex_clause_with<'gcx: 'tcx, F: TypeFolder<'gcx, 'tcx>>(
+        ex_clause: &chalk_engine::ExClause<Self>,
+        folder: &mut F,
+    ) -> chalk_engine::ExClause<Self>;
+
+    fn visit_ex_clause_with<'gcx: 'tcx, V: TypeVisitor<'tcx>>(
+        ex_clause: &chalk_engine::ExClause<Self>,
+        visitor: &mut V,
+    ) -> bool;
+}
+
+pub trait ExClauseLift<'tcx>
+where
+    Self: chalk_engine::context::Context + Clone,
+{
+    type LiftedExClause: Debug + 'tcx;
+
+    fn lift_ex_clause_to_tcx<'a, 'gcx>(
+        ex_clause: &chalk_engine::ExClause<Self>,
+        tcx: TyCtxt<'a, 'gcx, 'tcx>,
+    ) -> Option<Self::LiftedExClause>;
 }

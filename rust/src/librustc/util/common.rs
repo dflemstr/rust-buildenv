@@ -14,18 +14,14 @@ use rustc_data_structures::sync::Lock;
 
 use std::cell::{RefCell, Cell};
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::fmt::Debug;
 use std::hash::{Hash, BuildHasher};
-use std::iter::repeat;
 use std::panic;
 use std::env;
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use std::sync::mpsc::{Sender};
 use syntax_pos::{SpanData};
-use ty::maps::{QueryMsg};
 use ty::TyCtxt;
 use dep_graph::{DepNode};
 use proc_macro;
@@ -59,6 +55,17 @@ fn panic_hook(info: &panic::PanicInfo) {
         if backtrace {
             TyCtxt::try_print_query_stack();
         }
+
+        #[cfg(windows)]
+        unsafe {
+            if env::var("RUSTC_BREAK_ON_ICE").is_ok() {
+                extern "system" {
+                    fn DebugBreak();
+                }
+                // Trigger a debugger if we crashed during bootstrap
+                DebugBreak();
+            }
+        }
     }
 }
 
@@ -75,6 +82,13 @@ pub struct ProfQDumpParams {
     pub ack:Sender<()>,
     /// toggle dumping a log file with every `ProfileQueriesMsg`
     pub dump_profq_msg_log:bool,
+}
+
+#[allow(nonstandard_style)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryMsg {
+    pub query: &'static str,
+    pub msg: Option<String>,
 }
 
 /// A sequence of these messages induce a trace of query-based incremental compilation.
@@ -199,10 +213,10 @@ fn print_time_passes_entry_internal(what: &str, dur: Duration) {
             let mb = n as f64 / 1_000_000.0;
             format!("; rss: {}MB", mb.round() as usize)
         }
-        None => "".to_owned(),
+        None => String::new(),
     };
     println!("{}time: {}{}\t{}",
-             repeat("  ").take(indentation).collect::<String>(),
+             "  ".repeat(indentation),
              duration_to_secs_str(dur),
              mem_string,
              what);
@@ -226,7 +240,7 @@ pub fn to_readable_str(mut val: usize) -> String {
         val /= 1000;
 
         if val == 0 {
-            groups.push(format!("{}", group));
+            groups.push(group.to_string());
             break;
         } else {
             groups.push(format!("{:03}", group));
@@ -359,19 +373,6 @@ impl<K, V, S> MemoizationMap for RefCell<HashMap<K,V,S>>
         }
     }
 }
-
-#[cfg(unix)]
-pub fn path2cstr(p: &Path) -> CString {
-    use std::os::unix::prelude::*;
-    use std::ffi::OsStr;
-    let p: &OsStr = p.as_ref();
-    CString::new(p.as_bytes()).unwrap()
-}
-#[cfg(windows)]
-pub fn path2cstr(p: &Path) -> CString {
-    CString::new(p.to_str().unwrap()).unwrap()
-}
-
 
 #[test]
 fn test_to_readable_str() {

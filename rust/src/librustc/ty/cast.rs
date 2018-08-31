@@ -9,7 +9,7 @@
 // except according to those terms.
 
 // Helpers for handling cast expressions, used in both
-// typeck and trans.
+// typeck and codegen.
 
 use ty::{self, Ty};
 
@@ -36,9 +36,9 @@ pub enum CastTy<'tcx> {
     /// Function Pointers
     FnPtr,
     /// Raw pointers
-    Ptr(&'tcx ty::TypeAndMut<'tcx>),
+    Ptr(ty::TypeAndMut<'tcx>),
     /// References
-    RPtr(&'tcx ty::TypeAndMut<'tcx>),
+    RPtr(ty::TypeAndMut<'tcx>),
 }
 
 /// Cast Kind. See RFC 401 (or librustc_typeck/check/cast.rs)
@@ -60,18 +60,18 @@ pub enum CastKind {
 impl<'tcx> CastTy<'tcx> {
     pub fn from_ty(t: Ty<'tcx>) -> Option<CastTy<'tcx>> {
         match t.sty {
-            ty::TyBool => Some(CastTy::Int(IntTy::Bool)),
-            ty::TyChar => Some(CastTy::Int(IntTy::Char)),
-            ty::TyInt(_) => Some(CastTy::Int(IntTy::I)),
-            ty::TyInfer(ty::InferTy::IntVar(_)) => Some(CastTy::Int(IntTy::I)),
-            ty::TyInfer(ty::InferTy::FloatVar(_)) => Some(CastTy::Float),
-            ty::TyUint(u) => Some(CastTy::Int(IntTy::U(u))),
-            ty::TyFloat(_) => Some(CastTy::Float),
-            ty::TyAdt(d,_) if d.is_enum() && d.is_payloadfree() =>
+            ty::Bool => Some(CastTy::Int(IntTy::Bool)),
+            ty::Char => Some(CastTy::Int(IntTy::Char)),
+            ty::Int(_) => Some(CastTy::Int(IntTy::I)),
+            ty::Infer(ty::InferTy::IntVar(_)) => Some(CastTy::Int(IntTy::I)),
+            ty::Infer(ty::InferTy::FloatVar(_)) => Some(CastTy::Float),
+            ty::Uint(u) => Some(CastTy::Int(IntTy::U(u))),
+            ty::Float(_) => Some(CastTy::Float),
+            ty::Adt(d,_) if d.is_enum() && d.is_payloadfree() =>
                 Some(CastTy::Int(IntTy::CEnum)),
-            ty::TyRawPtr(ref mt) => Some(CastTy::Ptr(mt)),
-            ty::TyRef(_, ref mt) => Some(CastTy::RPtr(mt)),
-            ty::TyFnPtr(..) => Some(CastTy::FnPtr),
+            ty::RawPtr(mt) => Some(CastTy::Ptr(mt)),
+            ty::Ref(_, ty, mutbl) => Some(CastTy::RPtr(ty::TypeAndMut { ty, mutbl })),
+            ty::FnPtr(..) => Some(CastTy::FnPtr),
             _ => None,
         }
     }

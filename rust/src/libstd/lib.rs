@@ -232,80 +232,69 @@
 
 // std is implemented with unstable features, many of which are internal
 // compiler details that will never be stable
+#![cfg_attr(test, feature(test, update_panic_count))]
 #![feature(alloc)]
-#![feature(allocator_api)]
+#![feature(alloc_error_handler)]
 #![feature(alloc_system)]
+#![feature(allocator_api)]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
 #![feature(align_offset)]
+#![feature(arbitrary_self_types)]
 #![feature(array_error_internals)]
-#![feature(ascii_ctype)]
 #![feature(asm)]
-#![feature(attr_literals)]
 #![feature(box_syntax)]
 #![feature(cfg_target_has_atomic)]
 #![feature(cfg_target_thread_local)]
 #![feature(cfg_target_vendor)]
 #![feature(char_error_internals)]
-#![feature(char_internals)]
-#![feature(collections_range)]
 #![feature(compiler_builtins_lib)]
 #![feature(const_fn)]
-#![cfg_attr(stage0, feature(core_float))]
+#![feature(const_int_ops)]
+#![feature(const_ip)]
 #![feature(core_intrinsics)]
 #![feature(dropck_eyepatch)]
 #![feature(exact_size_is_empty)]
 #![feature(external_doc)]
-#![feature(fs_read_write)]
 #![feature(fixed_size_array)]
-#![feature(float_from_str_radix)]
-#![cfg_attr(stage0, feature(float_internals))]
 #![feature(fn_traits)]
 #![feature(fnbox)]
-#![cfg_attr(stage0, feature(generic_param_attrs))]
+#![feature(futures_api)]
+#![feature(generator_trait)]
 #![feature(hashmap_internals)]
-#![feature(heap_api)]
 #![feature(int_error_internals)]
 #![feature(integer_atomics)]
-#![feature(into_cow)]
 #![feature(lang_items)]
 #![feature(libc)]
 #![feature(link_args)]
 #![feature(linkage)]
-#![feature(macro_reexport)]
-#![feature(macro_vis_matcher)]
+#![cfg_attr(stage0, feature(macro_vis_matcher))]
 #![feature(needs_panic_runtime)]
 #![feature(never_type)]
+#![cfg_attr(not(stage0), feature(nll))]
+#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
 #![feature(exhaustive_patterns)]
-#![feature(nonzero)]
-#![feature(num_bits_bytes)]
-#![feature(old_wrapping)]
 #![feature(on_unimplemented)]
-#![feature(oom)]
 #![feature(optin_builtin_traits)]
 #![feature(panic_internals)]
 #![feature(panic_unwind)]
-#![feature(peek)]
-#![feature(placement_new_protocol)]
+#![feature(pin)]
 #![feature(prelude_import)]
 #![feature(ptr_internals)]
-#![feature(rand)]
 #![feature(raw)]
 #![feature(rustc_attrs)]
+#![feature(rustc_const_unstable)]
 #![feature(std_internals)]
 #![feature(stdsimd)]
 #![feature(shrink_to)]
-#![feature(slice_bytes)]
 #![feature(slice_concat_ext)]
 #![feature(slice_internals)]
 #![feature(slice_patterns)]
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
-#![feature(str_char)]
 #![feature(str_internals)]
-#![feature(str_utf16)]
-#![feature(test, rustc_private)]
+#![feature(rustc_private)]
 #![feature(thread_local)]
 #![feature(toowned_clone_into)]
 #![feature(try_from)]
@@ -313,13 +302,17 @@
 #![feature(unboxed_closures)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
-#![feature(vec_push_all)]
+#![cfg_attr(stage0, feature(use_extern_macros))]
 #![feature(doc_cfg)]
 #![feature(doc_masked)]
 #![feature(doc_spotlight)]
-#![cfg_attr(test, feature(update_panic_count))]
 #![cfg_attr(windows, feature(used))]
 #![feature(doc_alias)]
+#![feature(doc_keyword)]
+#![feature(panic_info_message)]
+#![cfg_attr(stage0, feature(panic_implementation))]
+#![cfg_attr(not(stage0), feature(panic_handler))]
+#![feature(non_exhaustive)]
 
 #![default_lib_allocator]
 
@@ -329,11 +322,8 @@
 // `force_alloc_system` is *only* intended as a workaround for local rebuilds
 // with a rustc without jemalloc.
 // FIXME(#44236) shouldn't need MSVC logic
-#![cfg_attr(all(not(target_env = "msvc"),
-                any(stage0, feature = "force_alloc_system")),
-            feature(global_allocator))]
 #[cfg(all(not(target_env = "msvc"),
-          any(stage0, feature = "force_alloc_system")))]
+          any(all(stage0, not(test)), feature = "force_alloc_system")))]
 #[global_allocator]
 static ALLOC: alloc_system::System = alloc_system::System;
 
@@ -347,15 +337,14 @@ use prelude::v1::*;
 #[cfg(test)] extern crate test;
 #[cfg(test)] extern crate rand;
 
-// We want to re-export a few macros from core but libcore has already been
-// imported by the compiler (via our #[no_std] attribute) In this case we just
-// add a new crate name so we can attach the re-exports to it.
-#[macro_reexport(assert_eq, assert_ne, debug_assert, debug_assert_eq,
-                 debug_assert_ne, unreachable, unimplemented, write, writeln, try)]
-extern crate core as __core;
+// Re-export a few macros from core
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use core::{assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne};
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use core::{unreachable, unimplemented, write, writeln, try};
 
+#[allow(unused_imports)] // macros from `alloc` are not used on all platforms
 #[macro_use]
-#[macro_reexport(vec, format)]
 extern crate alloc as alloc_crate;
 extern crate alloc_system;
 #[doc(masked)]
@@ -365,11 +354,6 @@ extern crate libc;
 #[doc(masked)]
 #[allow(unused_extern_crates)]
 extern crate unwind;
-
-// compiler-rt intrinsics
-#[doc(masked)]
-#[cfg(stage0)]
-extern crate compiler_builtins;
 
 // During testing, this crate is not actually the "real" std library, but rather
 // it links to the real std library, which was compiled from this same source
@@ -450,6 +434,10 @@ pub use alloc_crate::borrow;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use alloc_crate::fmt;
 #[stable(feature = "rust1", since = "1.0.0")]
+pub use alloc_crate::format;
+#[unstable(feature = "pin", issue = "49150")]
+pub use alloc_crate::pin;
+#[stable(feature = "rust1", since = "1.0.0")]
 pub use alloc_crate::slice;
 #[stable(feature = "rust1", since = "1.0.0")]
 pub use alloc_crate::str;
@@ -461,6 +449,8 @@ pub use alloc_crate::vec;
 pub use core::char;
 #[stable(feature = "i128", since = "1.26.0")]
 pub use core::u128;
+#[stable(feature = "core_hint", since = "1.27.0")]
+pub use core::hint;
 
 pub mod f32;
 pub mod f64;
@@ -482,19 +472,29 @@ pub mod path;
 pub mod process;
 pub mod sync;
 pub mod time;
-pub mod alloc;
 
-#[unstable(feature = "allocator_api", issue = "32838")]
-#[rustc_deprecated(since = "1.27.0", reason = "module renamed to `alloc`")]
-/// Use the `alloc` module instead.
-pub mod heap {
-    pub use alloc::*;
+#[unstable(feature = "futures_api",
+           reason = "futures in libcore are unstable",
+           issue = "50547")]
+pub mod task {
+    //! Types and Traits for working with asynchronous tasks.
+    #[doc(inline)]
+    pub use core::task::*;
+    #[doc(inline)]
+    pub use alloc_crate::task::*;
 }
+
+#[unstable(feature = "futures_api",
+           reason = "futures in libcore are unstable",
+           issue = "50547")]
+pub mod future;
 
 // Platform-abstraction modules
 #[macro_use]
 mod sys_common;
 mod sys;
+
+pub mod alloc;
 
 // Private support modules
 mod panicking;
@@ -523,12 +523,8 @@ mod stdsimd;
 #[cfg(not(stage0))]
 mod coresimd {
     pub use core::arch;
-    pub use core::simd;
 }
 
-#[unstable(feature = "stdsimd", issue = "48556")]
-#[cfg(all(not(stage0), not(test)))]
-pub use stdsimd::simd;
 #[stable(feature = "simd_arch", since = "1.27.0")]
 #[cfg(all(not(stage0), not(test)))]
 pub use stdsimd::arch;
@@ -537,3 +533,8 @@ pub use stdsimd::arch;
 // the rustdoc documentation for primitive types. Using `include!`
 // because rustdoc only looks for these modules at the crate level.
 include!("primitive_docs.rs");
+
+// Include a number of private modules that exist solely to provide
+// the rustdoc documentation for the existing keywords. Using `include!`
+// because rustdoc only looks for these modules at the crate level.
+include!("keyword_docs.rs");

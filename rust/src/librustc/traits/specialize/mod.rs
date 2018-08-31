@@ -17,7 +17,7 @@
 //! See the [rustc guide] for a bit more detail on how specialization
 //! fits together with the rest of the trait machinery.
 //!
-//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/trait-specialization.html
+//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/traits/specialization.html
 
 use super::{SelectionContext, FulfillmentContext};
 use super::util::impl_trait_ref_and_oblig;
@@ -90,7 +90,7 @@ pub fn translate_substs<'a, 'gcx, 'tcx>(infcx: &InferCtxt<'a, 'gcx, 'tcx>,
                                 .unwrap()
                                 .subst(infcx.tcx, &source_substs);
 
-    // translate the Self and TyParam parts of the substitution, since those
+    // translate the Self and Param parts of the substitution, since those
     // vary across impls
     let target_substs = match target_node {
         specialization_graph::Node::Impl(target_impl) => {
@@ -129,7 +129,7 @@ pub fn find_associated_item<'a, 'tcx>(
     let trait_def = tcx.trait_def(trait_def_id);
 
     let ancestors = trait_def.ancestors(tcx, impl_data.impl_def_id);
-    match ancestors.defs(tcx, item.name, item.kind, trait_def_id).next() {
+    match ancestors.defs(tcx, item.ident, item.kind, trait_def_id).next() {
         Some(node_item) => {
             let substs = tcx.infer_ctxt().enter(|infcx| {
                 let param_env = ty::ParamEnv::reveal_all();
@@ -196,6 +196,7 @@ pub(super) fn specializes<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         // that this always succeeds.
         let impl1_trait_ref =
             match traits::fully_normalize(&infcx,
+                                          FulfillmentContext::new(),
                                           ObligationCause::dummy(),
                                           penv,
                                           &impl1_trait_ref) {
@@ -343,7 +344,7 @@ pub(super) fn specialization_graph_provider<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
                         }),
                     if used_to_be_allowed { " (E0119)" } else { "" }
                 );
-                let impl_span = tcx.sess.codemap().def_span(
+                let impl_span = tcx.sess.source_map().def_span(
                     tcx.span_of_impl(impl_def_id).unwrap()
                 );
                 let mut err = if used_to_be_allowed {
@@ -362,8 +363,8 @@ pub(super) fn specialization_graph_provider<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx
 
                 match tcx.span_of_impl(overlap.with_impl) {
                     Ok(span) => {
-                        err.span_label(tcx.sess.codemap().def_span(span),
-                                       format!("first implementation here"));
+                        err.span_label(tcx.sess.source_map().def_span(span),
+                                       "first implementation here".to_string());
                         err.span_label(impl_span,
                                        format!("conflicting implementation{}",
                                                 overlap.self_desc
@@ -437,9 +438,9 @@ fn to_pretty_impl_header(tcx: TyCtxt, impl_def_id: DefId) -> Option<String> {
         }
         pretty_predicates.push(p.to_string());
     }
-    for ty in types_without_default_bounds {
-        pretty_predicates.push(format!("{}: ?Sized", ty));
-    }
+    pretty_predicates.extend(
+        types_without_default_bounds.iter().map(|ty| format!("{}: ?Sized", ty))
+    );
     if !pretty_predicates.is_empty() {
         write!(w, "\n  where {}", pretty_predicates.join(", ")).unwrap();
     }

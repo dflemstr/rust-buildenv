@@ -24,13 +24,16 @@ if [ "$NO_CHANGE_USER" = "" ]; then
   fi
 fi
 
+# only enable core dump on Linux
+if [ -f /proc/sys/kernel/core_pattern ]; then
+  ulimit -c unlimited
+fi
+
 ci_dir=`cd $(dirname $0) && pwd`
 source "$ci_dir/shared.sh"
 
-if [ "$TRAVIS" == "true" ] && [ "$TRAVIS_BRANCH" != "auto" ]; then
-    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-quiet-tests"
-else
-    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.print-step-timings"
+if [ "$TRAVIS" != "true" ] || [ "$TRAVIS_BRANCH" == "auto" ]; then
+    RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --set build.print-step-timings --enable-verbose-tests"
 fi
 
 RUST_CONFIGURE_ARGS="$RUST_CONFIGURE_ARGS --enable-sccache"
@@ -78,9 +81,9 @@ fi
 # sccache server at the start of the build, but no need to worry if this fails.
 SCCACHE_IDLE_TIMEOUT=10800 sccache --start-server || true
 
-if [ "$PARALLEL_CHECK" != "" ]; then
+if [ "$RUN_CHECK_WITH_PARALLEL_QUERIES" != "" ]; then
   $SRC/configure --enable-experimental-parallel-queries
-  python2.7 ../x.py check
+  CARGO_INCREMENTAL=0 python2.7 ../x.py check
   rm -f config.toml
   rm -rf build
 fi

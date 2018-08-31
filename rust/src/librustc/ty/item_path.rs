@@ -14,7 +14,7 @@ use ty::{self, Ty, TyCtxt};
 use middle::cstore::{ExternCrate, ExternCrateSource};
 use syntax::ast;
 use syntax::symbol::Symbol;
-use syntax::symbol::InternedString;
+use syntax::symbol::LocalInternedString;
 
 use std::cell::Cell;
 
@@ -131,7 +131,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     {
         let visible_parent_map = self.visible_parent_map(LOCAL_CRATE);
 
-        let (mut cur_def, mut cur_path) = (external_def_id, Vec::<InternedString>::new());
+        let (mut cur_def, mut cur_path) = (external_def_id, Vec::<LocalInternedString>::new());
         loop {
             // If `cur_def` is a direct or injected extern crate, push the path to the crate
             // followed by the path to the item within the crate and return.
@@ -168,8 +168,13 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             }
 
             let data = cur_def_key.disambiguated_data.data;
-            let symbol =
-                data.get_opt_name().unwrap_or_else(|| Symbol::intern("<unnamed>").as_str());
+            let symbol = data.get_opt_name().map(|n| n.as_str()).unwrap_or_else(|| {
+                if let DefPathData::CrateRoot = data {  // reexported `extern crate` (#43189)
+                    self.original_crate_name(cur_def.krate).as_str()
+                } else {
+                    Symbol::intern("<unnamed>").as_str()
+                }
+            });
             cur_path.push(symbol);
 
             match visible_parent_map.get(&cur_def) {
@@ -204,21 +209,24 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             // finer-grained distinctions, e.g. between enum/struct).
             data @ DefPathData::Misc |
             data @ DefPathData::TypeNs(..) |
+            data @ DefPathData::Trait(..) |
+            data @ DefPathData::AssocTypeInTrait(..) |
+            data @ DefPathData::AssocTypeInImpl(..) |
+            data @ DefPathData::AssocExistentialInImpl(..) |
             data @ DefPathData::ValueNs(..) |
             data @ DefPathData::Module(..) |
             data @ DefPathData::TypeParam(..) |
-            data @ DefPathData::LifetimeDef(..) |
+            data @ DefPathData::LifetimeParam(..) |
             data @ DefPathData::EnumVariant(..) |
             data @ DefPathData::Field(..) |
-            data @ DefPathData::Initializer |
+            data @ DefPathData::AnonConst |
             data @ DefPathData::MacroDef(..) |
             data @ DefPathData::ClosureExpr |
             data @ DefPathData::ImplTrait |
-            data @ DefPathData::Typeof |
             data @ DefPathData::GlobalMetaData(..) => {
                 let parent_def_id = self.parent_def_id(def_id).unwrap();
                 self.push_item_path(buffer, parent_def_id);
-                buffer.push(&data.as_interned_str());
+                buffer.push(&data.as_interned_str().as_symbol().as_str());
             }
             DefPathData::StructCtor => { // present `X` instead of `X::{{constructor}}`
                 let parent_def_id = self.parent_def_id(def_id).unwrap();
@@ -291,7 +299,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         // impl on `Foo`, but fallback to `<Foo>::bar` if self-type is
         // anything other than a simple path.
         match self_ty.sty {
-            ty::TyAdt(adt_def, substs) => {
+            ty::Adt(adt_def, substs) => {
                 if substs.types().next().is_none() { // ignore regions
                     self.push_item_path(buffer, adt_def.did);
                 } else {
@@ -299,15 +307,15 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
                 }
             }
 
-            ty::TyForeign(did) => self.push_item_path(buffer, did),
+            ty::Foreign(did) => self.push_item_path(buffer, did),
 
-            ty::TyBool |
-            ty::TyChar |
-            ty::TyInt(_) |
-            ty::TyUint(_) |
-            ty::TyFloat(_) |
-            ty::TyStr => {
-                buffer.push(&format!("{}", self_ty));
+            ty::Bool |
+            ty::Char |
+            ty::Int(_) |
+            ty::Uint(_) |
+            ty::Float(_) |
+            ty::Str => {
+                buffer.push(&self_ty.to_string());
             }
 
             _ => {
@@ -328,7 +336,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
         self.push_item_path(buffer, parent_def_id);
         let node_id = self.hir.as_local_node_id(impl_def_id).unwrap();
         let item = self.hir.expect_item(node_id);
-        let span_str = self.sess.codemap().span_to_string(item.span);
+        let span_str = self.sess.source_map().span_to_string(item.span);
         buffer.push(&format!("<impl at {}>", span_str));
     }
 
@@ -349,39 +357,40 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
 /// decisions and we may want to adjust it later.
 pub fn characteristic_def_id_of_type(ty: Ty) -> Option<DefId> {
     match ty.sty {
-        ty::TyAdt(adt_def, _) => Some(adt_def.did),
+        ty::Adt(adt_def, _) => Some(adt_def.did),
 
-        ty::TyDynamic(data, ..) => data.principal().map(|p| p.def_id()),
+        ty::Dynamic(data, ..) => data.principal().map(|p| p.def_id()),
 
-        ty::TyArray(subty, _) |
-        ty::TySlice(subty) => characteristic_def_id_of_type(subty),
+        ty::Array(subty, _) |
+        ty::Slice(subty) => characteristic_def_id_of_type(subty),
 
-        ty::TyRawPtr(mt) |
-        ty::TyRef(_, mt) => characteristic_def_id_of_type(mt.ty),
+        ty::RawPtr(mt) => characteristic_def_id_of_type(mt.ty),
 
-        ty::TyTuple(ref tys) => tys.iter()
+        ty::Ref(_, ty, _) => characteristic_def_id_of_type(ty),
+
+        ty::Tuple(ref tys) => tys.iter()
                                    .filter_map(|ty| characteristic_def_id_of_type(ty))
                                    .next(),
 
-        ty::TyFnDef(def_id, _) |
-        ty::TyClosure(def_id, _) |
-        ty::TyGenerator(def_id, _, _) |
-        ty::TyForeign(def_id) => Some(def_id),
+        ty::FnDef(def_id, _) |
+        ty::Closure(def_id, _) |
+        ty::Generator(def_id, _, _) |
+        ty::Foreign(def_id) => Some(def_id),
 
-        ty::TyBool |
-        ty::TyChar |
-        ty::TyInt(_) |
-        ty::TyUint(_) |
-        ty::TyStr |
-        ty::TyFnPtr(_) |
-        ty::TyProjection(_) |
-        ty::TyParam(_) |
-        ty::TyAnon(..) |
-        ty::TyInfer(_) |
-        ty::TyError |
-        ty::TyGeneratorWitness(..) |
-        ty::TyNever |
-        ty::TyFloat(_) => None,
+        ty::Bool |
+        ty::Char |
+        ty::Int(_) |
+        ty::Uint(_) |
+        ty::Str |
+        ty::FnPtr(_) |
+        ty::Projection(_) |
+        ty::Param(_) |
+        ty::Anon(..) |
+        ty::Infer(_) |
+        ty::Error |
+        ty::GeneratorWitness(..) |
+        ty::Never |
+        ty::Float(_) => None,
     }
 }
 

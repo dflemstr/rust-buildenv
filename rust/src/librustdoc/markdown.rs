@@ -12,20 +12,22 @@ use std::default::Default;
 use std::fs::File;
 use std::io::prelude::*;
 use std::path::{PathBuf, Path};
+use std::cell::RefCell;
 
+use errors;
 use getopts;
 use testing;
 use rustc::session::search_paths::SearchPaths;
 use rustc::session::config::{Externs, CodegenOptions};
-use syntax::codemap::DUMMY_SP;
+use syntax::source_map::DUMMY_SP;
+use syntax::feature_gate::UnstableFeatures;
 use syntax::edition::Edition;
 
 use externalfiles::{ExternalHtml, LoadStringError, load_string};
 
-use html::render::reset_ids;
 use html::escape::Escape;
 use html::markdown;
-use html::markdown::{Markdown, MarkdownWithToc, find_testable_code};
+use html::markdown::{ErrorCodes, IdMap, Markdown, MarkdownWithToc, find_testable_code};
 use test::{TestOptions, Collector};
 
 /// Separate any lines at the start of the file that begin with `# ` or `%`.
@@ -50,7 +52,7 @@ fn extract_leading_metadata<'a>(s: &'a str) -> (Vec<&'a str>, &'a str) {
 /// Render `input` (e.g. "foo.md") into an HTML file in `output`
 /// (e.g. output = "bar" => "bar/foo.html").
 pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
-              external_html: &ExternalHtml, include_toc: bool) -> isize {
+              external_html: &ExternalHtml, include_toc: bool, diag: &errors::Handler) -> isize {
     output.push(input.file_stem().unwrap());
     output.set_extension("html");
 
@@ -60,7 +62,7 @@ pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
         css.push_str(&s)
     }
 
-    let input_str = match load_string(input) {
+    let input_str = match load_string(input, diag) {
         Ok(s) => s,
         Err(LoadStringError::ReadFail) => return 1,
         Err(LoadStringError::BadUtf8) => return 2,
@@ -72,7 +74,7 @@ pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
 
     let mut out = match File::create(&output) {
         Err(e) => {
-            eprintln!("rustdoc: {}: {}", output.display(), e);
+            diag.struct_err(&format!("{}: {}", output.display(), e)).emit();
             return 4;
         }
         Ok(f) => f
@@ -80,17 +82,17 @@ pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
 
     let (metadata, text) = extract_leading_metadata(&input_str);
     if metadata.is_empty() {
-        eprintln!("rustdoc: invalid markdown file: no initial lines starting with `# ` or `%`");
+        diag.struct_err("invalid markdown file: no initial lines starting with `# ` or `%`").emit();
         return 5;
     }
     let title = metadata[0];
 
-    reset_ids(false);
-
+    let mut ids = IdMap::new();
+    let error_codes = ErrorCodes::from(UnstableFeatures::from_environment().is_nightly_build());
     let text = if include_toc {
-        format!("{}", MarkdownWithToc(text))
+        MarkdownWithToc(text, RefCell::new(&mut ids), error_codes).to_string()
     } else {
-        format!("{}", Markdown(text, &[]))
+        Markdown(text, &[], RefCell::new(&mut ids), error_codes).to_string()
     };
 
     let err = write!(
@@ -130,7 +132,7 @@ pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
 
     match err {
         Err(e) => {
-            eprintln!("rustdoc: cannot write to `{}`: {}", output.display(), e);
+            diag.struct_err(&format!("cannot write to `{}`: {}", output.display(), e)).emit();
             6
         }
         Ok(_) => 0,
@@ -141,8 +143,8 @@ pub fn render(input: &Path, mut output: PathBuf, matches: &getopts::Matches,
 pub fn test(input: &str, cfgs: Vec<String>, libs: SearchPaths, externs: Externs,
             mut test_args: Vec<String>, maybe_sysroot: Option<PathBuf>,
             display_warnings: bool, linker: Option<PathBuf>, edition: Edition,
-            cg: CodegenOptions) -> isize {
-    let input_str = match load_string(input) {
+            cg: CodegenOptions, diag: &errors::Handler) -> isize {
+    let input_str = match load_string(input, diag) {
         Ok(s) => s,
         Err(LoadStringError::ReadFail) => return 1,
         Err(LoadStringError::BadUtf8) => return 2,
@@ -155,7 +157,12 @@ pub fn test(input: &str, cfgs: Vec<String>, libs: SearchPaths, externs: Externs,
                                        true, opts, maybe_sysroot, None,
                                        Some(PathBuf::from(input)),
                                        linker, edition);
-    find_testable_code(&input_str, &mut collector, DUMMY_SP, None);
+    collector.set_position(DUMMY_SP);
+    let codes = ErrorCodes::from(UnstableFeatures::from_environment().is_nightly_build());
+    let res = find_testable_code(&input_str, &mut collector, codes);
+    if let Err(err) = res {
+        diag.span_warn(DUMMY_SP, &err.to_string());
+    }
     test_args.insert(0, "rustdoctest".to_string());
     testing::test_main(&test_args, collector.tests,
                        testing::Options::new().display_output(display_warnings));
