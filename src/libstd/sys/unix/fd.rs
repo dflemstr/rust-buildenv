@@ -11,7 +11,7 @@
 #![unstable(reason = "not public", issue = "0", feature = "fd")]
 
 use cmp;
-use io::{self, Read};
+use io::{self, Read, Initializer};
 use libc::{self, c_int, c_void, ssize_t};
 use mem;
 use sync::atomic::{AtomicBool, Ordering};
@@ -41,12 +41,12 @@ fn max_len() -> usize {
 
 impl FileDesc {
     pub fn new(fd: c_int) -> FileDesc {
-        FileDesc { fd: fd }
+        FileDesc { fd }
     }
 
     pub fn raw(&self) -> c_int { self.fd }
 
-    /// Extracts the actual filedescriptor without closing it.
+    /// Extracts the actual file descriptor without closing it.
     pub fn into_raw(self) -> c_int {
         let fd = self.fd;
         mem::forget(self);
@@ -269,6 +269,11 @@ impl FileDesc {
 impl<'a> Read for &'a FileDesc {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         (**self).read(buf)
+    }
+
+    #[inline]
+    unsafe fn initializer(&self) -> Initializer {
+        Initializer::nop()
     }
 }
 

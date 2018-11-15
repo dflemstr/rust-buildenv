@@ -27,6 +27,7 @@ use rustc::mir::{self, interpret};
 use rustc::traits::specialization_graph;
 use rustc::ty::{self, Ty, TyCtxt, ReprOptions, SymbolName};
 use rustc::ty::codec::{self as ty_codec, TyEncoder};
+use rustc::ty::layout::VariantIdx;
 
 use rustc::session::config::{self, CrateType};
 use rustc::util::nodemap::FxHashMap;
@@ -75,7 +76,7 @@ macro_rules! encoder_methods {
 impl<'a, 'tcx> Encoder for EncodeContext<'a, 'tcx> {
     type Error = <opaque::Encoder as Encoder>::Error;
 
-    fn emit_nil(&mut self) -> Result<(), Self::Error> {
+    fn emit_unit(&mut self) -> Result<(), Self::Error> {
         Ok(())
     }
 
@@ -323,7 +324,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         index.record(DefId::local(CRATE_DEF_INDEX),
                      IsolatedEncoder::encode_info_for_mod,
                      FromId(CRATE_NODE_ID, (&krate.module, &krate.attrs, &vis)));
-        let mut visitor = EncodeVisitor { index: index };
+        let mut visitor = EncodeVisitor { index };
         krate.visit_all_item_likes(&mut visitor.as_deep_visitor());
         for macro_def in &krate.exported_macros {
             visitor.visit_macro_def(macro_def);
@@ -340,7 +341,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let source_map = self.tcx.sess.source_map();
         let all_source_files = source_map.files();
 
-        let (working_dir, working_dir_was_remapped) = self.tcx.sess.working_dir.clone();
+        let (working_dir, _cwd_remapped) = self.tcx.sess.working_dir.clone();
 
         let adapted = all_source_files.iter()
             .filter(|source_file| {
@@ -349,32 +350,26 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
                 !source_file.is_imported()
             })
             .map(|source_file| {
-                // When exporting SourceFiles, we expand all paths to absolute
-                // paths because any relative paths are potentially relative to
-                // a wrong directory.
-                // However, if a path has been modified via
-                // `--remap-path-prefix` we assume the user has already set
-                // things up the way they want and don't touch the path values
-                // anymore.
                 match source_file.name {
+                    // This path of this SourceFile has been modified by
+                    // path-remapping, so we use it verbatim (and avoid
+                    // cloning the whole map in the process).
+                    _  if source_file.name_was_remapped => source_file.clone(),
+
+                    // Otherwise expand all paths to absolute paths because
+                    // any relative paths are potentially relative to a
+                    // wrong directory.
                     FileName::Real(ref name) => {
-                        if source_file.name_was_remapped ||
-                        (name.is_relative() && working_dir_was_remapped) {
-                            // This path of this SourceFile has been modified by
-                            // path-remapping, so we use it verbatim (and avoid cloning
-                            // the whole map in the process).
-                            source_file.clone()
-                        } else {
-                            let mut adapted = (**source_file).clone();
-                            adapted.name = Path::new(&working_dir).join(name).into();
-                            adapted.name_hash = {
-                                let mut hasher: StableHasher<u128> = StableHasher::new();
-                                adapted.name.hash(&mut hasher);
-                                hasher.finish()
-                            };
-                            Lrc::new(adapted)
-                        }
+                        let mut adapted = (**source_file).clone();
+                        adapted.name = Path::new(&working_dir).join(name).into();
+                        adapted.name_hash = {
+                            let mut hasher: StableHasher<u128> = StableHasher::new();
+                            adapted.name.hash(&mut hasher);
+                            hasher.finish()
+                        };
+                        Lrc::new(adapted)
                     },
+
                     // expanded code, not from a file
                     _ => source_file.clone(),
                 }
@@ -484,6 +479,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
         let is_proc_macro = tcx.sess.crate_types.borrow().contains(&CrateType::ProcMacro);
         let has_default_lib_allocator = attr::contains_name(&attrs, "default_lib_allocator");
         let has_global_allocator = *tcx.sess.has_global_allocator.get();
+        let has_panic_handler = *tcx.sess.has_panic_handler.try_get().unwrap_or(&false);
 
         let root = self.lazy(&CrateRoot {
             name: tcx.crate_name(LOCAL_CRATE),
@@ -494,6 +490,7 @@ impl<'a, 'tcx> EncodeContext<'a, 'tcx> {
             panic_strategy: tcx.sess.panic_strategy(),
             edition: hygiene::default_edition(),
             has_global_allocator: has_global_allocator,
+            has_panic_handler: has_panic_handler,
             has_default_lib_allocator: has_default_lib_allocator,
             plugin_registrar_fn: tcx.sess
                 .plugin_registrar_fn
@@ -584,7 +581,7 @@ impl<'a, 'b: 'a, 'tcx: 'b> IsolatedEncoder<'a, 'b, 'tcx> {
     /// the right to access any information in the adt-def (including,
     /// e.g., the length of the various vectors).
     fn encode_enum_variant_info(&mut self,
-                                (enum_did, Untracked(index)): (DefId, Untracked<usize>))
+                                (enum_did, Untracked(index)): (DefId, Untracked<VariantIdx>))
                                 -> Entry<'tcx> {
         let tcx = self.tcx;
         let def = tcx.adt_def(enum_did);
@@ -679,7 +676,7 @@ impl<'a, 'b: 'a, 'tcx: 'b> IsolatedEncoder<'a, 'b, 'tcx> {
     /// vectors).
     fn encode_field(&mut self,
                     (adt_def_id, Untracked((variant_index, field_index))): (DefId,
-                                                                            Untracked<(usize,
+                                                                            Untracked<(VariantIdx,
                                                                                        usize)>))
                     -> Entry<'tcx> {
         let tcx = self.tcx;
@@ -740,7 +737,9 @@ impl<'a, 'b: 'a, 'tcx: 'b> IsolatedEncoder<'a, 'b, 'tcx> {
 
         // If the structure is marked as non_exhaustive then lower the visibility
         // to within the crate.
-        if adt_def.is_non_exhaustive() && ctor_vis == ty::Visibility::Public {
+        if adt_def.non_enum_variant().is_field_list_non_exhaustive() &&
+            ctor_vis == ty::Visibility::Public
+        {
             ctor_vis = ty::Visibility::Restricted(DefId::local(CRATE_DEF_INDEX));
         }
 
@@ -1148,6 +1147,7 @@ impl<'a, 'b: 'a, 'tcx: 'b> IsolatedEncoder<'a, 'b, 'tcx> {
                     unsafety: trait_def.unsafety,
                     paren_sugar: trait_def.paren_sugar,
                     has_auto_impl: tcx.trait_is_auto(def_id),
+                    is_marker: trait_def.is_marker,
                     super_predicates: self.lazy(&tcx.super_predicates_of(def_id)),
                 };
 
@@ -1489,7 +1489,7 @@ impl<'a, 'b: 'a, 'tcx: 'b> IsolatedEncoder<'a, 'b, 'tcx> {
         let tcx = self.tcx;
         let mut visitor = ImplVisitor {
             tcx,
-            impls: FxHashMap(),
+            impls: FxHashMap::default(),
         };
         tcx.hir.krate().visit_all_item_likes(&mut visitor);
 
@@ -1668,7 +1668,7 @@ impl<'a, 'b, 'tcx> Visitor<'tcx> for EncodeVisitor<'a, 'b, 'tcx> {
 impl<'a, 'b, 'tcx> IndexBuilder<'a, 'b, 'tcx> {
     fn encode_fields(&mut self, adt_def_id: DefId) {
         let def = self.tcx.adt_def(adt_def_id);
-        for (variant_index, variant) in def.variants.iter().enumerate() {
+        for (variant_index, variant) in def.variants.iter_enumerated() {
             for (field_index, field) in variant.fields.iter().enumerate() {
                 self.record(field.did,
                             IsolatedEncoder::encode_field,
@@ -1735,7 +1735,7 @@ impl<'a, 'b, 'tcx> IndexBuilder<'a, 'b, 'tcx> {
                 self.encode_fields(def_id);
 
                 let def = self.tcx.adt_def(def_id);
-                for (i, variant) in def.variants.iter().enumerate() {
+                for (i, variant) in def.variants.iter_enumerated() {
                     self.record(variant.did,
                                 IsolatedEncoder::encode_enum_variant_info,
                                 (def_id, Untracked(i)));

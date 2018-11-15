@@ -95,7 +95,6 @@ use rustc::hir;
 use rustc::hir::def_id::LOCAL_CRATE;
 use rustc::mir::*;
 use syntax_pos::{Span};
-use rustc_data_structures::indexed_vec::Idx;
 use rustc_data_structures::fx::FxHashMap;
 
 #[derive(Debug)]
@@ -359,7 +358,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
             needs_cleanup: false,
             drops: vec![],
             cached_generator_drop: None,
-            cached_exits: FxHashMap(),
+            cached_exits: Default::default(),
             cached_unwind: CachedBlock::default(),
         });
     }
@@ -454,7 +453,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         }
         let scope = &self.scopes[len - scope_count];
         self.cfg.terminate(block, scope.source_info(span),
-                           TerminatorKind::Goto { target: target });
+                           TerminatorKind::Goto { target });
     }
 
     /// Creates a path that performs all required cleanup for dropping a generator.
@@ -566,8 +565,8 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
         // The outermost scope (`scopes[0]`) will be the `CallSiteScope`.
         // We want `scopes[1]`, which is the `ParameterScope`.
         assert!(self.scopes.len() >= 2);
-        assert!(match self.scopes[1].region_scope.data() {
-            region::ScopeData::Arguments(_) => true,
+        assert!(match self.scopes[1].region_scope.data {
+            region::ScopeData::Arguments => true,
             _ => false,
         });
         self.scopes[1].region_scope
@@ -1020,7 +1019,7 @@ fn build_diverge_scope<'a, 'gcx, 'tcx>(tcx: TyCtxt<'a, 'gcx, 'tcx>,
         } else {
             let block = cfg.start_new_cleanup_block();
             cfg.push_end_region(tcx, block, source_info(span), scope.region_scope);
-            cfg.terminate(block, source_info(span), TerminatorKind::Goto { target: target });
+            cfg.terminate(block, source_info(span), TerminatorKind::Goto { target });
             *cached_block = Some(block);
             block
         }

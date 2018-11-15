@@ -9,6 +9,5 @@
 // except according to those terms.
 
 fn main() {
-    concat!(test!());
-    //~^ ERROR cannot find macro `test!` in this scope
+    concat!(test!()); //~ ERROR cannot find macro `test!` in this scope
 }

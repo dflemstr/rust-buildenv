@@ -237,6 +237,11 @@ pub enum DocTests {
     Only,
 }
 
+pub enum GitRepo {
+    Rustc,
+    Llvm,
+}
+
 /// Global configuration for the build system.
 ///
 /// This structure transitively contains all configuration for the build system.
@@ -272,10 +277,6 @@ pub struct Build {
     // Stage 0 (downloaded) compiler and cargo or their local rust equivalents.
     initial_rustc: PathBuf,
     initial_cargo: PathBuf,
-
-    // Probed tools at runtime
-    lldb_version: Option<String>,
-    lldb_python_dir: Option<String>,
 
     // Runtime state filled in later on
     // C/C++ compilers and archiver for all targets
@@ -347,6 +348,7 @@ pub enum Mode {
     /// Compile a tool which uses all libraries we compile (up to rustc).
     /// Doesn't use the stage0 compiler libraries like "other", and includes
     /// tools like rustdoc, cargo, rls, etc.
+    ToolTest,
     ToolStd,
     ToolRustc,
 }
@@ -410,8 +412,6 @@ impl Build {
             ar: HashMap::new(),
             ranlib: HashMap::new(),
             crates: HashMap::new(),
-            lldb_version: None,
-            lldb_python_dir: None,
             is_sudo,
             ci_env: CiEnv::current(),
             delayed_failures: RefCell::new(Vec::new()),
@@ -516,12 +516,6 @@ impl Build {
     fn std_features(&self) -> String {
         let mut features = "panic-unwind".to_string();
 
-        if self.config.debug_jemalloc {
-            features.push_str(" debug-jemalloc");
-        }
-        if self.config.use_jemalloc {
-            features.push_str(" jemalloc");
-        }
         if self.config.backtrace {
             features.push_str(" backtrace");
         }
@@ -537,8 +531,8 @@ impl Build {
     /// Get the space-separated set of activated features for the compiler.
     fn rustc_features(&self) -> String {
         let mut features = String::new();
-        if self.config.use_jemalloc {
-            features.push_str(" jemalloc");
+        if self.config.jemalloc {
+            features.push_str("jemalloc");
         }
         features
     }
@@ -567,6 +561,7 @@ impl Build {
             Mode::Codegen => "-codegen",
             Mode::ToolBootstrap => "-bootstrap-tools",
             Mode::ToolStd => "-tools",
+            Mode::ToolTest => "-tools",
             Mode::ToolRustc => "-tools",
         };
         self.out.join(&*compiler.host)
@@ -634,9 +629,28 @@ impl Build {
     /// Returns the path to `FileCheck` binary for the specified target
     fn llvm_filecheck(&self, target: Interned<String>) -> PathBuf {
         let target_config = self.config.target_config.get(&target);
-        if let Some(s) = target_config.and_then(|c| c.llvm_config.as_ref()) {
+        if let Some(s) = target_config.and_then(|c| c.llvm_filecheck.as_ref()) {
+            s.to_path_buf()
+        } else if let Some(s) = target_config.and_then(|c| c.llvm_config.as_ref()) {
             let llvm_bindir = output(Command::new(s).arg("--bindir"));
-            Path::new(llvm_bindir.trim()).join(exe("FileCheck", &*target))
+            let filecheck = Path::new(llvm_bindir.trim()).join(exe("FileCheck", &*target));
+            if filecheck.exists() {
+                filecheck
+            } else {
+                // On Fedora the system LLVM installs FileCheck in the
+                // llvm subdirectory of the libdir.
+                let llvm_libdir = output(Command::new(s).arg("--libdir"));
+                let lib_filecheck = Path::new(llvm_libdir.trim())
+                    .join("llvm").join(exe("FileCheck", &*target));
+                if lib_filecheck.exists() {
+                    lib_filecheck
+                } else {
+                    // Return the most normal file name, even though
+                    // it doesn't exist, so that any error message
+                    // refers to that.
+                    filecheck
+                }
+            }
         } else {
             let base = self.llvm_out(self.config.build).join("build");
             let base = if !self.config.ninja && self.config.build.contains("msvc") {
@@ -738,6 +752,21 @@ impl Build {
         self.config.jobs.unwrap_or_else(|| num_cpus::get() as u32)
     }
 
+    fn debuginfo_map(&self, which: GitRepo) -> Option<String> {
+        if !self.config.rust_remap_debuginfo {
+            return None
+        }
+
+        let path = match which {
+            GitRepo::Rustc => {
+                let sha = self.rust_sha().unwrap_or(channel::CFG_RELEASE_NUM);
+                format!("/rustc/{}", sha)
+            }
+            GitRepo::Llvm => String::from("/rustc/llvm"),
+        };
+        Some(format!("{}={}", self.src.display(), path))
+    }
+
     /// Returns the path to the C compiler for the target specified.
     fn cc(&self, target: Interned<String>) -> &Path {
         self.cc[&target].path()
@@ -745,10 +774,10 @@ impl Build {
 
     /// Returns a list of flags to pass to the C compiler for the target
     /// specified.
-    fn cflags(&self, target: Interned<String>) -> Vec<String> {
+    fn cflags(&self, target: Interned<String>, which: GitRepo) -> Vec<String> {
         // Filter out -O and /O (the optimization flags) that we picked up from
         // cc-rs because the build scripts will determine that for themselves.
-        let mut base = self.cc[&target].args().iter()
+        let mut base: Vec<String> = self.cc[&target].args().iter()
                            .map(|s| s.to_string_lossy().into_owned())
                            .filter(|s| !s.starts_with("-O") && !s.starts_with("/O"))
                            .collect::<Vec<_>>();
@@ -756,7 +785,7 @@ impl Build {
         // If we're compiling on macOS then we add a few unconditional flags
         // indicating that we want libc++ (more filled out than libstdc++) and
         // we want to compile for 10.7. This way we can ensure that
-        // LLVM/jemalloc/etc are all properly compiled.
+        // LLVM/etc are all properly compiled.
         if target.contains("apple-darwin") {
             base.push("-stdlib=libc++".into());
         }
@@ -766,6 +795,16 @@ impl Build {
         // See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=78936
         if &*target == "i686-pc-windows-gnu" {
             base.push("-fno-omit-frame-pointer".into());
+        }
+
+        if let Some(map) = self.debuginfo_map(which) {
+        let cc = self.cc(target);
+            if cc.ends_with("clang") || cc.ends_with("gcc") {
+                base.push(format!("-fdebug-prefix-map={}", map));
+            } else if cc.ends_with("clang-cl.exe") {
+                base.push("-Xclang".into());
+                base.push(format!("-fdebug-prefix-map={}", map));
+            }
         }
         base
     }
@@ -798,7 +837,8 @@ impl Build {
         } else if target != self.config.build &&
                   !target.contains("msvc") &&
                   !target.contains("emscripten") &&
-                  !target.contains("wasm32") {
+                  !target.contains("wasm32") &&
+                  !target.contains("fuchsia") {
             Some(self.cc(target))
         } else {
             None
@@ -879,25 +919,6 @@ impl Build {
         !self.config.full_bootstrap &&
             compiler.stage >= 2 &&
             (self.hosts.iter().any(|h| *h == target) || target == self.build)
-    }
-
-    /// Returns the directory that OpenSSL artifacts are compiled into if
-    /// configured to do so.
-    fn openssl_dir(&self, target: Interned<String>) -> Option<PathBuf> {
-        // OpenSSL not used on Windows
-        if target.contains("windows") {
-            None
-        } else if self.config.openssl_static {
-            Some(self.out.join(&*target).join("openssl"))
-        } else {
-            None
-        }
-    }
-
-    /// Returns the directory that OpenSSL artifacts are installed into if
-    /// configured as such.
-    fn openssl_install_dir(&self, target: Interned<String>) -> Option<PathBuf> {
-        self.openssl_dir(target).map(|p| p.join("install"))
     }
 
     /// Given `num` in the form "a.b.c" return a "release string" which
@@ -1243,6 +1264,9 @@ impl Build {
         t!(fs::create_dir_all(dstdir));
         drop(fs::remove_file(&dst));
         {
+            if !src.exists() {
+                panic!("Error: File \"{}\" not found!", src.display());
+            }
             let mut s = t!(fs::File::open(&src));
             let mut d = t!(fs::File::create(&dst));
             io::copy(&mut s, &mut d).expect("failed to copy");

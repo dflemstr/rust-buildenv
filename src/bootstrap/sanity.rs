@@ -74,7 +74,7 @@ pub fn check(build: &mut Build) {
     // one is present as part of the PATH then that can lead to the system
     // being unable to identify the files properly. See
     // https://github.com/rust-lang/rust/issues/34959 for more details.
-    if cfg!(windows) && path.to_string_lossy().contains("\"") {
+    if cfg!(windows) && path.to_string_lossy().contains('\"') {
         panic!("PATH contains invalid character '\"'");
     }
 
@@ -152,12 +152,6 @@ pub fn check(build: &mut Build) {
         if !build.config.dry_run {
             cmd_finder.must_have(build.cxx(*host).unwrap());
         }
-
-        // The msvc hosts don't use jemalloc, turn it off globally to
-        // avoid packaging the dummy liballoc_jemalloc on that platform.
-        if host.contains("msvc") {
-            build.config.use_jemalloc = false;
-        }
     }
 
     // Externally configured LLVM requires FileCheck to exist
@@ -234,19 +228,6 @@ $ pacman -R cmake && pacman -S mingw-w64-x86_64-cmake
 ");
             }
         }
-    }
-
-    let run = |cmd: &mut Command| {
-        cmd.output().map(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                   .lines().next().unwrap_or_else(|| {
-                       panic!("{:?} failed {:?}", cmd, output)
-                   }).to_string()
-        })
-    };
-    build.lldb_version = run(Command::new("lldb").arg("--version")).ok();
-    if build.lldb_version.is_some() {
-        build.lldb_python_dir = run(Command::new("lldb").arg("-P")).ok();
     }
 
     if let Some(ref s) = build.config.ccache {

@@ -21,15 +21,12 @@
       html_root_url = "https://doc.rust-lang.org/nightly/")]
 
 #![feature(in_band_lifetimes)]
-#![feature(impl_header_lifetime_elision)]
 #![feature(unboxed_closures)]
 #![feature(fn_traits)]
 #![feature(unsize)]
 #![feature(specialization)]
 #![feature(optin_builtin_traits)]
-#![cfg_attr(stage0, feature(macro_vis_matcher))]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(allow_internal_unstable)]
 #![feature(vec_resize_with)]
 
@@ -51,7 +48,7 @@ extern crate rustc_rayon as rayon;
 extern crate rustc_rayon_core as rayon_core;
 extern crate rustc_hash;
 extern crate serialize;
-#[cfg_attr(test, macro_use)]
+extern crate graphviz;
 extern crate smallvec;
 
 // See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
@@ -60,23 +57,20 @@ extern crate rustc_cratesio_shim;
 
 pub use rustc_serialize::hex::ToHex;
 
+pub mod macros;
 pub mod svh;
-pub mod array_vec;
 pub mod base_n;
-pub mod bitslice;
-pub mod bitvec;
+pub mod bit_set;
 pub mod const_cstr;
 pub mod flock;
 pub mod fx;
 pub mod graph;
-pub mod indexed_set;
 pub mod indexed_vec;
 pub mod obligation_forest;
 pub mod owning_ref;
 pub mod ptr_key;
 pub mod sip128;
 pub mod small_c_str;
-pub mod small_vec;
 pub mod snapshot_map;
 pub use ena::snapshot_vec;
 pub mod sorted_map;

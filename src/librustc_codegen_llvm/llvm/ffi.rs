@@ -8,16 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-// FIXME: Rename 'DIGlobalVariable' to 'DIGlobalVariableExpression'
-// once support for LLVM 3.9 is dropped.
-//
-// This method was changed in this LLVM patch:
-// https://reviews.llvm.org/D26769
-
 use super::debuginfo::{
     DIBuilder, DIDescriptor, DIFile, DILexicalBlock, DISubprogram, DIType,
     DIBasicType, DIDerivedType, DICompositeType, DIScope, DIVariable,
-    DIGlobalVariable, DIArray, DISubrange, DITemplateTypeParameter, DIEnumerator,
+    DIGlobalVariableExpression, DIArray, DISubrange, DITemplateTypeParameter, DIEnumerator,
     DINameSpace, DIFlags,
 };
 
@@ -128,6 +122,7 @@ pub enum Attribute {
     SanitizeThread  = 20,
     SanitizeAddress = 21,
     SanitizeMemory  = 22,
+    NonLazyBind     = 23,
 }
 
 /// LLVMIntPredicate
@@ -363,6 +358,10 @@ extern { pub type ThinLTOData; }
 /// LLVMRustThinLTOBuffer
 extern { pub type ThinLTOBuffer; }
 
+// LLVMRustModuleNameCallback
+pub type ThinLTOModuleNameCallback =
+    unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char);
+
 /// LLVMRustThinLTOModule
 #[repr(C)]
 pub struct ThinLTOModule {
@@ -443,7 +442,7 @@ pub mod debuginfo {
     pub type DIDerivedType = DIType;
     pub type DICompositeType = DIDerivedType;
     pub type DIVariable = DIDescriptor;
-    pub type DIGlobalVariable = DIDescriptor;
+    pub type DIGlobalVariableExpression = DIDescriptor;
     pub type DIArray = DIDescriptor;
     pub type DISubrange = DIDescriptor;
     pub type DIEnumerator = DIDescriptor;
@@ -483,6 +482,8 @@ pub mod debuginfo {
 extern { pub type ModuleBuffer; }
 
 extern "C" {
+    pub fn LLVMRustInstallFatalErrorHandler();
+
     // Create and destroy contexts.
     pub fn LLVMRustContextCreate(shouldDiscardNames: bool) -> &'static mut Context;
     pub fn LLVMContextDispose(C: &'static mut Context);
@@ -997,6 +998,22 @@ extern "C" {
                              Bundle: Option<&OperandBundleDef<'a>>,
                              Name: *const c_char)
                              -> &'a Value;
+    pub fn LLVMRustBuildMemCpy(B: &Builder<'a>,
+                               Dst: &'a Value,
+                               DstAlign: c_uint,
+                               Src: &'a Value,
+                               SrcAlign: c_uint,
+                               Size: &'a Value,
+                               IsVolatile: bool)
+                               -> &'a Value;
+    pub fn LLVMRustBuildMemMove(B: &Builder<'a>,
+                                Dst: &'a Value,
+                                DstAlign: c_uint,
+                                Src: &'a Value,
+                                SrcAlign: c_uint,
+                                Size: &'a Value,
+                                IsVolatile: bool)
+                                -> &'a Value;
     pub fn LLVMBuildSelect(B: &Builder<'a>,
                            If: &'a Value,
                            Then: &'a Value,
@@ -1040,42 +1057,42 @@ extern "C" {
     pub fn LLVMRustBuildVectorReduceFAdd(B: &Builder<'a>,
                                          Acc: &'a Value,
                                          Src: &'a Value)
-                                         -> Option<&'a Value>;
+                                         -> &'a Value;
     pub fn LLVMRustBuildVectorReduceFMul(B: &Builder<'a>,
                                          Acc: &'a Value,
                                          Src: &'a Value)
-                                         -> Option<&'a Value>;
+                                         -> &'a Value;
     pub fn LLVMRustBuildVectorReduceAdd(B: &Builder<'a>,
                                         Src: &'a Value)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceMul(B: &Builder<'a>,
                                         Src: &'a Value)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceAnd(B: &Builder<'a>,
                                         Src: &'a Value)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceOr(B: &Builder<'a>,
                                        Src: &'a Value)
-                                       -> Option<&'a Value>;
+                                       -> &'a Value;
     pub fn LLVMRustBuildVectorReduceXor(B: &Builder<'a>,
                                         Src: &'a Value)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceMin(B: &Builder<'a>,
                                         Src: &'a Value,
                                         IsSigned: bool)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceMax(B: &Builder<'a>,
                                         Src: &'a Value,
                                         IsSigned: bool)
-                                        -> Option<&'a Value>;
+                                        -> &'a Value;
     pub fn LLVMRustBuildVectorReduceFMin(B: &Builder<'a>,
                                          Src: &'a Value,
                                          IsNaN: bool)
-                                         -> Option<&'a Value>;
+                                         -> &'a Value;
     pub fn LLVMRustBuildVectorReduceFMax(B: &Builder<'a>,
                                          Src: &'a Value,
                                          IsNaN: bool)
-                                         -> Option<&'a Value>;
+                                         -> &'a Value;
 
     pub fn LLVMRustBuildMinNum(
         B: &Builder<'a>,
@@ -1156,7 +1173,7 @@ extern "C" {
                                                         RunInliner: Bool);
     pub fn LLVMRustPassManagerBuilderPopulateThinLTOPassManager(
         PMB: &PassManagerBuilder,
-        PM: &PassManager) -> bool;
+        PM: &PassManager);
 
     // Stuff that's in rustllvm/ because it's not upstream yet.
 
@@ -1210,6 +1227,9 @@ extern "C" {
                              AlignStack: Bool,
                              Dialect: AsmDialect)
                              -> &Value;
+    pub fn LLVMRustInlineAsmVerify(Ty: &Type,
+                                   Constraints: *const c_char)
+                                   -> bool;
 
     pub fn LLVMRustDebugMetadataVersion() -> u32;
     pub fn LLVMRustVersionMajor() -> u32;
@@ -1303,6 +1323,19 @@ extern "C" {
                                              Ty: &'a DIType)
                                              -> &'a DIDerivedType;
 
+    pub fn LLVMRustDIBuilderCreateVariantMemberType(Builder: &DIBuilder<'a>,
+                                                    Scope: &'a DIScope,
+                                                    Name: *const c_char,
+                                                    File: &'a DIFile,
+                                                    LineNumber: c_uint,
+                                                    SizeInBits: u64,
+                                                    AlignInBits: u32,
+                                                    OffsetInBits: u64,
+                                                    Discriminant: Option<&'a Value>,
+                                                    Flags: DIFlags,
+                                                    Ty: &'a DIType)
+                                                    -> &'a DIType;
+
     pub fn LLVMRustDIBuilderCreateLexicalBlock(Builder: &DIBuilder<'a>,
                                                Scope: &'a DIScope,
                                                File: &'a DIFile,
@@ -1326,7 +1359,7 @@ extern "C" {
                                                  Val: &'a Value,
                                                  Decl: Option<&'a DIDescriptor>,
                                                  AlignInBits: u32)
-                                                 -> &'a DIGlobalVariable;
+                                                 -> &'a DIGlobalVariableExpression;
 
     pub fn LLVMRustDIBuilderCreateVariable(Builder: &DIBuilder<'a>,
                                            Tag: c_uint,
@@ -1380,7 +1413,8 @@ extern "C" {
                                                   SizeInBits: u64,
                                                   AlignInBits: u32,
                                                   Elements: &'a DIArray,
-                                                  ClassType: &'a DIType)
+                                                  ClassType: &'a DIType,
+                                                  IsFixed: bool)
                                                   -> &'a DIType;
 
     pub fn LLVMRustDIBuilderCreateUnionType(Builder: &DIBuilder<'a>,
@@ -1395,6 +1429,19 @@ extern "C" {
                                             RunTimeLang: c_uint,
                                             UniqueId: *const c_char)
                                             -> &'a DIType;
+
+    pub fn LLVMRustDIBuilderCreateVariantPart(Builder: &DIBuilder<'a>,
+                                              Scope: &'a DIScope,
+                                              Name: *const c_char,
+                                              File: &'a DIFile,
+                                              LineNo: c_uint,
+                                              SizeInBits: u64,
+                                              AlignInBits: u32,
+                                              Flags: DIFlags,
+                                              Discriminator: Option<&'a DIDerivedType>,
+                                              Elements: &'a DIArray,
+                                              UniqueId: *const c_char)
+                                              -> &'a DIDerivedType;
 
     pub fn LLVMSetUnnamedAddr(GlobalVar: &Value, UnnamedAddr: Bool);
 
@@ -1462,7 +1509,8 @@ extern "C" {
                                        DataSections: bool,
                                        TrapUnreachable: bool,
                                        Singlethread: bool,
-                                       AsmComments: bool)
+                                       AsmComments: bool,
+                                       EmitStackSizeSection: bool)
                                        -> Option<&'static mut TargetMachine>;
     pub fn LLVMRustDisposeTargetMachine(T: &'static mut TargetMachine);
     pub fn LLVMRustAddAnalysisPasses(T: &'a TargetMachine, PM: &PassManager<'a>, M: &'a Module);
@@ -1594,8 +1642,6 @@ extern "C" {
     pub fn LLVMRustModuleBufferFree(p: &'static mut ModuleBuffer);
     pub fn LLVMRustModuleCost(M: &Module) -> u64;
 
-    pub fn LLVMRustThinLTOAvailable() -> bool;
-    pub fn LLVMRustPGOAvailable() -> bool;
     pub fn LLVMRustThinLTOBufferCreate(M: &Module) -> &'static mut ThinLTOBuffer;
     pub fn LLVMRustThinLTOBufferFree(M: &'static mut ThinLTOBuffer);
     pub fn LLVMRustThinLTOBufferPtr(M: &ThinLTOBuffer) -> *const c_char;
@@ -1622,6 +1668,11 @@ extern "C" {
         Data: &ThinLTOData,
         Module: &Module,
     ) -> bool;
+    pub fn LLVMRustGetThinLTOModuleImports(
+        Data: *const ThinLTOData,
+        ModuleNameCallback: ThinLTOModuleNameCallback,
+        CallbackPayload: *mut c_void,
+    );
     pub fn LLVMRustFreeThinLTOData(Data: &'static mut ThinLTOData);
     pub fn LLVMRustParseBitcodeForThinLTO(
         Context: &Context,

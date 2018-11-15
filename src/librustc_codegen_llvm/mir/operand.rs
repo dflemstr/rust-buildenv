@@ -8,13 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc::mir::interpret::ConstEvalErr;
+use rustc::mir::interpret::{ConstValue, ErrorHandled};
 use rustc::mir;
-use rustc::mir::interpret::{ConstValue, ScalarMaybeUndef};
 use rustc::ty;
 use rustc::ty::layout::{self, Align, LayoutOf, TyLayout};
-use rustc_data_structures::indexed_vec::Idx;
-use rustc_data_structures::sync::Lrc;
 
 use base;
 use common::{CodegenCx, C_undef, C_usize};
@@ -81,7 +78,7 @@ impl OperandRef<'ll, 'tcx> {
 
     pub fn from_const(bx: &Builder<'a, 'll, 'tcx>,
                       val: &'tcx ty::Const<'tcx>)
-                      -> Result<OperandRef<'ll, 'tcx>, Lrc<ConstEvalErr<'tcx>>> {
+                      -> Result<OperandRef<'ll, 'tcx>, ErrorHandled> {
         let layout = bx.cx.layout_of(val.ty);
 
         if layout.is_zst() {
@@ -115,15 +112,12 @@ impl OperandRef<'ll, 'tcx> {
                     layout.scalar_pair_element_llvm_type(bx.cx, 0, true),
                 );
                 let b_layout = layout.scalar_pair_element_llvm_type(bx.cx, 1, true);
-                let b_llval = match b {
-                    ScalarMaybeUndef::Scalar(b) => scalar_to_llvm(
-                        bx.cx,
-                        b,
-                        b_scalar,
-                        b_layout,
-                    ),
-                    ScalarMaybeUndef::Undef => C_undef(b_layout),
-                };
+                let b_llval = scalar_to_llvm(
+                    bx.cx,
+                    b,
+                    b_scalar,
+                    b_layout,
+                );
                 OperandValue::Pair(a_llval, b_llval)
             },
             ConstValue::ByRef(_, alloc, offset) => {
@@ -288,8 +282,8 @@ impl OperandValue<'ll> {
         }
         match self {
             OperandValue::Ref(r, None, source_align) => {
-                base::memcpy_ty(bx, dest.llval, r, dest.layout,
-                                source_align.min(dest.align), flags)
+                base::memcpy_ty(bx, dest.llval, dest.align, r, source_align,
+                                dest.layout, flags)
             }
             OperandValue::Ref(_, Some(_), _) => {
                 bug!("cannot directly store unsized values");
@@ -330,7 +324,7 @@ impl OperandValue<'ll> {
         // Allocate an appropriate region on the stack, and copy the value into it
         let (llsize, _) = glue::size_and_align_of_dst(&bx, unsized_ty, Some(llextra));
         let lldst = bx.array_alloca(Type::i8(bx.cx), llsize, "unsized_tmp", max_align);
-        base::call_memcpy(&bx, lldst, llptr, llsize, min_align, flags);
+        base::call_memcpy(&bx, lldst, max_align, llptr, min_align, llsize, flags);
 
         // Store the allocated region and the extra to the indirect place.
         let indirect_operand = OperandValue::Pair(lldst, llextra);
@@ -429,10 +423,13 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 self.eval_mir_constant(bx, constant)
                     .and_then(|c| OperandRef::from_const(bx, c))
                     .unwrap_or_else(|err| {
-                        err.report_as_error(
-                            bx.tcx().at(constant.span),
-                            "could not evaluate constant operand",
-                        );
+                        match err {
+                            // errored or at least linted
+                            ErrorHandled::Reported => {},
+                            ErrorHandled::TooGeneric => {
+                                bug!("codgen encountered polymorphic constant")
+                            },
+                        }
                         // Allow RalfJ to sleep soundly knowing that even refactorings that remove
                         // the above error (or silence it under some conditions) will not cause UB
                         let fnname = bx.cx.get_intrinsic(&("llvm.trap"));

@@ -32,7 +32,7 @@ use native;
 use test;
 use tool;
 use util::{add_lib_path, exe, libdir};
-use {Build, DocTests, Mode};
+use {Build, DocTests, Mode, GitRepo};
 
 pub use Compiler;
 
@@ -130,7 +130,7 @@ impl PathSet {
     fn has(&self, needle: &Path) -> bool {
         match self {
             PathSet::Set(set) => set.iter().any(|p| p.ends_with(needle)),
-            PathSet::Suite(_) => false,
+            PathSet::Suite(suite) => suite.ends_with(needle),
         }
     }
 
@@ -379,7 +379,6 @@ impl<'a> Builder<'a> {
                 test::Ui,
                 test::RunPass,
                 test::CompileFail,
-                test::ParseFail,
                 test::RunFail,
                 test::RunPassValgrind,
                 test::MirOpt,
@@ -708,6 +707,80 @@ impl<'a> Builder<'a> {
     ) -> Command {
         let mut cargo = Command::new(&self.initial_cargo);
         let out_dir = self.stage_out(compiler, mode);
+
+        // command specific path, we call clear_if_dirty with this
+        let mut my_out = match cmd {
+            "build" => self.cargo_out(compiler, mode, target),
+
+            // This is the intended out directory for crate documentation.
+            "doc" | "rustdoc" =>  self.crate_doc_out(target),
+
+            _ => self.stage_out(compiler, mode),
+        };
+
+        // This is for the original compiler, but if we're forced to use stage 1, then
+        // std/test/rustc stamps won't exist in stage 2, so we need to get those from stage 1, since
+        // we copy the libs forward.
+        let cmp = if self.force_use_stage1(compiler, target) {
+            self.compiler(1, compiler.host)
+        } else {
+            compiler
+        };
+
+        let libstd_stamp = match cmd {
+            "check" => check::libstd_stamp(self, cmp, target),
+            _ => compile::libstd_stamp(self, cmp, target),
+        };
+
+        let libtest_stamp = match cmd {
+            "check" => check::libtest_stamp(self, cmp, target),
+            _ => compile::libstd_stamp(self, cmp, target),
+        };
+
+        let librustc_stamp = match cmd {
+            "check" => check::librustc_stamp(self, cmp, target),
+            _ => compile::librustc_stamp(self, cmp, target),
+        };
+
+        if cmd == "doc" || cmd == "rustdoc" {
+            if mode == Mode::Rustc || mode == Mode::ToolRustc || mode == Mode::Codegen {
+                // This is the intended out directory for compiler documentation.
+                my_out = self.compiler_doc_out(target);
+            }
+            let rustdoc = self.rustdoc(compiler.host);
+            self.clear_if_dirty(&my_out, &rustdoc);
+        } else if cmd != "test" {
+            match mode {
+                Mode::Std => {
+                    self.clear_if_dirty(&my_out, &self.rustc(compiler));
+                },
+                Mode::Test => {
+                    self.clear_if_dirty(&my_out, &libstd_stamp);
+                },
+                Mode::Rustc => {
+                    self.clear_if_dirty(&my_out, &self.rustc(compiler));
+                    self.clear_if_dirty(&my_out, &libstd_stamp);
+                    self.clear_if_dirty(&my_out, &libtest_stamp);
+                },
+                Mode::Codegen => {
+                    self.clear_if_dirty(&my_out, &librustc_stamp);
+                },
+                Mode::ToolBootstrap => { },
+                Mode::ToolStd => {
+                    self.clear_if_dirty(&my_out, &libstd_stamp);
+                },
+                Mode::ToolTest => {
+                    self.clear_if_dirty(&my_out, &libstd_stamp);
+                    self.clear_if_dirty(&my_out, &libtest_stamp);
+                },
+                Mode::ToolRustc => {
+                    self.clear_if_dirty(&my_out, &libstd_stamp);
+                    self.clear_if_dirty(&my_out, &libtest_stamp);
+                    self.clear_if_dirty(&my_out, &librustc_stamp);
+                },
+            }
+        }
+
         cargo
             .env("CARGO_TARGET_DIR", out_dir)
             .arg(cmd);
@@ -809,7 +882,7 @@ impl<'a> Builder<'a> {
             .env("RUSTDOC", self.out.join("bootstrap/debug/rustdoc"))
             .env(
                 "RUSTDOC_REAL",
-                if cmd == "doc" || (cmd == "test" && want_rustdoc) {
+                if cmd == "doc" || cmd == "rustdoc" || (cmd == "test" && want_rustdoc) {
                     self.rustdoc(compiler.host)
                 } else {
                     PathBuf::from("/path/to/nowhere/rustdoc/not/required")
@@ -876,6 +949,10 @@ impl<'a> Builder<'a> {
             cargo.env("RUSTC_HOST_CRT_STATIC", x.to_string());
         }
 
+        if let Some(map) = self.build.debuginfo_map(GitRepo::Rustc) {
+            cargo.env("RUSTC_DEBUGINFO_MAP", map);
+        }
+
         // Enable usage of unstable features
         cargo.env("RUSTC_BOOTSTRAP", "1");
         self.add_rust_test_threads(&mut cargo);
@@ -922,10 +999,6 @@ impl<'a> Builder<'a> {
             cargo.env("RUSTC_BACKTRACE_ON_ICE", "1");
         }
 
-        if self.config.rust_verify_llvm_ir {
-            cargo.env("RUSTC_VERIFY_LLVM_IR", "1");
-        }
-
         cargo.env("RUSTC_VERBOSE", self.verbosity.to_string());
 
         // in std, we want to avoid denying warnings for stage 0 as that makes cfg's painful.
@@ -964,7 +1037,7 @@ impl<'a> Builder<'a> {
             let cc = ccacheify(&self.cc(target));
             cargo.env(format!("CC_{}", target), &cc).env("CC", &cc);
 
-            let cflags = self.cflags(target).join(" ");
+            let cflags = self.cflags(target, GitRepo::Rustc).join(" ");
             cargo
                 .env(format!("CFLAGS_{}", target), cflags.clone())
                 .env("CFLAGS", cflags.clone());
@@ -1046,10 +1119,15 @@ impl<'a> Builder<'a> {
             cargo.arg("-v");
         }
 
-        // This must be kept before the thinlto check, as we set codegen units
-        // to 1 forcibly there.
-        if let Some(n) = self.config.rust_codegen_units {
-            cargo.env("RUSTC_CODEGEN_UNITS", n.to_string());
+        match (mode, self.config.rust_codegen_units_std, self.config.rust_codegen_units) {
+            (Mode::Std, Some(n), _) |
+            (Mode::Test, Some(n), _) |
+            (_, _, Some(n)) => {
+                cargo.env("RUSTC_CODEGEN_UNITS", n.to_string());
+            }
+            _ => {
+                // Don't set anything
+            }
         }
 
         if self.config.rust_optimize {
@@ -1771,7 +1849,7 @@ mod __test {
         );
 
         // Ensure we don't build any compiler artifacts.
-        assert!(builder.cache.all::<compile::Rustc>().is_empty());
+        assert!(!builder.cache.contains::<compile::Rustc>());
         assert_eq!(
             first(builder.cache.all::<test::Crate>()),
             &[test::Crate {
@@ -1782,5 +1860,35 @@ mod __test {
                 krate: INTERNER.intern_str("std"),
             },]
         );
+    }
+
+    #[test]
+    fn test_exclude() {
+        let mut config = configure(&[], &[]);
+        config.exclude = vec![
+            "src/test/run-pass".into(),
+            "src/tools/tidy".into(),
+        ];
+        config.cmd = Subcommand::Test {
+            paths: Vec::new(),
+            test_args: Vec::new(),
+            rustc_args: Vec::new(),
+            fail_fast: true,
+            doc_tests: DocTests::No,
+            bless: false,
+            compare_mode: None,
+        };
+
+        let build = Build::new(config);
+        let builder = Builder::new(&build);
+        builder.run_step_descriptions(&Builder::get_step_descriptions(Kind::Test), &[]);
+
+        // Ensure we have really excluded run-pass & tidy
+        assert!(!builder.cache.contains::<test::RunPass>());
+        assert!(!builder.cache.contains::<test::Tidy>());
+
+        // Ensure other tests are not affected.
+        assert!(builder.cache.contains::<test::RunPassFullDeps>());
+        assert!(builder.cache.contains::<test::RustdocUi>());
     }
 }

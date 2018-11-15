@@ -8,6 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// run-pass
+#![allow(non_camel_case_types)]
+
 // edition:2018
 
 #![feature(uniform_paths)]

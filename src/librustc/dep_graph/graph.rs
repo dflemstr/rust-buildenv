@@ -39,10 +39,12 @@ pub struct DepGraph {
     fingerprints: Lrc<Lock<IndexVec<DepNodeIndex, Fingerprint>>>
 }
 
-newtype_index!(DepNodeIndex);
+newtype_index! {
+    pub struct DepNodeIndex { .. }
+}
 
 impl DepNodeIndex {
-    const INVALID: DepNodeIndex = DepNodeIndex(::std::u32::MAX);
+    const INVALID: DepNodeIndex = DepNodeIndex::MAX;
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -99,11 +101,11 @@ impl DepGraph {
         DepGraph {
             data: Some(Lrc::new(DepGraphData {
                 previous_work_products: prev_work_products,
-                dep_node_debug: Lock::new(FxHashMap()),
+                dep_node_debug: Lock::new(Default::default()),
                 current: Lock::new(CurrentDepGraph::new()),
                 previous: prev_graph,
                 colors: Lock::new(DepNodeColorMap::new(prev_graph_node_count)),
-                loaded_from_cache: Lock::new(FxHashMap()),
+                loaded_from_cache: Lock::new(Default::default()),
             })),
             fingerprints: Lrc::new(Lock::new(fingerprints)),
         }
@@ -207,7 +209,7 @@ impl DepGraph {
             |key| OpenTask::Regular(Lock::new(RegularOpenTask {
                 node: key,
                 reads: SmallVec::new(),
-                read_set: FxHashSet(),
+                read_set: Default::default(),
             })),
             |data, key, task| data.borrow_mut().complete_task(key, task))
     }
@@ -351,7 +353,7 @@ impl DepGraph {
             let (result, open_task) = ty::tls::with_context(|icx| {
                 let task = OpenTask::Anon(Lock::new(AnonOpenTask {
                     reads: SmallVec::new(),
-                    read_set: FxHashSet(),
+                    read_set: Default::default(),
                 }));
 
                 let r = {
@@ -878,7 +880,7 @@ pub struct WorkProduct {
     pub saved_files: Vec<(WorkProductFileKind, String)>,
 }
 
-#[derive(Clone, Copy, Debug, RustcEncodable, RustcDecodable)]
+#[derive(Clone, Copy, Debug, RustcEncodable, RustcDecodable, PartialEq)]
 pub enum WorkProductFileKind {
     Object,
     Bytecode,
@@ -935,7 +937,7 @@ impl CurrentDepGraph {
         CurrentDepGraph {
             nodes: IndexVec::new(),
             edges: IndexVec::new(),
-            node_to_node_index: FxHashMap(),
+            node_to_node_index: Default::default(),
             anon_id_seed: stable_hasher.finish(),
             forbidden_edge,
             total_read_count: 0,
@@ -1125,14 +1127,16 @@ impl DepNodeColorMap {
         match self.values[index] {
             COMPRESSED_NONE => None,
             COMPRESSED_RED => Some(DepNodeColor::Red),
-            value => Some(DepNodeColor::Green(DepNodeIndex(value - COMPRESSED_FIRST_GREEN)))
+            value => Some(DepNodeColor::Green(DepNodeIndex::from_u32(
+                value - COMPRESSED_FIRST_GREEN
+            )))
         }
     }
 
     fn insert(&mut self, index: SerializedDepNodeIndex, color: DepNodeColor) {
         self.values[index] = match color {
             DepNodeColor::Red => COMPRESSED_RED,
-            DepNodeColor::Green(index) => index.0 + COMPRESSED_FIRST_GREEN,
+            DepNodeColor::Green(index) => index.as_u32() + COMPRESSED_FIRST_GREEN,
         }
     }
 }

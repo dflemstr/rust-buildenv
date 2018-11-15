@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+use rustc::mir::ConstraintCategory;
 use rustc::ty::RegionVid;
 use rustc_data_structures::graph::scc::Sccs;
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
@@ -58,8 +59,9 @@ impl ConstraintSet {
     crate fn compute_sccs(
         &self,
         constraint_graph: &graph::NormalConstraintGraph,
+        static_region: RegionVid,
     ) -> Sccs<RegionVid, ConstraintSccIndex> {
-        let region_graph = &constraint_graph.region_graph(self);
+        let region_graph = &constraint_graph.region_graph(self, static_region);
         Sccs::new(region_graph)
     }
 }
@@ -86,6 +88,9 @@ pub struct OutlivesConstraint {
 
     /// Where did this constraint arise?
     pub locations: Locations,
+
+    /// What caused this constraint?
+    pub category: ConstraintCategory,
 }
 
 impl fmt::Debug for OutlivesConstraint {
@@ -98,6 +103,14 @@ impl fmt::Debug for OutlivesConstraint {
     }
 }
 
-newtype_index!(ConstraintIndex { DEBUG_FORMAT = "ConstraintIndex({})" });
+newtype_index! {
+    pub struct ConstraintIndex {
+        DEBUG_FORMAT = "ConstraintIndex({})"
+    }
+}
 
-newtype_index!(ConstraintSccIndex { DEBUG_FORMAT = "ConstraintSccIndex({})" });
+newtype_index! {
+    pub struct ConstraintSccIndex {
+        DEBUG_FORMAT = "ConstraintSccIndex({})"
+    }
+}

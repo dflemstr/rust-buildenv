@@ -59,10 +59,10 @@ impl NonCamelCaseTypes {
 
         fn is_camel_case(name: ast::Name) -> bool {
             let name = name.as_str();
+            let name = name.trim_matches('_');
             if name.is_empty() {
                 return true;
             }
-            let name = name.trim_matches('_');
 
             // start with a non-lowercase letter rather than non-uppercase
             // ones (some scripts don't have a concept of upper/lowercase)
@@ -121,7 +121,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for NonCamelCaseTypes {
         let has_repr_c = it.attrs
             .iter()
             .any(|attr| {
-                attr::find_repr_attrs(cx.tcx.sess.diagnostic(), attr)
+                attr::find_repr_attrs(&cx.tcx.sess.parse_sess, attr)
                     .iter()
                     .any(|r| r == &attr::ReprC)
             });

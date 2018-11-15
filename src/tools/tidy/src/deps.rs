@@ -18,7 +18,7 @@ use std::process::Command;
 
 use serde_json;
 
-static LICENSES: &'static [&'static str] = &[
+const LICENSES: &[&str] = &[
     "MIT/Apache-2.0",
     "MIT / Apache-2.0",
     "Apache-2.0/MIT",
@@ -33,7 +33,7 @@ static LICENSES: &'static [&'static str] = &[
 /// should be considered bugs. Exceptions are only allowed in Rust
 /// tooling. It is _crucial_ that no exception crates be dependencies
 /// of the Rust runtime (std / test).
-static EXCEPTIONS: &'static [&'static str] = &[
+const EXCEPTIONS: &[&str] = &[
     "mdbook",             // MPL2, mdbook
     "openssl",            // BSD+advertising clause, cargo, mdbook
     "pest",               // MPL2, mdbook via handlebars
@@ -51,16 +51,17 @@ static EXCEPTIONS: &'static [&'static str] = &[
     "ordslice",           // Apache-2.0, rls
     "cloudabi",           // BSD-2-Clause, (rls -> crossbeam-channel 0.2 -> rand 0.5)
     "ryu",                // Apache-2.0, rls/cargo/... (b/c of serde)
+    "bytesize",           // Apache-2.0, cargo
 ];
 
 /// Which crates to check against the whitelist?
-static WHITELIST_CRATES: &'static [CrateVersion] = &[
+const WHITELIST_CRATES: &[CrateVersion] = &[
     CrateVersion("rustc", "0.0.0"),
     CrateVersion("rustc_codegen_llvm", "0.0.0"),
 ];
 
 /// Whitelist of crates rustc is allowed to depend on. Avoid adding to the list if possible.
-static WHITELIST: &'static [Crate] = &[
+const WHITELIST: &[Crate] = &[
     Crate("aho-corasick"),
     Crate("arrayvec"),
     Crate("atty"),
@@ -91,9 +92,11 @@ static WHITELIST: &'static [Crate] = &[
     Crate("kernel32-sys"),
     Crate("lazy_static"),
     Crate("libc"),
+    Crate("lock_api"),
     Crate("log"),
     Crate("log_settings"),
     Crate("memchr"),
+    Crate("memmap"),
     Crate("memoffset"),
     Crate("miniz-sys"),
     Crate("nodrop"),
@@ -101,8 +104,8 @@ static WHITELIST: &'static [Crate] = &[
     Crate("owning_ref"),
     Crate("parking_lot"),
     Crate("parking_lot_core"),
-    Crate("polonius-engine"),
     Crate("pkg-config"),
+    Crate("polonius-engine"),
     Crate("quick-error"),
     Crate("rand"),
     Crate("rand_core"),
@@ -133,6 +136,7 @@ static WHITELIST: &'static [Crate] = &[
     Crate("winapi"),
     Crate("winapi-build"),
     Crate("winapi-i686-pc-windows-gnu"),
+    Crate("winapi-util"),
     Crate("winapi-x86_64-pc-windows-gnu"),
     Crate("wincolor"),
 ];
@@ -205,12 +209,13 @@ pub fn check(path: &Path, bad: &mut bool) {
         let dir = t!(dir);
 
         // skip our exceptions
-        if EXCEPTIONS.iter().any(|exception| {
+        let is_exception = EXCEPTIONS.iter().any(|exception| {
             dir.path()
                 .to_str()
                 .unwrap()
                 .contains(&format!("src/vendor/{}", exception))
-        }) {
+        });
+        if is_exception {
             continue;
         }
 
@@ -239,7 +244,7 @@ pub fn check_whitelist(path: &Path, cargo: &Path, bad: &mut bool) {
         unapproved.append(&mut bad);
     }
 
-    if unapproved.len() > 0 {
+    if !unapproved.is_empty() {
         println!("Dependencies not on the whitelist:");
         for dep in unapproved {
             println!("* {}", dep.id_str());

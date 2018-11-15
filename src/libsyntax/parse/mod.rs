@@ -15,7 +15,7 @@ use ast::{self, CrateConfig, NodeId};
 use early_buffered_lints::{BufferedEarlyLint, BufferedEarlyLintId};
 use source_map::{SourceMap, FilePathMapping};
 use syntax_pos::{Span, SourceFile, FileName, MultiSpan};
-use errors::{Handler, ColorConfig, DiagnosticBuilder};
+use errors::{Handler, ColorConfig, Diagnostic, DiagnosticBuilder};
 use feature_gate::UnstableFeatures;
 use parse::parser::Parser;
 use ptr::P;
@@ -57,7 +57,7 @@ pub struct ParseSess {
     pub non_modrs_mods: Lock<Vec<(ast::Ident, Span)>>,
     /// Used to determine and report recursive mod inclusions
     included_mod_stack: Lock<Vec<PathBuf>>,
-    code_map: Lrc<SourceMap>,
+    source_map: Lrc<SourceMap>,
     pub buffered_lints: Lock<Vec<BufferedEarlyLint>>,
 }
 
@@ -71,7 +71,7 @@ impl ParseSess {
         ParseSess::with_span_handler(handler, cm)
     }
 
-    pub fn with_span_handler(handler: Handler, code_map: Lrc<SourceMap>) -> ParseSess {
+    pub fn with_span_handler(handler: Handler, source_map: Lrc<SourceMap>) -> ParseSess {
         ParseSess {
             span_diagnostic: handler,
             unstable_features: UnstableFeatures::from_environment(),
@@ -80,14 +80,14 @@ impl ParseSess {
             raw_identifier_spans: Lock::new(Vec::new()),
             registered_diagnostics: Lock::new(ErrorMap::new()),
             included_mod_stack: Lock::new(vec![]),
-            code_map,
+            source_map,
             non_modrs_mods: Lock::new(vec![]),
             buffered_lints: Lock::new(vec![]),
         }
     }
 
     pub fn source_map(&self) -> &SourceMap {
-        &self.code_map
+        &self.source_map
     }
 
     pub fn buffer_lint<S: Into<MultiSpan>>(&self,
@@ -174,12 +174,21 @@ pub fn parse_stream_from_source_str(name: FileName, source: String, sess: &Parse
     source_file_to_stream(sess, sess.source_map().new_source_file(name, source), override_span)
 }
 
-// Create a new parser from a source string
+/// Create a new parser from a source string
 pub fn new_parser_from_source_str(sess: &ParseSess, name: FileName, source: String)
                                       -> Parser {
-    let mut parser = source_file_to_parser(sess, sess.source_map().new_source_file(name, source));
+    panictry_buffer!(&sess.span_diagnostic, maybe_new_parser_from_source_str(sess, name, source))
+}
+
+/// Create a new parser from a source string. Returns any buffered errors from lexing the initial
+/// token stream.
+pub fn maybe_new_parser_from_source_str(sess: &ParseSess, name: FileName, source: String)
+    -> Result<Parser, Vec<Diagnostic>>
+{
+    let mut parser = maybe_source_file_to_parser(sess,
+                                                 sess.source_map().new_source_file(name, source))?;
     parser.recurse_into_file_modules = false;
-    parser
+    Ok(parser)
 }
 
 /// Create a new parser, handling errors as appropriate
@@ -204,14 +213,23 @@ crate fn new_sub_parser_from_file<'a>(sess: &'a ParseSess,
 
 /// Given a source_file and config, return a parser
 fn source_file_to_parser(sess: & ParseSess, source_file: Lrc<SourceFile>) -> Parser {
+    panictry_buffer!(&sess.span_diagnostic,
+                     maybe_source_file_to_parser(sess, source_file))
+}
+
+/// Given a source_file and config, return a parser. Returns any buffered errors from lexing the
+/// initial token stream.
+fn maybe_source_file_to_parser(sess: &ParseSess, source_file: Lrc<SourceFile>)
+    -> Result<Parser, Vec<Diagnostic>>
+{
     let end_pos = source_file.end_pos;
-    let mut parser = stream_to_parser(sess, source_file_to_stream(sess, source_file, None));
+    let mut parser = stream_to_parser(sess, maybe_file_to_stream(sess, source_file, None)?);
 
     if parser.token == token::Eof && parser.span.is_dummy() {
         parser.span = Span::new(end_pos, end_pos, parser.span.ctxt());
     }
 
-    parser
+    Ok(parser)
 }
 
 // must preserve old name for now, because quote! from the *existing*
@@ -230,7 +248,7 @@ fn file_to_source_file(sess: &ParseSess, path: &Path, spanopt: Option<Span>)
     match sess.source_map().load_file(path) {
         Ok(source_file) => source_file,
         Err(e) => {
-            let msg = format!("couldn't read {:?}: {}", path.display(), e);
+            let msg = format!("couldn't read {}: {}", path.display(), e);
             match spanopt {
                 Some(sp) => sess.span_diagnostic.span_fatal(sp, &msg).raise(),
                 None => sess.span_diagnostic.fatal(&msg).raise()
@@ -243,9 +261,25 @@ fn file_to_source_file(sess: &ParseSess, path: &Path, spanopt: Option<Span>)
 pub fn source_file_to_stream(sess: &ParseSess,
                              source_file: Lrc<SourceFile>,
                              override_span: Option<Span>) -> TokenStream {
-    let mut srdr = lexer::StringReader::new(sess, source_file, override_span);
+    panictry_buffer!(&sess.span_diagnostic, maybe_file_to_stream(sess, source_file, override_span))
+}
+
+/// Given a source file, produce a sequence of token-trees. Returns any buffered errors from
+/// parsing the token tream.
+pub fn maybe_file_to_stream(sess: &ParseSess,
+                            source_file: Lrc<SourceFile>,
+                            override_span: Option<Span>) -> Result<TokenStream, Vec<Diagnostic>> {
+    let mut srdr = lexer::StringReader::new_or_buffered_errs(sess, source_file, override_span)?;
     srdr.real_token();
-    panictry!(srdr.parse_all_token_trees())
+
+    match srdr.parse_all_token_trees() {
+        Ok(stream) => Ok(stream),
+        Err(err) => {
+            let mut buffer = Vec::with_capacity(1);
+            err.buffer(&mut buffer);
+            Err(buffer)
+        }
+    }
 }
 
 /// Given stream and the `ParseSess`, produce a parser
@@ -494,8 +528,17 @@ fn float_lit(s: &str, suffix: Option<Symbol>, diag: Option<(Span, &Handler)>)
                  -> Option<ast::LitKind> {
     debug!("float_lit: {:?}, {:?}", s, suffix);
     // FIXME #2252: bounds checking float literals is deferred until trans
-    let s = s.chars().filter(|&c| c != '_').collect::<String>();
-    filtered_float_lit(Symbol::intern(&s), suffix, diag)
+
+    // Strip underscores without allocating a new String unless necessary.
+    let s2;
+    let s = if s.chars().any(|c| c == '_') {
+        s2 = s.chars().filter(|&c| c != '_').collect::<String>();
+        &s2
+    } else {
+        s
+    };
+
+    filtered_float_lit(Symbol::intern(s), suffix, diag)
 }
 
 /// Parse a string representing a byte literal into its final form. Similar to `char_lit`
@@ -591,8 +634,14 @@ fn integer_lit(s: &str, suffix: Option<Symbol>, diag: Option<(Span, &Handler)>)
                    -> Option<ast::LitKind> {
     // s can only be ascii, byte indexing is fine
 
-    let s2 = s.chars().filter(|&c| c != '_').collect::<String>();
-    let mut s = &s2[..];
+    // Strip underscores without allocating a new String unless necessary.
+    let s2;
+    let mut s = if s.chars().any(|c| c == '_') {
+        s2 = s.chars().filter(|&c| c != '_').collect::<String>();
+        &s2
+    } else {
+        s
+    };
 
     debug!("integer_lit: {}, {:?}", s, suffix);
 
@@ -722,7 +771,7 @@ mod tests {
     use attr::first_attr_value_str_by_name;
     use parse;
     use print::pprust::item_to_string;
-    use tokenstream::{self, TokenTree};
+    use tokenstream::{self, DelimSpan, TokenTree};
     use util::parser_testing::string_to_stream;
     use util::parser_testing::{string_to_expr, string_to_item};
     use with_globals;
@@ -805,7 +854,7 @@ mod tests {
                 TokenTree::Token(sp(0, 2), token::Ident(Ident::from_str("fn"), false)).into(),
                 TokenTree::Token(sp(3, 4), token::Ident(Ident::from_str("a"), false)).into(),
                 TokenTree::Delimited(
-                    sp(5, 14),
+                    DelimSpan::from_pair(sp(5, 6), sp(13, 14)),
                     tokenstream::Delimited {
                         delim: token::DelimToken::Paren,
                         tts: TokenStream::concat(vec![
@@ -817,7 +866,7 @@ mod tests {
                         ]).into(),
                     }).into(),
                 TokenTree::Delimited(
-                    sp(15, 21),
+                    DelimSpan::from_pair(sp(15, 16), sp(20, 21)),
                     tokenstream::Delimited {
                         delim: token::DelimToken::Brace,
                         tts: TokenStream::concat(vec![

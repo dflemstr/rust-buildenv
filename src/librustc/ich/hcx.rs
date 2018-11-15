@@ -15,7 +15,6 @@ use hir::map::definitions::Definitions;
 use ich::{self, CachingSourceMapView, Fingerprint};
 use middle::cstore::CrateStore;
 use ty::{TyCtxt, fast_reject};
-use mir::interpret::AllocId;
 use session::Session;
 
 use std::cmp::Ord;
@@ -28,6 +27,7 @@ use syntax::ast;
 use syntax::source_map::SourceMap;
 use syntax::ext::hygiene::SyntaxContext;
 use syntax::symbol::Symbol;
+use syntax::tokenstream::DelimSpan;
 use syntax_pos::{Span, DUMMY_SP};
 use syntax_pos::hygiene;
 
@@ -60,8 +60,6 @@ pub struct StableHashingContext<'a> {
     // CachingSourceMapView, so we initialize it lazily.
     raw_source_map: &'a SourceMap,
     caching_source_map: Option<CachingSourceMapView<'a>>,
-
-    pub(super) alloc_id_recursion_tracker: FxHashSet<AllocId>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -105,7 +103,6 @@ impl<'a> StableHashingContext<'a> {
             hash_spans: hash_spans_initial,
             hash_bodies: true,
             node_id_hashing_mode: NodeIdHashingMode::HashDefPath,
-            alloc_id_recursion_tracker: Default::default(),
         }
     }
 
@@ -373,7 +370,7 @@ impl<'a> HashStable<StableHashingContext<'a>> for Span {
             // recursing every time.
             thread_local! {
                 static CACHE: RefCell<FxHashMap<hygiene::Mark, u64>> =
-                    RefCell::new(FxHashMap());
+                    RefCell::new(Default::default());
             }
 
             let sub_hash: u64 = CACHE.with(|cache| {
@@ -393,6 +390,17 @@ impl<'a> HashStable<StableHashingContext<'a>> for Span {
 
             sub_hash.hash_stable(hcx, hasher);
         }
+    }
+}
+
+impl<'a> HashStable<StableHashingContext<'a>> for DelimSpan {
+    fn hash_stable<W: StableHasherResult>(
+        &self,
+        hcx: &mut StableHashingContext<'a>,
+        hasher: &mut StableHasher<W>,
+    ) {
+        self.open.hash_stable(hcx, hasher);
+        self.close.hash_stable(hcx, hasher);
     }
 }
 

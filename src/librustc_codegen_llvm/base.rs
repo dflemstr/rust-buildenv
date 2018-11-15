@@ -24,28 +24,28 @@
 //!     int) and rec(x=int, y=int, z=int) will have the same llvm::Type.
 
 use super::ModuleLlvm;
-use super::ModuleSource;
 use super::ModuleCodegen;
 use super::ModuleKind;
+use super::CachedModuleCodegen;
 
 use abi;
 use back::write::{self, OngoingCodegen};
 use llvm::{self, TypeKind, get_param};
 use metadata;
+use rustc::dep_graph::cgu_reuse_tracker::CguReuse;
 use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE};
 use rustc::middle::lang_items::StartFnLangItem;
 use rustc::middle::weak_lang_items;
 use rustc::mir::mono::{Linkage, Visibility, Stats, CodegenUnitNameBuilder};
 use rustc::middle::cstore::{EncodedMetadata};
 use rustc::ty::{self, Ty, TyCtxt};
-use rustc::ty::layout::{self, Align, TyLayout, LayoutOf};
+use rustc::ty::layout::{self, Align, TyLayout, LayoutOf, VariantIdx};
 use rustc::ty::query::Providers;
-use rustc::dep_graph::{DepNode, DepConstructor};
 use rustc::middle::cstore::{self, LinkagePreference};
 use rustc::middle::exported_symbols;
 use rustc::util::common::{time, print_time_passes_entry};
 use rustc::util::profiling::ProfileCategory;
-use rustc::session::config::{self, DebugInfo, EntryFnType};
+use rustc::session::config::{self, DebugInfo, EntryFnType, Lto};
 use rustc::session::Session;
 use rustc_incremental;
 use allocator;
@@ -53,10 +53,9 @@ use mir::place::PlaceRef;
 use attributes;
 use builder::{Builder, MemFlags};
 use callee;
-use common::{C_bool, C_bytes_in_context, C_i32, C_usize};
-use rustc_mir::monomorphize::collector::{self, MonoItemCollectionMode};
+use common::{C_bool, C_bytes_in_context, C_usize};
 use rustc_mir::monomorphize::item::DefPathBasedNames;
-use common::{self, C_struct_in_context, C_array, val_ty};
+use common::{C_struct_in_context, C_array, val_ty};
 use consts;
 use context::CodegenCx;
 use debuginfo;
@@ -64,24 +63,24 @@ use declare;
 use meth;
 use mir;
 use monomorphize::Instance;
-use monomorphize::partitioning::{self, PartitioningStrategy, CodegenUnit, CodegenUnitExt};
+use monomorphize::partitioning::{CodegenUnit, CodegenUnitExt};
 use rustc_codegen_utils::symbol_names_test;
 use time_graph;
-use mono_item::{MonoItem, BaseMonoItemExt, MonoItemExt};
+use mono_item::{MonoItem, MonoItemExt};
 use type_::Type;
 use type_of::LayoutLlvmExt;
-use rustc::util::nodemap::{FxHashMap, FxHashSet, DefIdSet};
+use rustc::util::nodemap::FxHashMap;
 use CrateInfo;
 use rustc_data_structures::small_c_str::SmallCStr;
 use rustc_data_structures::sync::Lrc;
+use rustc_data_structures::indexed_vec::Idx;
 
 use std::any::Any;
-use std::ffi::CString;
-use std::sync::Arc;
-use std::time::{Instant, Duration};
-use std::i32;
 use std::cmp;
+use std::ffi::CString;
+use std::ops::{Deref, DerefMut};
 use std::sync::mpsc;
+use std::time::{Instant, Duration};
 use syntax_pos::Span;
 use syntax_pos::symbol::InternedString;
 use syntax::attr;
@@ -213,8 +212,8 @@ pub fn unsized_info(
                             vtable_ptr.llvm_type(cx))
         }
         _ => bug!("unsized_info: invalid unsizing {:?} -> {:?}",
-                                     source,
-                                     target),
+                  source,
+                  target),
     }
 }
 
@@ -311,7 +310,7 @@ pub fn coerce_unsized_into(
         (&ty::Adt(def_a, _), &ty::Adt(def_b, _)) => {
             assert_eq!(def_a, def_b);
 
-            for i in 0..def_a.variants[0].fields.len() {
+            for i in 0..def_a.variants[VariantIdx::new(0)].fields.len() {
                 let src_f = src.project_field(bx, i);
                 let dst_f = dst.project_field(bx, i);
 
@@ -320,8 +319,8 @@ pub fn coerce_unsized_into(
                 }
 
                 if src_f.layout.ty == dst_f.layout.ty {
-                    memcpy_ty(bx, dst_f.llval, src_f.llval, src_f.layout,
-                              src_f.align.min(dst_f.align), MemFlags::empty());
+                    memcpy_ty(bx, dst_f.llval, dst_f.align, src_f.llval, src_f.align,
+                              src_f.layout, MemFlags::empty());
                 } else {
                     coerce_unsized_into(bx, src_f, dst_f);
                 }
@@ -340,11 +339,11 @@ pub fn cast_shift_expr_rhs(
 }
 
 fn cast_shift_rhs<'ll, F, G>(op: hir::BinOpKind,
-                        lhs: &'ll Value,
-                        rhs: &'ll Value,
-                        trunc: F,
-                        zext: G)
-                        -> &'ll Value
+                             lhs: &'ll Value,
+                             rhs: &'ll Value,
+                             trunc: F,
+                             zext: G)
+                             -> &'ll Value
     where F: FnOnce(&'ll Value, &'ll Type) -> &'ll Value,
           G: FnOnce(&'ll Value, &'ll Type) -> &'ll Value
 {
@@ -363,8 +362,8 @@ fn cast_shift_rhs<'ll, F, G>(op: hir::BinOpKind,
         if lhs_sz < rhs_sz {
             trunc(rhs, lhs_llty)
         } else if lhs_sz > rhs_sz {
-            // FIXME (#1877: If shifting by negative
-            // values becomes not undefined then this is wrong.
+            // FIXME (#1877: If in the future shifting by negative
+            // values is no longer undefined then this is wrong.
             zext(rhs, lhs_llty)
         } else {
             rhs
@@ -421,36 +420,34 @@ pub fn to_immediate_scalar(
 pub fn call_memcpy(
     bx: &Builder<'_, 'll, '_>,
     dst: &'ll Value,
+    dst_align: Align,
     src: &'ll Value,
+    src_align: Align,
     n_bytes: &'ll Value,
-    align: Align,
     flags: MemFlags,
 ) {
     if flags.contains(MemFlags::NONTEMPORAL) {
         // HACK(nox): This is inefficient but there is no nontemporal memcpy.
-        let val = bx.load(src, align);
+        let val = bx.load(src, src_align);
         let ptr = bx.pointercast(dst, val_ty(val).ptr_to());
-        bx.store_with_flags(val, ptr, align, flags);
+        bx.store_with_flags(val, ptr, dst_align, flags);
         return;
     }
     let cx = bx.cx;
-    let ptr_width = &cx.sess().target.target.target_pointer_width;
-    let key = format!("llvm.memcpy.p0i8.p0i8.i{}", ptr_width);
-    let memcpy = cx.get_intrinsic(&key);
     let src_ptr = bx.pointercast(src, Type::i8p(cx));
     let dst_ptr = bx.pointercast(dst, Type::i8p(cx));
     let size = bx.intcast(n_bytes, cx.isize_ty, false);
-    let align = C_i32(cx, align.abi() as i32);
-    let volatile = C_bool(cx, flags.contains(MemFlags::VOLATILE));
-    bx.call(memcpy, &[dst_ptr, src_ptr, size, align, volatile], None);
+    let volatile = flags.contains(MemFlags::VOLATILE);
+    bx.memcpy(dst_ptr, dst_align.abi(), src_ptr, src_align.abi(), size, volatile);
 }
 
 pub fn memcpy_ty(
     bx: &Builder<'_, 'll, 'tcx>,
     dst: &'ll Value,
+    dst_align: Align,
     src: &'ll Value,
+    src_align: Align,
     layout: TyLayout<'tcx>,
-    align: Align,
     flags: MemFlags,
 ) {
     let size = layout.size.bytes();
@@ -458,7 +455,7 @@ pub fn memcpy_ty(
         return;
     }
 
-    call_memcpy(bx, dst, src, C_usize(bx.cx, size), align, flags);
+    call_memcpy(bx, dst, dst_align, src, src_align, C_usize(bx.cx, size), flags);
 }
 
 pub fn call_memset(
@@ -491,14 +488,11 @@ pub fn codegen_instance<'a, 'tcx>(cx: &CodegenCx<'a, 'tcx>, instance: Instance<'
     // release builds.
     info!("codegen_instance({})", instance);
 
-    let fn_ty = instance.ty(cx.tcx);
-    let sig = common::ty_fn_sig(cx, fn_ty);
+    let sig = instance.fn_sig(cx.tcx);
     let sig = cx.tcx.normalize_erasing_late_bound_regions(ty::ParamEnv::reveal_all(), &sig);
 
-    let lldecl = match cx.instances.borrow().get(&instance) {
-        Some(&val) => val,
-        None => bug!("Instance `{:?}` not already declared", instance)
-    };
+    let lldecl = cx.instances.borrow().get(&instance).cloned().unwrap_or_else(||
+        bug!("Instance `{:?}` not already declared", instance));
 
     cx.stats.borrow_mut().n_closures += 1;
 
@@ -560,14 +554,14 @@ fn maybe_create_entry_wrapper(cx: &CodegenCx) {
         // regions must appear in the argument
         // listing.
         let main_ret_ty = cx.tcx.erase_regions(
-            &main_ret_ty.no_late_bound_regions().unwrap(),
+            &main_ret_ty.no_bound_vars().unwrap(),
         );
 
         if declare::get_defined_value(cx, "main").is_some() {
             // FIXME: We should be smart and show a better diagnostic here.
             cx.sess().struct_span_err(sp, "entry symbol `main` defined multiple times")
-                      .help("did you use #[no_mangle] on `fn main`? Use #[start] instead")
-                      .emit();
+                     .help("did you use #[no_mangle] on `fn main`? Use #[start] instead")
+                     .emit();
             cx.sess().abort_if_errors();
             bug!();
         }
@@ -698,24 +692,48 @@ pub fn iter_globals(llmod: &'ll llvm::Module) -> ValueIter<'ll> {
     }
 }
 
-pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                             rx: mpsc::Receiver<Box<dyn Any + Send>>)
-                             -> OngoingCodegen {
+fn determine_cgu_reuse<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                                 cgu: &CodegenUnit<'tcx>)
+                                 -> CguReuse {
+    if !tcx.dep_graph.is_fully_enabled() {
+        return CguReuse::No
+    }
 
-    check_for_rustc_errors_attr(tcx);
+    let work_product_id = &cgu.work_product_id();
+    if tcx.dep_graph.previous_work_product(work_product_id).is_none() {
+        // We don't have anything cached for this CGU. This can happen
+        // if the CGU did not exist in the previous session.
+        return CguReuse::No
+    }
 
-    if let Some(true) = tcx.sess.opts.debugging_opts.thinlto {
-        if unsafe { !llvm::LLVMRustThinLTOAvailable() } {
-            tcx.sess.fatal("this compiler's LLVM does not support ThinLTO");
+    // Try to mark the CGU as green. If it we can do so, it means that nothing
+    // affecting the LLVM module has changed and we can re-use a cached version.
+    // If we compile with any kind of LTO, this means we can re-use the bitcode
+    // of the Pre-LTO stage (possibly also the Post-LTO version but we'll only
+    // know that later). If we are not doing LTO, there is only one optimized
+    // version of each module, so we re-use that.
+    let dep_node = cgu.codegen_dep_node(tcx);
+    assert!(!tcx.dep_graph.dep_node_exists(&dep_node),
+        "CompileCodegenUnit dep-node for CGU `{}` already exists before marking.",
+        cgu.name());
+
+    if tcx.dep_graph.try_mark_green(tcx, &dep_node).is_some() {
+        // We can re-use either the pre- or the post-thinlto state
+        if tcx.sess.lto() != Lto::No {
+            CguReuse::PreLto
+        } else {
+            CguReuse::PostLto
         }
+    } else {
+        CguReuse::No
     }
+}
 
-    if (tcx.sess.opts.debugging_opts.pgo_gen.is_some() ||
-        !tcx.sess.opts.debugging_opts.pgo_use.is_empty()) &&
-        unsafe { !llvm::LLVMRustPGOAvailable() }
-    {
-        tcx.sess.fatal("this compiler's LLVM does not support PGO");
-    }
+pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
+                               rx: mpsc::Receiver<Box<dyn Any + Send>>)
+                               -> OngoingCodegen
+{
+    check_for_rustc_errors_attr(tcx);
 
     let cgu_name_builder = &mut CodegenUnitNameBuilder::new(tcx);
 
@@ -734,7 +752,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     let metadata_module = ModuleCodegen {
         name: metadata_cgu_name,
-        source: ModuleSource::Codegened(metadata_llvm_module),
+        module_llvm: metadata_llvm_module,
         kind: ModuleKind::Metadata,
     };
 
@@ -749,7 +767,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
        !tcx.sess.opts.output_types.should_codegen() {
         let ongoing_codegen = write::start_async_codegen(
             tcx,
-            time_graph.clone(),
+            time_graph,
             metadata,
             rx,
             1);
@@ -766,8 +784,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
     // Run the monomorphization collector and partition the collected items into
     // codegen units.
-    let codegen_units =
-        tcx.collect_and_partition_mono_items(LOCAL_CRATE).1;
+    let codegen_units = tcx.collect_and_partition_mono_items(LOCAL_CRATE).1;
     let codegen_units = (*codegen_units).clone();
 
     // Force all codegen_unit queries so they are already either red or green
@@ -787,6 +804,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         metadata,
         rx,
         codegen_units.len());
+    let ongoing_codegen = AbortCodegenOnDrop(Some(ongoing_codegen));
 
     // Codegen an allocator shim, if necessary.
     //
@@ -800,12 +818,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         .iter()
         .any(|(_, list)| {
             use rustc::middle::dependency_format::Linkage;
-            list.iter().any(|linkage| {
-                match linkage {
-                    Linkage::Dynamic => true,
-                    _ => false,
-                }
-            })
+            list.iter().any(|&linkage| linkage == Linkage::Dynamic)
         });
     let allocator_module = if any_dynamic_crate {
         None
@@ -823,7 +836,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
 
         Some(ModuleCodegen {
             name: llmod_id,
-            source: ModuleSource::Codegened(modules),
+            module_llvm: modules,
             kind: ModuleKind::Allocator,
         })
     } else {
@@ -851,48 +864,37 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         ongoing_codegen.wait_for_signal_to_codegen_item();
         ongoing_codegen.check_for_errors(tcx.sess);
 
-        // First, if incremental compilation is enabled, we try to re-use the
-        // codegen unit from the cache.
-        if tcx.dep_graph.is_fully_enabled() {
-            let cgu_id = cgu.work_product_id();
+        let cgu_reuse = determine_cgu_reuse(tcx, &cgu);
+        tcx.sess.cgu_reuse_tracker.set_actual_reuse(&cgu.name().as_str(), cgu_reuse);
 
-            // Check whether there is a previous work-product we can
-            // re-use.  Not only must the file exist, and the inputs not
-            // be dirty, but the hash of the symbols we will generate must
-            // be the same.
-            if let Some(buf) = tcx.dep_graph.previous_work_product(&cgu_id) {
-                let dep_node = &DepNode::new(tcx,
-                    DepConstructor::CompileCodegenUnit(cgu.name().clone()));
-
-                // We try to mark the DepNode::CompileCodegenUnit green. If we
-                // succeed it means that none of the dependencies has changed
-                // and we can safely re-use.
-                if let Some(dep_node_index) = tcx.dep_graph.try_mark_green(tcx, dep_node) {
-                    let module = ModuleCodegen {
-                        name: cgu.name().to_string(),
-                        source: ModuleSource::Preexisting(buf),
-                        kind: ModuleKind::Regular,
-                    };
-                    tcx.dep_graph.mark_loaded_from_cache(dep_node_index, true);
-                    write::submit_codegened_module_to_llvm(tcx, module, 0);
-                    // Continue to next cgu, this one is done.
-                    continue
-                }
-            } else {
-                // This can happen if files were  deleted from the cache
-                // directory for some reason. We just re-compile then.
+        match cgu_reuse {
+            CguReuse::No => {
+                let _timing_guard = time_graph.as_ref().map(|time_graph| {
+                    time_graph.start(write::CODEGEN_WORKER_TIMELINE,
+                                     write::CODEGEN_WORK_PACKAGE_KIND,
+                                     &format!("codegen {}", cgu.name()))
+                });
+                let start_time = Instant::now();
+                let stats = compile_codegen_unit(tcx, *cgu.name());
+                all_stats.extend(stats);
+                total_codegen_time += start_time.elapsed();
+                false
             }
-        }
-
-        let _timing_guard = time_graph.as_ref().map(|time_graph| {
-            time_graph.start(write::CODEGEN_WORKER_TIMELINE,
-                             write::CODEGEN_WORK_PACKAGE_KIND,
-                             &format!("codegen {}", cgu.name()))
-        });
-        let start_time = Instant::now();
-        all_stats.extend(tcx.compile_codegen_unit(*cgu.name()));
-        total_codegen_time += start_time.elapsed();
-        ongoing_codegen.check_for_errors(tcx.sess);
+            CguReuse::PreLto => {
+                write::submit_pre_lto_module_to_llvm(tcx, CachedModuleCodegen {
+                    name: cgu.name().to_string(),
+                    source: cgu.work_product(tcx),
+                });
+                true
+            }
+            CguReuse::PostLto => {
+                write::submit_post_lto_module_to_llvm(tcx, CachedModuleCodegen {
+                    name: cgu.name().to_string(),
+                    source: cgu.work_product(tcx),
+                });
+                true
+            }
+        };
     }
 
     ongoing_codegen.codegen_finished(tcx);
@@ -903,9 +905,7 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                             "codegen to LLVM IR",
                             total_codegen_time);
 
-    if tcx.sess.opts.incremental.is_some() {
-        ::rustc_incremental::assert_module_sources::assert_module_sources(tcx);
-    }
+    rustc_incremental::assert_module_sources::assert_module_sources(tcx);
 
     symbol_names_test::report_symbol_names(tcx);
 
@@ -934,7 +934,54 @@ pub fn codegen_crate<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     ongoing_codegen.check_for_errors(tcx.sess);
 
     assert_and_save_dep_graph(tcx);
-    ongoing_codegen
+    ongoing_codegen.into_inner()
+}
+
+/// A curious wrapper structure whose only purpose is to call `codegen_aborted`
+/// when it's dropped abnormally.
+///
+/// In the process of working on rust-lang/rust#55238 a mysterious segfault was
+/// stumbled upon. The segfault was never reproduced locally, but it was
+/// suspected to be related to the fact that codegen worker threads were
+/// sticking around by the time the main thread was exiting, causing issues.
+///
+/// This structure is an attempt to fix that issue where the `codegen_aborted`
+/// message will block until all workers have finished. This should ensure that
+/// even if the main codegen thread panics we'll wait for pending work to
+/// complete before returning from the main thread, hopefully avoiding
+/// segfaults.
+///
+/// If you see this comment in the code, then it means that this workaround
+/// worked! We may yet one day track down the mysterious cause of that
+/// segfault...
+struct AbortCodegenOnDrop(Option<OngoingCodegen>);
+
+impl AbortCodegenOnDrop {
+    fn into_inner(mut self) -> OngoingCodegen {
+        self.0.take().unwrap()
+    }
+}
+
+impl Deref for AbortCodegenOnDrop {
+    type Target = OngoingCodegen;
+
+    fn deref(&self) -> &OngoingCodegen {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl DerefMut for AbortCodegenOnDrop {
+    fn deref_mut(&mut self) -> &mut OngoingCodegen {
+        self.0.as_mut().unwrap()
+    }
+}
+
+impl Drop for AbortCodegenOnDrop {
+    fn drop(&mut self) {
+        if let Some(codegen) = self.0.take() {
+            codegen.codegen_aborted();
+        }
+    }
 }
 
 fn assert_and_save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
@@ -947,128 +994,6 @@ fn assert_and_save_dep_graph<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
          || rustc_incremental::save_dep_graph(tcx));
 }
 
-fn collect_and_partition_mono_items<'a, 'tcx>(
-    tcx: TyCtxt<'a, 'tcx, 'tcx>,
-    cnum: CrateNum,
-) -> (Arc<DefIdSet>, Arc<Vec<Arc<CodegenUnit<'tcx>>>>)
-{
-    assert_eq!(cnum, LOCAL_CRATE);
-
-    let collection_mode = match tcx.sess.opts.debugging_opts.print_mono_items {
-        Some(ref s) => {
-            let mode_string = s.to_lowercase();
-            let mode_string = mode_string.trim();
-            if mode_string == "eager" {
-                MonoItemCollectionMode::Eager
-            } else {
-                if mode_string != "lazy" {
-                    let message = format!("Unknown codegen-item collection mode '{}'. \
-                                           Falling back to 'lazy' mode.",
-                                           mode_string);
-                    tcx.sess.warn(&message);
-                }
-
-                MonoItemCollectionMode::Lazy
-            }
-        }
-        None => {
-            if tcx.sess.opts.cg.link_dead_code {
-                MonoItemCollectionMode::Eager
-            } else {
-                MonoItemCollectionMode::Lazy
-            }
-        }
-    };
-
-    let (items, inlining_map) =
-        time(tcx.sess, "monomorphization collection", || {
-            collector::collect_crate_mono_items(tcx, collection_mode)
-    });
-
-    tcx.sess.abort_if_errors();
-
-    ::rustc_mir::monomorphize::assert_symbols_are_distinct(tcx, items.iter());
-
-    let strategy = if tcx.sess.opts.incremental.is_some() {
-        PartitioningStrategy::PerModule
-    } else {
-        PartitioningStrategy::FixedUnitCount(tcx.sess.codegen_units())
-    };
-
-    let codegen_units = time(tcx.sess, "codegen unit partitioning", || {
-        partitioning::partition(tcx,
-                                items.iter().cloned(),
-                                strategy,
-                                &inlining_map)
-            .into_iter()
-            .map(Arc::new)
-            .collect::<Vec<_>>()
-    });
-
-    let mono_items: DefIdSet = items.iter().filter_map(|mono_item| {
-        match *mono_item {
-            MonoItem::Fn(ref instance) => Some(instance.def_id()),
-            MonoItem::Static(def_id) => Some(def_id),
-            _ => None,
-        }
-    }).collect();
-
-    if tcx.sess.opts.debugging_opts.print_mono_items.is_some() {
-        let mut item_to_cgus: FxHashMap<_, Vec<_>> = FxHashMap();
-
-        for cgu in &codegen_units {
-            for (&mono_item, &linkage) in cgu.items() {
-                item_to_cgus.entry(mono_item)
-                            .or_default()
-                            .push((cgu.name().clone(), linkage));
-            }
-        }
-
-        let mut item_keys: Vec<_> = items
-            .iter()
-            .map(|i| {
-                let mut output = i.to_string(tcx);
-                output.push_str(" @@");
-                let mut empty = Vec::new();
-                let cgus = item_to_cgus.get_mut(i).unwrap_or(&mut empty);
-                cgus.as_mut_slice().sort_by_key(|&(ref name, _)| name.clone());
-                cgus.dedup();
-                for &(ref cgu_name, (linkage, _)) in cgus.iter() {
-                    output.push_str(" ");
-                    output.push_str(&cgu_name.as_str());
-
-                    let linkage_abbrev = match linkage {
-                        Linkage::External => "External",
-                        Linkage::AvailableExternally => "Available",
-                        Linkage::LinkOnceAny => "OnceAny",
-                        Linkage::LinkOnceODR => "OnceODR",
-                        Linkage::WeakAny => "WeakAny",
-                        Linkage::WeakODR => "WeakODR",
-                        Linkage::Appending => "Appending",
-                        Linkage::Internal => "Internal",
-                        Linkage::Private => "Private",
-                        Linkage::ExternalWeak => "ExternalWeak",
-                        Linkage::Common => "Common",
-                    };
-
-                    output.push_str("[");
-                    output.push_str(linkage_abbrev);
-                    output.push_str("]");
-                }
-                output
-            })
-            .collect();
-
-        item_keys.sort();
-
-        for item in item_keys {
-            println!("MONO_ITEM {}", item);
-        }
-    }
-
-    (Arc::new(mono_items), Arc::new(codegen_units))
-}
-
 impl CrateInfo {
     pub fn new(tcx: TyCtxt) -> CrateInfo {
         let mut info = CrateInfo {
@@ -1076,17 +1001,17 @@ impl CrateInfo {
             compiler_builtins: None,
             profiler_runtime: None,
             sanitizer_runtime: None,
-            is_no_builtins: FxHashSet(),
-            native_libraries: FxHashMap(),
+            is_no_builtins: Default::default(),
+            native_libraries: Default::default(),
             used_libraries: tcx.native_libraries(LOCAL_CRATE),
             link_args: tcx.link_args(LOCAL_CRATE),
-            crate_name: FxHashMap(),
+            crate_name: Default::default(),
             used_crates_dynamic: cstore::used_crates(tcx, LinkagePreference::RequireDynamic),
             used_crates_static: cstore::used_crates(tcx, LinkagePreference::RequireStatic),
-            used_crate_source: FxHashMap(),
-            wasm_imports: FxHashMap(),
-            lang_item_to_crate: FxHashMap(),
-            missing_lang_items: FxHashMap(),
+            used_crate_source: Default::default(),
+            wasm_imports: Default::default(),
+            lang_item_to_crate: Default::default(),
+            missing_lang_items: Default::default(),
         };
         let lang_items = tcx.lang_items();
 
@@ -1099,7 +1024,15 @@ impl CrateInfo {
             info.load_wasm_imports(tcx, LOCAL_CRATE);
         }
 
-        for &cnum in tcx.crates().iter() {
+        let crates = tcx.crates();
+
+        let n_crates = crates.len();
+        info.native_libraries.reserve(n_crates);
+        info.crate_name.reserve(n_crates);
+        info.used_crate_source.reserve(n_crates);
+        info.missing_lang_items.reserve(n_crates);
+
+        for &cnum in crates.iter() {
             info.native_libraries.insert(cnum, tcx.native_libraries(cnum));
             info.crate_name.insert(cnum, tcx.crate_name(cnum).to_string());
             info.used_crate_source.insert(cnum, tcx.used_crate_source(cnum));
@@ -1141,26 +1074,25 @@ impl CrateInfo {
     }
 
     fn load_wasm_imports(&mut self, tcx: TyCtxt, cnum: CrateNum) {
-        for (&id, module) in tcx.wasm_import_module_map(cnum).iter() {
+        self.wasm_imports.extend(tcx.wasm_import_module_map(cnum).iter().map(|(&id, module)| {
             let instance = Instance::mono(tcx, id);
             let import_name = tcx.symbol_name(instance);
-            self.wasm_imports.insert(import_name.to_string(), module.clone());
-        }
+
+            (import_name.to_string(), module.clone())
+        }));
     }
 }
 
-fn is_codegened_item(tcx: TyCtxt, id: DefId) -> bool {
-    let (all_mono_items, _) =
-        tcx.collect_and_partition_mono_items(LOCAL_CRATE);
-    all_mono_items.contains(&id)
-}
-
 fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
-                                  cgu: InternedString) -> Stats {
-    let cgu = tcx.codegen_unit(cgu);
-
+                                  cgu_name: InternedString)
+                                  -> Stats {
     let start_time = Instant::now();
-    let (stats, module) = module_codegen(tcx, cgu);
+
+    let dep_node = tcx.codegen_unit(cgu_name).codegen_dep_node(tcx);
+    let ((stats, module), _) = tcx.dep_graph.with_task(dep_node,
+                                                       tcx,
+                                                       cgu_name,
+                                                       module_codegen);
     let time_to_codegen = start_time.elapsed();
 
     // We assume that the cost to run LLVM on a CGU is proportional to
@@ -1169,23 +1101,23 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                time_to_codegen.subsec_nanos() as u64;
 
     write::submit_codegened_module_to_llvm(tcx,
-                                            module,
-                                            cost);
+                                           module,
+                                           cost);
     return stats;
 
     fn module_codegen<'a, 'tcx>(
         tcx: TyCtxt<'a, 'tcx, 'tcx>,
-        cgu: Arc<CodegenUnit<'tcx>>)
+        cgu_name: InternedString)
         -> (Stats, ModuleCodegen)
     {
-        let cgu_name = cgu.name().to_string();
+        let cgu = tcx.codegen_unit(cgu_name);
 
         // Instantiate monomorphizations without filling out definitions yet...
-        let llvm_module = ModuleLlvm::new(tcx.sess, &cgu_name);
+        let llvm_module = ModuleLlvm::new(tcx.sess, &cgu_name.as_str());
         let stats = {
             let cx = CodegenCx::new(tcx, cgu, &llvm_module);
             let mono_items = cx.codegen_unit
-                                 .items_in_deterministic_order(cx.tcx);
+                               .items_in_deterministic_order(cx.tcx);
             for &(mono_item, (linkage, visibility)) in &mono_items {
                 mono_item.predefine(&cx, linkage, visibility);
             }
@@ -1234,32 +1166,14 @@ fn compile_codegen_unit<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         };
 
         (stats, ModuleCodegen {
-            name: cgu_name,
-            source: ModuleSource::Codegened(llvm_module),
+            name: cgu_name.to_string(),
+            module_llvm: llvm_module,
             kind: ModuleKind::Regular,
         })
     }
 }
 
-pub fn provide(providers: &mut Providers) {
-    providers.collect_and_partition_mono_items =
-        collect_and_partition_mono_items;
-
-    providers.is_codegened_item = is_codegened_item;
-
-    providers.codegen_unit = |tcx, name| {
-        let (_, all) = tcx.collect_and_partition_mono_items(LOCAL_CRATE);
-        all.iter()
-            .find(|cgu| *cgu.name() == name)
-            .cloned()
-            .unwrap_or_else(|| panic!("failed to find cgu with name {:?}", name))
-    };
-    providers.compile_codegen_unit = compile_codegen_unit;
-
-    provide_extern(providers);
-}
-
-pub fn provide_extern(providers: &mut Providers) {
+pub fn provide_both(providers: &mut Providers) {
     providers.dllimport_foreign_items = |tcx, krate| {
         let module_map = tcx.foreign_modules(krate);
         let module_map = module_map.iter()

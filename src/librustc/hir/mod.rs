@@ -27,7 +27,7 @@ use syntax_pos::{Span, DUMMY_SP, symbol::InternedString};
 use syntax::source_map::{self, Spanned};
 use rustc_target::spec::abi::Abi;
 use syntax::ast::{self, CrateSugar, Ident, Name, NodeId, DUMMY_NODE_ID, AsmDialect};
-use syntax::ast::{Attribute, Lit, StrStyle, FloatTy, IntTy, UintTy, MetaItem};
+use syntax::ast::{Attribute, Lit, StrStyle, FloatTy, IntTy, UintTy};
 use syntax::attr::InlineAttr;
 use syntax::ext::hygiene::SyntaxContext;
 use syntax::ptr::P;
@@ -37,7 +37,6 @@ use syntax::util::parser::ExprPrecedence;
 use ty::AdtKind;
 use ty::query::Providers;
 
-use rustc_data_structures::indexed_vec;
 use rustc_data_structures::sync::{ParallelIterator, par_iter, Send, Sync, scope};
 use rustc_data_structures::thin_vec::ThinVec;
 
@@ -58,7 +57,6 @@ macro_rules! hir_vec {
     ($($x:expr),*) => (
         $crate::hir::HirVec::from(vec![$($x),*])
     );
-    ($($x:expr,)*) => (hir_vec![$($x),*])
 }
 
 pub mod check_attr;
@@ -121,40 +119,28 @@ impl serialize::UseSpecializedDecodable for HirId {
     }
 }
 
-
-/// An `ItemLocalId` uniquely identifies something within a given "item-like",
-/// that is within a hir::Item, hir::TraitItem, or hir::ImplItem. There is no
-/// guarantee that the numerical value of a given `ItemLocalId` corresponds to
-/// the node's position within the owning item in any way, but there is a
-/// guarantee that the `LocalItemId`s within an owner occupy a dense range of
-/// integers starting at zero, so a mapping that maps all or most nodes within
-/// an "item-like" to something else can be implement by a `Vec` instead of a
-/// tree or hash map.
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug,
-         RustcEncodable, RustcDecodable)]
-pub struct ItemLocalId(pub u32);
-
-impl ItemLocalId {
-    pub fn as_usize(&self) -> usize {
-        self.0 as usize
+// hack to ensure that we don't try to access the private parts of `ItemLocalId` in this module
+mod item_local_id_inner {
+    use rustc_data_structures::indexed_vec::Idx;
+    /// An `ItemLocalId` uniquely identifies something within a given "item-like",
+    /// that is within a hir::Item, hir::TraitItem, or hir::ImplItem. There is no
+    /// guarantee that the numerical value of a given `ItemLocalId` corresponds to
+    /// the node's position within the owning item in any way, but there is a
+    /// guarantee that the `LocalItemId`s within an owner occupy a dense range of
+    /// integers starting at zero, so a mapping that maps all or most nodes within
+    /// an "item-like" to something else can be implement by a `Vec` instead of a
+    /// tree or hash map.
+    newtype_index! {
+        pub struct ItemLocalId { .. }
     }
 }
 
-impl indexed_vec::Idx for ItemLocalId {
-    fn new(idx: usize) -> Self {
-        debug_assert!((idx as u32) as usize == idx);
-        ItemLocalId(idx as u32)
-    }
-
-    fn index(self) -> usize {
-        self.0 as usize
-    }
-}
+pub use self::item_local_id_inner::ItemLocalId;
 
 /// The `HirId` corresponding to CRATE_NODE_ID and CRATE_DEF_INDEX
 pub const CRATE_HIR_ID: HirId = HirId {
     owner: CRATE_DEF_INDEX,
-    local_id: ItemLocalId(0)
+    local_id: ItemLocalId::from_u32_const(0)
 };
 
 pub const DUMMY_HIR_ID: HirId = HirId {
@@ -162,7 +148,7 @@ pub const DUMMY_HIR_ID: HirId = HirId {
     local_id: DUMMY_ITEM_LOCAL_ID,
 };
 
-pub const DUMMY_ITEM_LOCAL_ID: ItemLocalId = ItemLocalId(!0);
+pub const DUMMY_ITEM_LOCAL_ID: ItemLocalId = ItemLocalId::MAX;
 
 #[derive(Clone, RustcEncodable, RustcDecodable, Copy)]
 pub struct Label {
@@ -170,7 +156,7 @@ pub struct Label {
 }
 
 impl fmt::Debug for Label {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "label({:?})", self.ident)
     }
 }
@@ -208,13 +194,18 @@ pub enum ParamName {
     /// where `'f` is something like `Fresh(0)`. The indices are
     /// unique per impl, but not necessarily continuous.
     Fresh(usize),
+
+    /// Indicates an illegal name was given and an error has been
+    /// repored (so we should squelch other derived errors). Occurs
+    /// when e.g. `'_` is used in the wrong place.
+    Error,
 }
 
 impl ParamName {
     pub fn ident(&self) -> Ident {
         match *self {
             ParamName::Plain(ident) => ident,
-            ParamName::Fresh(_) => keywords::UnderscoreLifetime.ident(),
+            ParamName::Error | ParamName::Fresh(_) => keywords::UnderscoreLifetime.ident(),
         }
     }
 
@@ -234,6 +225,10 @@ pub enum LifetimeName {
     /// User typed nothing. e.g. the lifetime in `&u32`.
     Implicit,
 
+    /// Indicates an error during lowering (usually `'_` in wrong place)
+    /// that was already reported.
+    Error,
+
     /// User typed `'_`.
     Underscore,
 
@@ -245,6 +240,7 @@ impl LifetimeName {
     pub fn ident(&self) -> Ident {
         match *self {
             LifetimeName::Implicit => keywords::Invalid.ident(),
+            LifetimeName::Error => keywords::Invalid.ident(),
             LifetimeName::Underscore => keywords::UnderscoreLifetime.ident(),
             LifetimeName::Static => keywords::StaticLifetime.ident(),
             LifetimeName::Param(param_name) => param_name.ident(),
@@ -260,7 +256,7 @@ impl LifetimeName {
             // in the compiler is concerned -- `Fresh(_)` variants act
             // equivalently to "some fresh name". They correspond to
             // early-bound regions on an impl, in other words.
-            LifetimeName::Param(_) | LifetimeName::Static => false,
+            LifetimeName::Error | LifetimeName::Param(_) | LifetimeName::Static => false,
         }
     }
 
@@ -277,13 +273,13 @@ impl LifetimeName {
 }
 
 impl fmt::Display for Lifetime {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.name.ident().fmt(f)
     }
 }
 
 impl fmt::Debug for Lifetime {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f,
                "lifetime({}: {})",
                self.id,
@@ -320,13 +316,13 @@ impl Path {
 }
 
 impl fmt::Debug for Path {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "path({})", print::to_string(print::NO_ANN, |s| s.print_path(self, false)))
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "path({})", self)
     }
 }
 
 impl fmt::Display for Path {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", print::to_string(print::NO_ANN, |s| s.print_path(self, false)))
     }
 }
@@ -337,6 +333,13 @@ impl fmt::Display for Path {
 pub struct PathSegment {
     /// The identifier portion of this path segment.
     pub ident: Ident,
+    // `id` and `def` are optional. We currently only use these in save-analysis,
+    // any path segments without these will not have save-analysis info and
+    // therefore will not have 'jump to def' in IDEs, but otherwise will not be
+    // affected. (In general, we don't bother to get the defs for synthesized
+    // segments, only for segments which have come from the AST).
+    pub id: Option<NodeId>,
+    pub def: Option<Def>,
 
     /// Type/lifetime parameters attached to this path. They come in
     /// two flavors: `Path<A,B,C>` and `Path(A,B) -> C`. Note that
@@ -357,14 +360,24 @@ impl PathSegment {
     pub fn from_ident(ident: Ident) -> PathSegment {
         PathSegment {
             ident,
+            id: None,
+            def: None,
             infer_types: true,
             args: None,
         }
     }
 
-    pub fn new(ident: Ident, args: GenericArgs, infer_types: bool) -> Self {
+    pub fn new(
+        ident: Ident,
+        id: Option<NodeId>,
+        def: Option<Def>,
+        args: GenericArgs,
+        infer_types: bool,
+    ) -> Self {
         PathSegment {
             ident,
+            id,
+            def,
             infer_types,
             args: if args.is_empty() {
                 None
@@ -479,9 +492,9 @@ pub enum TraitBoundModifier {
 }
 
 /// The AST represents all type param bounds as types.
-/// typeck::collect::compute_bounds matches these against
-/// the "special" built-in traits (see middle::lang_items) and
-/// detects Copy, Send and Sync.
+/// `typeck::collect::compute_bounds` matches these against
+/// the "special" built-in traits (see `middle::lang_items`) and
+/// detects `Copy`, `Send` and `Sync`.
 #[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
 pub enum GenericBound {
     Trait(PolyTraitRef, TraitBoundModifier),
@@ -499,14 +512,30 @@ impl GenericBound {
 
 pub type GenericBounds = HirVec<GenericBound>;
 
+#[derive(Copy, Clone, PartialEq, Eq, RustcEncodable, RustcDecodable, Debug)]
+pub enum LifetimeParamKind {
+    // Indicates that the lifetime definition was explicitly declared, like:
+    // `fn foo<'a>(x: &'a u8) -> &'a u8 { x }`
+    Explicit,
+
+    // Indicates that the lifetime definition was synthetically added
+    // as a result of an in-band lifetime usage like:
+    // `fn foo(x: &'a u8) -> &'a u8 { x }`
+    InBand,
+
+    // Indication that the lifetime was elided like both cases here:
+    // `fn foo(x: &u8) -> &'_ u8 { x }`
+    Elided,
+
+    // Indication that the lifetime name was somehow in error.
+    Error,
+}
+
 #[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
 pub enum GenericParamKind {
     /// A lifetime definition, eg `'a: 'b + 'c + 'd`.
     Lifetime {
-        // Indicates that the lifetime definition was synthetically added
-        // as a result of an in-band lifetime usage like:
-        // `fn foo(x: &'a u8) -> &'a u8 { x }`
-        in_band: bool,
+        kind: LifetimeParamKind,
     },
     Type {
         default: Option<P<Ty>>,
@@ -655,8 +684,6 @@ pub struct WhereEqPredicate {
     pub rhs_ty: P<Ty>,
 }
 
-pub type CrateConfig = HirVec<P<MetaItem>>;
-
 /// The top-level data structure that stores the entire contents of
 /// the crate currently being compiled.
 ///
@@ -804,7 +831,7 @@ pub struct Pat {
 }
 
 impl fmt::Debug for Pat {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "pat({}: {})", self.id,
                print::to_string(print::NO_ANN, |s| s.print_pat(self)))
     }
@@ -831,9 +858,10 @@ impl Pat {
                 s.walk_(it)
             }
             PatKind::Slice(ref before, ref slice, ref after) => {
-                before.iter().all(|p| p.walk_(it)) &&
-                slice.iter().all(|p| p.walk_(it)) &&
-                after.iter().all(|p| p.walk_(it))
+                before.iter()
+                      .chain(slice.iter())
+                      .chain(after.iter())
+                      .all(|p| p.walk_(it))
             }
             PatKind::Wild |
             PatKind::Lit(_) |
@@ -872,23 +900,23 @@ pub struct FieldPat {
 /// inference.
 #[derive(Clone, PartialEq, RustcEncodable, RustcDecodable, Debug, Copy)]
 pub enum BindingAnnotation {
-  /// No binding annotation given: this means that the final binding mode
-  /// will depend on whether we have skipped through a `&` reference
-  /// when matching. For example, the `x` in `Some(x)` will have binding
-  /// mode `None`; if you do `let Some(x) = &Some(22)`, it will
-  /// ultimately be inferred to be by-reference.
-  ///
-  /// Note that implicit reference skipping is not implemented yet (#42640).
-  Unannotated,
+    /// No binding annotation given: this means that the final binding mode
+    /// will depend on whether we have skipped through a `&` reference
+    /// when matching. For example, the `x` in `Some(x)` will have binding
+    /// mode `None`; if you do `let Some(x) = &Some(22)`, it will
+    /// ultimately be inferred to be by-reference.
+    ///
+    /// Note that implicit reference skipping is not implemented yet (#42640).
+    Unannotated,
 
-  /// Annotated with `mut x` -- could be either ref or not, similar to `None`.
-  Mutable,
+    /// Annotated with `mut x` -- could be either ref or not, similar to `None`.
+    Mutable,
 
-  /// Annotated as `ref`, like `ref x`
-  Ref,
+    /// Annotated as `ref`, like `ref x`
+    Ref,
 
-  /// Annotated as `ref mut x`.
-  RefMut,
+    /// Annotated as `ref mut x`.
+    RefMut,
 }
 
 #[derive(Copy, Clone, PartialEq, RustcEncodable, RustcDecodable, Debug)]
@@ -1119,7 +1147,7 @@ impl UnOp {
 pub type Stmt = Spanned<StmtKind>;
 
 impl fmt::Debug for StmtKind {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Sadness.
         let spanned = source_map::dummy_spanned(self.clone());
         write!(f,
@@ -1152,8 +1180,8 @@ impl StmtKind {
 
     pub fn id(&self) -> NodeId {
         match *self {
-            StmtKind::Decl(_, id) => id,
-            StmtKind::Expr(_, id) => id,
+            StmtKind::Decl(_, id) |
+            StmtKind::Expr(_, id) |
             StmtKind::Semi(_, id) => id,
         }
     }
@@ -1204,8 +1232,13 @@ impl DeclKind {
 pub struct Arm {
     pub attrs: HirVec<Attribute>,
     pub pats: HirVec<P<Pat>>,
-    pub guard: Option<P<Expr>>,
+    pub guard: Option<Guard>,
     pub body: P<Expr>,
+}
+
+#[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
+pub enum Guard {
+    If(P<Expr>),
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
@@ -1339,10 +1372,63 @@ impl Expr {
             ExprKind::Yield(..) => ExprPrecedence::Yield,
         }
     }
+
+    pub fn is_place_expr(&self) -> bool {
+         match self.node {
+            ExprKind::Path(QPath::Resolved(_, ref path)) => {
+                match path.def {
+                    Def::Local(..) | Def::Upvar(..) | Def::Static(..) | Def::Err => true,
+                    _ => false,
+                }
+            }
+
+            ExprKind::Type(ref e, _) => {
+                e.is_place_expr()
+            }
+
+            ExprKind::Unary(UnDeref, _) |
+            ExprKind::Field(..) |
+            ExprKind::Index(..) => {
+                true
+            }
+
+            // Partially qualified paths in expressions can only legally
+            // refer to associated items which are always rvalues.
+            ExprKind::Path(QPath::TypeRelative(..)) |
+
+            ExprKind::Call(..) |
+            ExprKind::MethodCall(..) |
+            ExprKind::Struct(..) |
+            ExprKind::Tup(..) |
+            ExprKind::If(..) |
+            ExprKind::Match(..) |
+            ExprKind::Closure(..) |
+            ExprKind::Block(..) |
+            ExprKind::Repeat(..) |
+            ExprKind::Array(..) |
+            ExprKind::Break(..) |
+            ExprKind::Continue(..) |
+            ExprKind::Ret(..) |
+            ExprKind::While(..) |
+            ExprKind::Loop(..) |
+            ExprKind::Assign(..) |
+            ExprKind::InlineAsm(..) |
+            ExprKind::AssignOp(..) |
+            ExprKind::Lit(_) |
+            ExprKind::Unary(..) |
+            ExprKind::Box(..) |
+            ExprKind::AddrOf(..) |
+            ExprKind::Binary(..) |
+            ExprKind::Yield(..) |
+            ExprKind::Cast(..) => {
+                false
+            }
+        }
+    }
 }
 
 impl fmt::Debug for Expr {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "expr({}: {})", self.id,
                print::to_string(print::NO_ANN, |s| s.print_expr(self)))
     }
@@ -1515,7 +1601,7 @@ pub enum LoopIdError {
 }
 
 impl fmt::Display for LoopIdError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(match *self {
             LoopIdError::OutsideLoopScope => "not inside loop scope",
             LoopIdError::UnlabeledCfInWhileCondition =>
@@ -1653,7 +1739,6 @@ pub struct TypeBinding {
     pub span: Span,
 }
 
-
 #[derive(Clone, RustcEncodable, RustcDecodable)]
 pub struct Ty {
     pub id: NodeId,
@@ -1663,7 +1748,7 @@ pub struct Ty {
 }
 
 impl fmt::Debug for Ty {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "type({})",
                print::to_string(print::NO_ANN, |s| s.print_type(self)))
     }
@@ -1718,6 +1803,12 @@ pub enum TyKind {
     ///
     /// Type parameters may be stored in each `PathSegment`.
     Path(QPath),
+    /// A type definition itself. This is currently only used for the `existential type`
+    /// item that `impl Trait` in return position desugars to.
+    ///
+    /// The generic arg list are the lifetimes (and in the future possibly parameters) that are
+    /// actually bound on the `impl Trait`.
+    Def(ItemId, HirVec<GenericArg>),
     /// A trait object type `Bound1 + Bound2 + Bound3`
     /// where `Bound` is a trait or a lifetime.
     TraitObject(HirVec<PolyTraitRef>, Lifetime),
@@ -1735,6 +1826,7 @@ pub struct InlineAsmOutput {
     pub constraint: Symbol,
     pub is_rw: bool,
     pub is_indirect: bool,
+    pub span: Span,
 }
 
 #[derive(Clone, RustcEncodable, RustcDecodable, Debug)]
@@ -1764,9 +1856,34 @@ pub struct FnDecl {
     pub inputs: HirVec<Ty>,
     pub output: FunctionRetTy,
     pub variadic: bool,
-    /// True if this function has an `self`, `&self` or `&mut self` receiver
-    /// (but not a `self: Xxx` one).
-    pub has_implicit_self: bool,
+    /// Does the function have an implicit self?
+    pub implicit_self: ImplicitSelfKind,
+}
+
+/// Represents what type of implicit self a function has, if any.
+#[derive(Clone, Copy, RustcEncodable, RustcDecodable, Debug)]
+pub enum ImplicitSelfKind {
+    /// Represents a `fn x(self);`.
+    Imm,
+    /// Represents a `fn x(mut self);`.
+    Mut,
+    /// Represents a `fn x(&self);`.
+    ImmRef,
+    /// Represents a `fn x(&mut self);`.
+    MutRef,
+    /// Represents when a function does not have a self argument or
+    /// when a function has a `self: X` argument.
+    None
+}
+
+impl ImplicitSelfKind {
+    /// Does this represent an implicit self?
+    pub fn has_implicit_self(&self) -> bool {
+        match *self {
+            ImplicitSelfKind::None => false,
+            _ => true,
+        }
+    }
 }
 
 /// Is the trait definition an auto trait?
@@ -1821,7 +1938,7 @@ impl Defaultness {
 }
 
 impl fmt::Display for Unsafety {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(match *self {
                               Unsafety::Normal => "normal",
                               Unsafety::Unsafe => "unsafe",
@@ -1839,7 +1956,7 @@ pub enum ImplPolarity {
 }
 
 impl fmt::Debug for ImplPolarity {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             ImplPolarity::Positive => "positive".fmt(f),
             ImplPolarity::Negative => "negative".fmt(f),
@@ -2280,7 +2397,7 @@ pub type TraitMap = NodeMap<Vec<TraitCandidate>>;
 pub type GlobMap = NodeMap<FxHashSet<Name>>;
 
 
-pub fn provide(providers: &mut Providers) {
+pub fn provide(providers: &mut Providers<'_>) {
     providers.describe_def = map::describe_def;
 }
 
@@ -2365,9 +2482,22 @@ impl CodegenFnAttrs {
         }
     }
 
-    /// True if `#[no_mangle]` or `#[export_name(...)]` is present.
+    /// True if it looks like this symbol needs to be exported, for example:
+    ///
+    /// * `#[no_mangle]` is present
+    /// * `#[export_name(...)]` is present
+    /// * `#[linkage]` is present
     pub fn contains_extern_indicator(&self) -> bool {
-        self.flags.contains(CodegenFnAttrFlags::NO_MANGLE) || self.export_name.is_some()
+        self.flags.contains(CodegenFnAttrFlags::NO_MANGLE) ||
+            self.export_name.is_some() ||
+            match self.linkage {
+                // these are private, make sure we don't try to consider
+                // them external
+                None |
+                Some(Linkage::Internal) |
+                Some(Linkage::Private) => false,
+                Some(_) => true,
+            }
     }
 }
 
@@ -2382,6 +2512,7 @@ pub enum Node<'hir> {
     AnonConst(&'hir AnonConst),
     Expr(&'hir Expr),
     Stmt(&'hir Stmt),
+    PathSegment(&'hir PathSegment),
     Ty(&'hir Ty),
     TraitRef(&'hir TraitRef),
     Binding(&'hir Pat),

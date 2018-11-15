@@ -8,8 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-use rustc_data_structures::sync::{RwLock, ReadGuard};
-use std::mem;
+use rustc_data_structures::sync::{RwLock, ReadGuard, MappedReadGuard};
 
 /// The `Steal` struct is intended to used as the value for a query.
 /// Specifically, we sometimes have queries (*cough* MIR *cough*)
@@ -42,7 +41,7 @@ impl<T> Steal<T> {
         }
     }
 
-    pub fn borrow(&self) -> ReadGuard<T> {
+    pub fn borrow(&self) -> MappedReadGuard<'_, T> {
         ReadGuard::map(self.value.borrow(), |opt| match *opt {
             None => bug!("attempted to read from stolen value"),
             Some(ref v) => v
@@ -51,7 +50,7 @@ impl<T> Steal<T> {
 
     pub fn steal(&self) -> T {
         let value_ref = &mut *self.value.try_write().expect("stealing value which is locked");
-        let value = mem::replace(value_ref, None);
+        let value = value_ref.take();
         value.expect("attempt to read from stolen value")
     }
 }

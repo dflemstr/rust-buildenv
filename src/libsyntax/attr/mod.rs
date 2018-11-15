@@ -15,7 +15,7 @@ mod builtin;
 pub use self::builtin::{
     cfg_matches, contains_feature_attr, eval_condition, find_crate_name, find_deprecation,
     find_repr_attrs, find_stability, find_unwind_attr, Deprecation, InlineAttr, IntType, ReprAttr,
-    RustcConstUnstable, RustcDeprecation, Stability, StabilityLevel, UnwindAttr,
+    RustcDeprecation, Stability, StabilityLevel, UnwindAttr,
 };
 pub use self::IntType::*;
 pub use self::ReprAttr::*;
@@ -34,7 +34,7 @@ use parse::token::{self, Token};
 use ptr::P;
 use symbol::Symbol;
 use ThinVec;
-use tokenstream::{TokenStream, TokenTree, Delimited};
+use tokenstream::{TokenStream, TokenTree, Delimited, DelimSpan};
 use GLOBALS;
 
 use std::iter;
@@ -217,6 +217,15 @@ impl Attribute {
 impl MetaItem {
     pub fn name(&self) -> Name {
         name_from_path(&self.ident)
+    }
+
+    // #[attribute(name = "value")]
+    //             ^^^^^^^^^^^^^^
+    pub fn name_value_literal(&self) -> Option<&Lit> {
+        match &self.node {
+            MetaItemKind::NameValue(v) => Some(v),
+            _ => None,
+        }
     }
 
     pub fn value_str(&self) -> Option<Symbol> {
@@ -446,6 +455,11 @@ pub fn find_by_name<'a>(attrs: &'a [Attribute], name: &str) -> Option<&'a Attrib
     attrs.iter().find(|attr| attr.check_name(name))
 }
 
+pub fn filter_by_name<'a>(attrs: &'a [Attribute], name: &'a str)
+    -> impl Iterator<Item = &'a Attribute> {
+    attrs.iter().filter(move |attr| attr.check_name(name))
+}
+
 pub fn first_attr_value_str_by_name(attrs: &[Attribute], name: &str) -> Option<Symbol> {
     attrs.iter()
         .find(|at| at.check_name(name))
@@ -535,7 +549,7 @@ impl MetaItemKind {
                     }
                     tokens.push(item.node.tokens());
                 }
-                TokenTree::Delimited(span, Delimited {
+                TokenTree::Delimited(DelimSpan::from_single(span), Delimited {
                     delim: token::Paren,
                     tts: TokenStream::concat(tokens).into(),
                 }).into()

@@ -10,14 +10,14 @@
 
 use ast::{self, Arg, Arm, Block, Expr, Item, Pat, Stmt, Ty};
 use source_map::respan;
-use syntax_pos::Span;
+use syntax_pos::{Span, DUMMY_SP};
 use ext::base::ExtCtxt;
 use ext::base;
 use ext::build::AstBuilder;
 use parse::parser::{Parser, PathStyle};
 use parse::token;
 use ptr::P;
-use tokenstream::{TokenStream, TokenTree};
+use tokenstream::{DelimSpan, TokenStream, TokenTree};
 
 /// Quasiquoting works via token trees.
 ///
@@ -36,7 +36,7 @@ pub mod rt {
     use symbol::Symbol;
     use ThinVec;
 
-    use tokenstream::{self, TokenTree, TokenStream};
+    use tokenstream::{self, DelimSpan, TokenTree, TokenStream};
 
     pub use parse::new_parser_from_tts;
     pub use syntax_pos::{BytePos, Span, DUMMY_SP, FileName};
@@ -245,7 +245,8 @@ pub mod rt {
             }
             inner.push(self.tokens.clone());
 
-            r.push(TokenTree::Delimited(self.span, tokenstream::Delimited {
+            let delim_span = DelimSpan::from_single(self.span);
+            r.push(TokenTree::Delimited(delim_span, tokenstream::Delimited {
                 delim: token::Bracket, tts: TokenStream::concat(inner).into()
             }));
             r
@@ -261,7 +262,7 @@ pub mod rt {
 
     impl ToTokens for () {
         fn to_tokens(&self, _cx: &ExtCtxt) -> Vec<TokenTree> {
-            vec![TokenTree::Delimited(DUMMY_SP, tokenstream::Delimited {
+            vec![TokenTree::Delimited(DelimSpan::dummy(), tokenstream::Delimited {
                 delim: token::Paren,
                 tts: TokenStream::empty().into(),
             })]
@@ -273,7 +274,7 @@ pub mod rt {
             // FIXME: This is wrong
             P(ast::Expr {
                 id: ast::DUMMY_NODE_ID,
-                node: ast::ExprKind::Lit(P(self.clone())),
+                node: ast::ExprKind::Lit(self.clone()),
                 span: DUMMY_SP,
                 attrs: ThinVec::new(),
             }).to_tokens(cx)
@@ -304,7 +305,7 @@ pub mod rt {
                     let lit = ast::LitKind::Int(val as u128, ast::LitIntType::Signed($tag));
                     let lit = P(ast::Expr {
                         id: ast::DUMMY_NODE_ID,
-                        node: ast::ExprKind::Lit(P(dummy_spanned(lit))),
+                        node: ast::ExprKind::Lit(dummy_spanned(lit)),
                         span: DUMMY_SP,
                         attrs: ThinVec::new(),
                     });
@@ -385,13 +386,16 @@ pub fn unflatten(tts: Vec<TokenTree>) -> Vec<TokenTree> {
 
     let mut results = Vec::new();
     let mut result = Vec::new();
+    let mut open_span = DUMMY_SP;
     for tree in tts {
         match tree {
-            TokenTree::Token(_, token::OpenDelim(..)) => {
+            TokenTree::Token(span, token::OpenDelim(..)) => {
+                open_span = span;
                 results.push(::std::mem::replace(&mut result, Vec::new()));
             }
             TokenTree::Token(span, token::CloseDelim(delim)) => {
-                let tree = TokenTree::Delimited(span, Delimited {
+                let delim_span = DelimSpan::from_pair(open_span, span);
+                let tree = TokenTree::Delimited(delim_span, Delimited {
                     delim,
                     tts: result.into_iter().map(TokenStream::from).collect::<TokenStream>().into(),
                 });
@@ -415,7 +419,7 @@ pub fn parse_item_panic(parser: &mut Parser) -> Option<P<Item>> {
 }
 
 pub fn parse_pat_panic(parser: &mut Parser) -> P<Pat> {
-    panictry!(parser.parse_pat())
+    panictry!(parser.parse_pat(None))
 }
 
 pub fn parse_arm_panic(parser: &mut Parser) -> Arm {
@@ -756,9 +760,9 @@ fn statements_mk_tt(cx: &ExtCtxt, tt: &TokenTree, quoted: bool) -> Vec<ast::Stmt
             vec![cx.stmt_expr(e_push)]
         },
         TokenTree::Delimited(span, ref delimed) => {
-            let mut stmts = statements_mk_tt(cx, &delimed.open_tt(span), false);
+            let mut stmts = statements_mk_tt(cx, &delimed.open_tt(span.open), false);
             stmts.extend(statements_mk_tts(cx, delimed.stream()));
-            stmts.extend(statements_mk_tt(cx, &delimed.close_tt(span), false));
+            stmts.extend(statements_mk_tt(cx, &delimed.close_tt(span.close), false));
             stmts
         }
     }

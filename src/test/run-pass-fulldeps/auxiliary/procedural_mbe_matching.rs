@@ -43,7 +43,7 @@ fn expand_mbe_matches(cx: &mut ExtCtxt, _: Span, args: &[TokenTree])
                                     &[],
                                     Edition::Edition2015,
                                     // not used...
-                                    NodeId::new(0));
+                                    NodeId::from_u32(0));
     let map = match TokenTree::parse(cx, &mbe_matcher, args.iter().cloned().collect()) {
         Success(map) => map,
         Failure(_, tok) => {
@@ -70,7 +70,8 @@ fn expand_mbe_matches(cx: &mut ExtCtxt, _: Span, args: &[TokenTree])
                     _ => unreachable!(),
                 }
             }).collect();
-            let arm = cx.arm(seq_sp, pats, cx.expr_bool(seq_sp, true));
+            let span = seq_sp.entire();
+            let arm = cx.arm(span, pats, cx.expr_bool(span, true));
 
             quote_expr!(cx,
                 match $matched_expr {

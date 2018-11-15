@@ -8,6 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// run-pass
+#![allow(unused_imports)]
+#![allow(non_camel_case_types)]
+
 // edition:2018
 
 #![feature(decl_macro, uniform_paths)]
@@ -56,4 +60,12 @@ fn main() {
     bar::io::stdout();
     bar::std();
     bar::std!();
+
+    {
+        // Test that having `io` in a module scope and a non-module
+        // scope is allowed, when both resolve to the same definition.
+        use std::io;
+        use io::stdout;
+        stdout();
+    }
 }

@@ -45,44 +45,16 @@ fn binop_right_homogeneous(op: mir::BinOp) -> bool {
     }
 }
 
-impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
-    pub fn inc_step_counter_and_detect_loops(&mut self) -> EvalResult<'tcx, ()> {
-        /// The number of steps between loop detector snapshots.
-        /// Should be a power of two for performance reasons.
-        const DETECTOR_SNAPSHOT_PERIOD: isize = 256;
-
-        {
-            let steps = &mut self.steps_since_detector_enabled;
-
-            *steps += 1;
-            if *steps < 0 {
-                return Ok(());
-            }
-
-            *steps %= DETECTOR_SNAPSHOT_PERIOD;
-            if *steps != 0 {
-                return Ok(());
-            }
-        }
-
-        if self.loop_detector.is_empty() {
-            // First run of the loop detector
-
-            // FIXME(#49980): make this warning a lint
-            self.tcx.sess.span_warn(self.frame().span,
-                "Constant evaluating a complex constant, this might take some time");
-        }
-
-        self.loop_detector.observe_and_analyze(&self.machine, &self.stack, &self.memory)
-    }
-
+impl<'a, 'mir, 'tcx, M: Machine<'a, 'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
     pub fn run(&mut self) -> EvalResult<'tcx> {
         while self.step()? {}
         Ok(())
     }
 
     /// Returns true as long as there are more things to do.
-    fn step(&mut self) -> EvalResult<'tcx, bool> {
+    ///
+    /// This is used by [priroda](https://github.com/oli-obk/priroda)
+    pub fn step(&mut self) -> EvalResult<'tcx, bool> {
         if self.stack.is_empty() {
             return Ok(false);
         }
@@ -100,7 +72,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
             return Ok(true);
         }
 
-        self.inc_step_counter_and_detect_loops()?;
+        M::before_terminator(self)?;
 
         let terminator = basic_block.terminator();
         assert_eq!(old_frames, self.cur_frame());
@@ -142,19 +114,23 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 self.deallocate_local(old_val)?;
             }
 
-            // No dynamic semantics attached to `ReadForMatch`; MIR
+            // No dynamic semantics attached to `FakeRead`; MIR
             // interpreter is solely intended for borrowck'ed code.
-            ReadForMatch(..) => {}
+            FakeRead(..) => {}
 
-            // Validity checks.
-            Validate(op, ref places) => {
-                for operand in places {
-                    M::validation_op(self, op, operand)?;
-                }
+            // Stacked Borrows.
+            Retag { fn_entry, ref place } => {
+                let dest = self.eval_place(place)?;
+                M::retag(self, fn_entry, dest)?;
+            }
+            EscapeToRaw(ref op) => {
+                let op = self.eval_operand(op, None)?;
+                M::escape_to_raw(self, op)?;
             }
 
+            // Statements we do not track.
             EndRegion(..) => {}
-            UserAssertTy(..) => {}
+            AscribeUserType(..) => {}
 
             // Defined to do nothing. These are added by optimization passes, to avoid changing the
             // size of MIR constantly.
@@ -188,9 +164,9 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
 
             BinaryOp(bin_op, ref left, ref right) => {
                 let layout = if binop_left_homogeneous(bin_op) { Some(dest.layout) } else { None };
-                let left = self.read_value(self.eval_operand(left, layout)?)?;
+                let left = self.read_immediate(self.eval_operand(left, layout)?)?;
                 let layout = if binop_right_homogeneous(bin_op) { Some(left.layout) } else { None };
-                let right = self.read_value(self.eval_operand(right, layout)?)?;
+                let right = self.read_immediate(self.eval_operand(right, layout)?)?;
                 self.binop_ignore_overflow(
                     bin_op,
                     left,
@@ -201,9 +177,9 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
 
             CheckedBinaryOp(bin_op, ref left, ref right) => {
                 // Due to the extra boolean in the result, we can never reuse the `dest.layout`.
-                let left = self.read_value(self.eval_operand(left, None)?)?;
+                let left = self.read_immediate(self.eval_operand(left, None)?)?;
                 let layout = if binop_right_homogeneous(bin_op) { Some(left.layout) } else { None };
-                let right = self.read_value(self.eval_operand(right, layout)?)?;
+                let right = self.read_immediate(self.eval_operand(right, layout)?)?;
                 self.binop_with_overflow(
                     bin_op,
                     left,
@@ -214,7 +190,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
 
             UnaryOp(un_op, ref operand) => {
                 // The operand always has the same type as the result.
-                let val = self.read_value(self.eval_operand(operand, Some(dest.layout))?)?;
+                let val = self.read_immediate(self.eval_operand(operand, Some(dest.layout))?)?;
                 let val = self.unary_op(un_op, val.to_scalar()?, dest.layout)?;
                 self.write_scalar(val, dest)?;
             }
@@ -246,7 +222,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
             Repeat(ref operand, _) => {
                 let op = self.eval_operand(operand, None)?;
                 let dest = self.force_allocation(dest)?;
-                let length = dest.len(&self)?;
+                let length = dest.len(self)?;
 
                 if length > 0 {
                     // write the first
@@ -256,7 +232,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                     if length > 1 {
                         // copy the rest
                         let (dest, dest_align) = first.to_scalar_ptr_align();
-                        let rest = dest.ptr_offset(first.layout.size, &self)?;
+                        let rest = dest.ptr_offset(first.layout.size, self)?;
                         self.memory.copy_repeatedly(
                             dest, dest_align, rest, dest_align, first.layout.size, length - 1, true
                         )?;
@@ -268,7 +244,7 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
                 // FIXME(CTFE): don't allow computing the length of arrays in const eval
                 let src = self.eval_place(place)?;
                 let mplace = self.force_allocation(src)?;
-                let len = mplace.len(&self)?;
+                let len = mplace.len(self)?;
                 let size = self.pointer_size();
                 self.write_scalar(
                     Scalar::from_uint(len, size),
@@ -278,8 +254,8 @@ impl<'a, 'mir, 'tcx, M: Machine<'mir, 'tcx>> EvalContext<'a, 'mir, 'tcx, M> {
 
             Ref(_, _, ref place) => {
                 let src = self.eval_place(place)?;
-                let val = self.force_allocation(src)?.to_ref();
-                self.write_value(val, dest)?;
+                let val = self.force_allocation(src)?;
+                self.write_immediate(val.to_ref(), dest)?;
             }
 
             NullaryOp(mir::NullOp::Box, _) => {

@@ -2,7 +2,7 @@ error[E0596]: cannot borrow immutable argument `x` as mutable
   --> $DIR/borrowck-borrow-overloaded-auto-deref-mut.rs:63:24
    |
 LL | fn deref_mut_field1(x: Own<Point>) {
-   |                     - consider changing this to `mut x`
+   |                     - help: make this binding mutable: `mut x`
 LL |     let __isize = &mut x.y; //~ ERROR cannot borrow
    |                        ^ cannot borrow mutably
 
@@ -21,6 +21,7 @@ LL |     let _x = &mut x.x;
    |                   - first mutable borrow occurs here
 LL |     let _y = &mut x.y; //~ ERROR cannot borrow
    |                   ^ second mutable borrow occurs here
+LL |     use_mut(_x);
 LL | }
    | - first borrow ends here
 
@@ -28,7 +29,7 @@ error[E0596]: cannot borrow immutable argument `x` as mutable
   --> $DIR/borrowck-borrow-overloaded-auto-deref-mut.rs:98:5
    |
 LL | fn assign_field1<'a>(x: Own<Point>) {
-   |                      - consider changing this to `mut x`
+   |                      - help: make this binding mutable: `mut x`
 LL |     x.y = 3; //~ ERROR cannot borrow
    |     ^ cannot borrow mutably
 
@@ -47,6 +48,7 @@ LL |     let _p: &mut Point = &mut **x;
    |                                -- first mutable borrow occurs here
 LL |     x.y = 3; //~ ERROR cannot borrow
    |     ^ second mutable borrow occurs here
+LL |     use_mut(_p);
 LL | }
    | - first borrow ends here
 
@@ -54,7 +56,7 @@ error[E0596]: cannot borrow immutable argument `x` as mutable
   --> $DIR/borrowck-borrow-overloaded-auto-deref-mut.rs:119:5
    |
 LL | fn deref_mut_method1(x: Own<Point>) {
-   |                      - consider changing this to `mut x`
+   |                      - help: make this binding mutable: `mut x`
 LL |     x.set(0, 0); //~ ERROR cannot borrow
    |     ^ cannot borrow mutably
 
@@ -70,7 +72,7 @@ error[E0596]: cannot borrow immutable argument `x` as mutable
   --> $DIR/borrowck-borrow-overloaded-auto-deref-mut.rs:139:6
    |
 LL | fn assign_method1<'a>(x: Own<Point>) {
-   |                       - consider changing this to `mut x`
+   |                       - help: make this binding mutable: `mut x`
 LL |     *x.y_mut() = 3; //~ ERROR cannot borrow
    |      ^ cannot borrow mutably
 

@@ -8,16 +8,22 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-union Foo {
-    a: u8,
-    b: Bar,
-}
+#![feature(const_transmute)]
+#![allow(const_err)] // make sure we cannot allow away the errors tested here
+
+use std::mem;
 
 #[derive(Copy, Clone)]
 enum Bar {}
 
-const BAD_BAD_BAD: Bar = unsafe { Foo { a: 1 }.b};
-//~^ ERROR this constant likely exhibits undefined behavior
+const BAD_BAD_BAD: Bar = unsafe { mem::transmute(()) };
+//~^ ERROR it is undefined behavior to use this value
+
+const BAD_BAD_REF: &Bar = unsafe { mem::transmute(1usize) };
+//~^ ERROR it is undefined behavior to use this value
+
+const BAD_BAD_ARRAY: [Bar; 1] = unsafe { mem::transmute(()) };
+//~^ ERROR it is undefined behavior to use this value
 
 fn main() {
 }

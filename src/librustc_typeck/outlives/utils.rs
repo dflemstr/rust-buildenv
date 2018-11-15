@@ -11,6 +11,7 @@
 use rustc::ty::outlives::Component;
 use rustc::ty::subst::{Kind, UnpackedKind};
 use rustc::ty::{self, Region, RegionKind, Ty, TyCtxt};
+use smallvec::smallvec;
 use std::collections::BTreeSet;
 
 /// Tracks the `T: 'a` or `'a: 'a` predicates that we have inferred
@@ -40,7 +41,9 @@ pub fn insert_outlives_predicate<'tcx>(
             //
             // Or if within `struct Foo<U>` you had `T = Vec<U>`, then
             // we would want to add `U: 'outlived_region`
-            for component in tcx.outlives_components(ty) {
+            let mut components = smallvec![];
+            tcx.push_outlives_components(ty, &mut components);
+            for component in components {
                 match component {
                     Component::Region(r) => {
                         // This would arise from something like:
@@ -148,15 +151,9 @@ fn is_free_region<'tcx>(tcx: TyCtxt<'_, 'tcx, 'tcx>, region: Region<'_>) -> bool
         //         field: &'static T, // this would generate a ReStatic
         //     }
         RegionKind::ReStatic => {
-            if tcx
-                .sess
-                .features_untracked()
-                .infer_static_outlives_requirements
-            {
-                true
-            } else {
-                false
-            }
+            tcx.sess
+               .features_untracked()
+               .infer_static_outlives_requirements
         }
 
         // Late-bound regions can appear in `fn` types:
@@ -173,10 +170,9 @@ fn is_free_region<'tcx>(tcx: TyCtxt<'_, 'tcx, 'tcx>, region: Region<'_>) -> bool
         RegionKind::ReEmpty
         | RegionKind::ReErased
         | RegionKind::ReClosureBound(..)
-        | RegionKind::ReCanonical(..)
         | RegionKind::ReScope(..)
         | RegionKind::ReVar(..)
-        | RegionKind::ReSkolemized(..)
+        | RegionKind::RePlaceholder(..)
         | RegionKind::ReFree(..) => {
             bug!("unexpected region in outlives inference: {:?}", region);
         }

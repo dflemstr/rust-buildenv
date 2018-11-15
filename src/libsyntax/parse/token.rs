@@ -23,8 +23,7 @@ use symbol::keywords;
 use syntax::parse::parse_stream_from_source_str;
 use syntax_pos::{self, Span, FileName};
 use syntax_pos::symbol::{self, Symbol};
-use tokenstream::{TokenStream, TokenTree};
-use tokenstream;
+use tokenstream::{self, DelimSpan, TokenStream, TokenTree};
 
 use std::{cmp, fmt};
 use std::mem;
@@ -80,14 +79,14 @@ pub enum Lit {
 }
 
 impl Lit {
-    crate fn short_name(&self) -> &'static str {
+    crate fn literal_name(&self) -> &'static str {
         match *self {
-            Byte(_) => "byte",
-            Char(_) => "char",
-            Integer(_) => "integer",
-            Float(_) => "float",
-            Str_(_) | StrRaw(..) => "string",
-            ByteStr(_) | ByteStrRaw(..) => "byte string"
+            Byte(_) => "byte literal",
+            Char(_) => "char literal",
+            Integer(_) => "integer literal",
+            Float(_) => "float literal",
+            Str_(_) | StrRaw(..) => "string literal",
+            ByteStr(_) | ByteStrRaw(..) => "byte string literal"
         }
     }
 
@@ -137,6 +136,7 @@ fn ident_can_begin_type(ident: ast::Ident, is_raw: bool) -> bool {
         keywords::Unsafe.name(),
         keywords::Extern.name(),
         keywords::Typeof.name(),
+        keywords::Dyn.name(),
     ].contains(&ident.name)
 }
 
@@ -825,7 +825,8 @@ fn prepend_attrs(sess: &ParseSess,
         // that it encompasses more than each token, but it hopefully is "good
         // enough" for now at least.
         builder.push(tokenstream::TokenTree::Token(attr.span, Pound));
-        builder.push(tokenstream::TokenTree::Delimited(attr.span, tokens));
+        let delim_span = DelimSpan::from_single(attr.span);
+        builder.push(tokenstream::TokenTree::Delimited(delim_span, tokens));
     }
     builder.push(tokens.clone());
     Some(builder.build())

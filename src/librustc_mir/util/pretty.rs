@@ -17,6 +17,7 @@ use rustc::ty::item_path;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::indexed_vec::Idx;
 use std::fmt::Display;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -493,14 +494,18 @@ fn write_scope_tree(
             };
 
             let indent = indent + INDENT.len();
-            let indented_var = format!(
-                "{0:1$}let {2}{3:?}: {4:?};",
+            let mut indented_var = format!(
+                "{0:1$}let {2}{3:?}: {4:?}",
                 INDENT,
                 indent,
                 mut_str,
                 local,
                 var.ty
             );
+            for user_ty in var.user_ty.projections() {
+                write!(indented_var, " as {:?}", user_ty).unwrap();
+            }
+            indented_var.push_str(";");
             writeln!(
                 w,
                 "{0:1$} // \"{2}\" in {3}",
@@ -531,7 +536,7 @@ pub fn write_mir_intro<'a, 'gcx, 'tcx>(
     writeln!(w, "{{")?;
 
     // construct a scope tree and write it out
-    let mut scope_tree: FxHashMap<SourceScope, Vec<SourceScope>> = FxHashMap();
+    let mut scope_tree: FxHashMap<SourceScope, Vec<SourceScope>> = Default::default();
     for (index, scope_data) in mir.source_scopes.iter().enumerate() {
         if let Some(parent) = scope_data.parent_scope {
             scope_tree
@@ -612,8 +617,9 @@ fn write_temp_decls(mir: &Mir, w: &mut dyn Write) -> io::Result<()> {
     for temp in mir.temps_iter() {
         writeln!(
             w,
-            "{}let mut {:?}: {};",
+            "{}let {}{:?}: {};",
             INDENT,
+            if mir.local_decls[temp].mutability == Mutability::Mut {"mut "} else {""},
             temp,
             mir.local_decls[temp].ty
         )?;

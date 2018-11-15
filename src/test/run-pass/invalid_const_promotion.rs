@@ -8,10 +8,14 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(unused_mut)]
 // ignore-wasm32
 // ignore-emscripten
 
-#![feature(const_fn, libc)]
+// compile-flags: -C debug_assertions=yes
+
+#![stable(feature = "rustc", since = "1.0.0")]
+#![feature(const_fn, libc, staged_api, rustc_attrs)]
 #![allow(const_err)]
 
 extern crate libc;
@@ -19,7 +23,9 @@ extern crate libc;
 use std::env;
 use std::process::{Command, Stdio};
 
-// this will panic in debug mode
+// this will panic in debug mode and overflow in release mode
+#[stable(feature = "rustc", since = "1.0.0")]
+#[rustc_promotable]
 const fn bar() -> usize { 0 - 1 }
 
 fn foo() {
@@ -33,6 +39,7 @@ fn check_status(status: std::process::ExitStatus)
     use std::os::unix::process::ExitStatusExt;
 
     assert!(status.signal() == Some(libc::SIGILL)
+            || status.signal() == Some(libc::SIGTRAP)
             || status.signal() == Some(libc::SIGABRT));
 }
 

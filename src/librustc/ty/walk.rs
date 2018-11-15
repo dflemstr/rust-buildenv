@@ -54,7 +54,7 @@ impl<'tcx> Iterator for TypeWalker<'tcx> {
         debug!("next(): stack={:?}", self.stack);
         match self.stack.pop() {
             None => {
-                return None;
+                None
             }
             Some(ty) => {
                 self.last_subtree = self.stack.len();
@@ -82,7 +82,7 @@ fn push_subtypes<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent_ty: Ty<'tcx>) {
     match parent_ty.sty {
         ty::Bool | ty::Char | ty::Int(_) | ty::Uint(_) | ty::Float(_) |
         ty::Str | ty::Infer(_) | ty::Param(_) | ty::Never | ty::Error |
-        ty::Foreign(..) => {
+        ty::Bound(..) | ty::Foreign(..) => {
         }
         ty::Array(ty, len) => {
             push_const(stack, len);
@@ -97,7 +97,7 @@ fn push_subtypes<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent_ty: Ty<'tcx>) {
         ty::Ref(_, ty, _) => {
             stack.push(ty);
         }
-        ty::Projection(ref data) => {
+        ty::Projection(ref data) | ty::UnnormalizedProjection(ref data) => {
             stack.extend(data.substs.types().rev());
         }
         ty::Dynamic(ref obj, ..) => {
@@ -114,7 +114,7 @@ fn push_subtypes<'tcx>(stack: &mut TypeWalkerStack<'tcx>, parent_ty: Ty<'tcx>) {
                 substs.types().rev().chain(opt_ty)
             }));
         }
-        ty::Adt(_, substs) | ty::Anon(_, substs) => {
+        ty::Adt(_, substs) | ty::Opaque(_, substs) => {
             stack.extend(substs.types().rev());
         }
         ty::Closure(_, ref substs) => {

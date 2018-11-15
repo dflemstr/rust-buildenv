@@ -16,18 +16,17 @@ use dataflow::{drop_flag_effects_for_location, on_lookup_result_bits};
 use dataflow::MoveDataParamEnv;
 use dataflow::{self, do_dataflow, DebugFormatted};
 use rustc::ty::{self, TyCtxt};
+use rustc::ty::layout::VariantIdx;
 use rustc::mir::*;
 use rustc::util::nodemap::FxHashMap;
-use rustc_data_structures::indexed_set::IdxSet;
-use rustc_data_structures::indexed_vec::Idx;
+use rustc_data_structures::bit_set::BitSet;
+use std::fmt;
+use syntax::ast;
+use syntax_pos::Span;
 use transform::{MirPass, MirSource};
 use util::patch::MirPatch;
 use util::elaborate_drops::{DropFlagState, Unwind, elaborate_drop};
 use util::elaborate_drops::{DropElaborator, DropStyle, DropFlagMode};
-use syntax::ast;
-use syntax_pos::Span;
-
-use std::fmt;
 
 pub struct ElaborateDrops;
 
@@ -77,7 +76,7 @@ impl MirPass for ElaborateDrops {
                 env: &env,
                 flow_inits,
                 flow_uninits,
-                drop_flags: FxHashMap(),
+                drop_flags: Default::default(),
                 patch: MirPatch::new(mir),
             }.elaborate()
         };
@@ -93,12 +92,12 @@ fn find_dead_unwinds<'a, 'tcx>(
     mir: &Mir<'tcx>,
     id: ast::NodeId,
     env: &MoveDataParamEnv<'tcx, 'tcx>)
-    -> IdxSet<BasicBlock>
+    -> BitSet<BasicBlock>
 {
     debug!("find_dead_unwinds({:?})", mir.span);
     // We only need to do this pass once, because unwind edges can only
     // reach cleanup blocks, which can't have unwind edges themselves.
-    let mut dead_unwinds = IdxSet::new_empty(mir.basic_blocks().len());
+    let mut dead_unwinds = BitSet::new_empty(mir.basic_blocks().len());
     let flow_inits =
         do_dataflow(tcx, mir, id, &[], &dead_unwinds,
                     MaybeInitializedPlaces::new(tcx, mir, &env),
@@ -112,7 +111,7 @@ fn find_dead_unwinds<'a, 'tcx>(
 
         let mut init_data = InitializationData {
             live: flow_inits.sets().on_entry_set_for(bb.index()).to_owned(),
-            dead: IdxSet::new_empty(env.move_data.move_paths.len()),
+            dead: BitSet::new_empty(env.move_data.move_paths.len()),
         };
         debug!("find_dead_unwinds @ {:?}: {:?}; init_data={:?}",
                bb, bb_data, init_data.live);
@@ -139,7 +138,7 @@ fn find_dead_unwinds<'a, 'tcx>(
 
         debug!("find_dead_unwinds @ {:?}: maybe_live={}", bb, maybe_live);
         if !maybe_live {
-            dead_unwinds.add(&bb);
+            dead_unwinds.insert(bb);
         }
     }
 
@@ -147,8 +146,8 @@ fn find_dead_unwinds<'a, 'tcx>(
 }
 
 struct InitializationData {
-    live: IdxSet<MovePathIndex>,
-    dead: IdxSet<MovePathIndex>
+    live: BitSet<MovePathIndex>,
+    dead: BitSet<MovePathIndex>
 }
 
 impl InitializationData {
@@ -163,19 +162,19 @@ impl InitializationData {
                    loc, path, df);
             match df {
                 DropFlagState::Present => {
-                    self.live.add(&path);
-                    self.dead.remove(&path);
+                    self.live.insert(path);
+                    self.dead.remove(path);
                 }
                 DropFlagState::Absent => {
-                    self.dead.add(&path);
-                    self.live.remove(&path);
+                    self.dead.insert(path);
+                    self.live.remove(path);
                 }
             }
         });
     }
 
     fn state(&self, path: MovePathIndex) -> (bool, bool) {
-        (self.live.contains(&path), self.dead.contains(&path))
+        (self.live.contains(path), self.dead.contains(path))
     }
 }
 
@@ -284,7 +283,7 @@ impl<'a, 'b, 'tcx> DropElaborator<'a, 'tcx> for Elaborator<'a, 'b, 'tcx> {
         })
     }
 
-    fn downcast_subpath(&self, path: Self::Path, variant: usize) -> Option<Self::Path> {
+    fn downcast_subpath(&self, path: Self::Path, variant: VariantIdx) -> Option<Self::Path> {
         dataflow::move_path_children_matching(self.ctxt.move_data(), path, |p| {
             match p {
                 &Projection {
@@ -480,11 +479,11 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         assert!(!data.is_cleanup, "DropAndReplace in unwind path not supported");
 
         let assign = Statement {
-            kind: StatementKind::Assign(location.clone(), Rvalue::Use(value.clone())),
+            kind: StatementKind::Assign(location.clone(), box Rvalue::Use(value.clone())),
             source_info: terminator.source_info
         };
 
-        let unwind = unwind.unwrap_or(self.patch.resume_block());
+        let unwind = unwind.unwrap_or_else(|| self.patch.resume_block());
         let unwind = self.patch.new_block(BasicBlockData {
             statements: vec![assign.clone()],
             terminator: Some(Terminator {
@@ -497,7 +496,7 @@ impl<'b, 'tcx> ElaborateDropsCtxt<'b, 'tcx> {
         let target = self.patch.new_block(BasicBlockData {
             statements: vec![assign],
             terminator: Some(Terminator {
-                kind: TerminatorKind::Goto { target: target },
+                kind: TerminatorKind::Goto { target },
                 ..*terminator
             }),
             is_cleanup: false,

@@ -11,9 +11,10 @@
 use hir::def::Def;
 use hir::def_id::DefId;
 use ty::{self, Ty, TyCtxt};
-use ty::layout::{LayoutError, Pointer, SizeSkeleton};
+use ty::layout::{LayoutError, Pointer, SizeSkeleton, VariantIdx};
 
 use rustc_target::spec::abi::Abi::RustIntrinsic;
+use rustc_data_structures::indexed_vec::Idx;
 use syntax_pos::Span;
 use hir::intravisit::{self, Visitor, NestedVisitorMap};
 use hir;
@@ -48,10 +49,13 @@ fn unpack_option_like<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     if def.variants.len() == 2 && !def.repr.c() && def.repr.int.is_none() {
         let data_idx;
 
-        if def.variants[0].fields.is_empty() {
-            data_idx = 1;
-        } else if def.variants[1].fields.is_empty() {
-            data_idx = 0;
+        let one = VariantIdx::new(1);
+        let zero = VariantIdx::new(0);
+
+        if def.variants[zero].fields.is_empty() {
+            data_idx = one;
+        } else if def.variants[one].fields.is_empty() {
+            data_idx = zero;
         } else {
             return ty;
         }
@@ -84,7 +88,7 @@ impl<'a, 'tcx> ExprVisitor<'a, 'tcx> {
             // `Option<typeof(function)>` to present a clearer error.
             let from = unpack_option_like(self.tcx.global_tcx(), from);
             if let (&ty::FnDef(..), SizeSkeleton::Known(size_to)) = (&from.sty, sk_to) {
-                if size_to == Pointer.size(self.tcx) {
+                if size_to == Pointer.size(&self.tcx) {
                     struct_span_err!(self.tcx.sess, span, E0591,
                                      "can't transmute zero-sized type")
                         .note(&format!("source type: {}", from))
@@ -107,7 +111,7 @@ impl<'a, 'tcx> ExprVisitor<'a, 'tcx> {
                 }
                 Err(LayoutError::Unknown(bad)) => {
                     if bad == ty {
-                        "this type's size can vary".to_string()
+                        "this type's size can vary".to_owned()
                     } else {
                         format!("size can vary because of {}", bad)
                     }
@@ -117,7 +121,7 @@ impl<'a, 'tcx> ExprVisitor<'a, 'tcx> {
         };
 
         struct_span_err!(self.tcx.sess, span, E0512,
-            "transmute called with types of different sizes")
+                         "transmute called with types of different sizes")
             .note(&format!("source type: {} ({})", from, skeleton_string(from, sk_from)))
             .note(&format!("target type: {} ({})", to, skeleton_string(to, sk_to)))
             .emit();

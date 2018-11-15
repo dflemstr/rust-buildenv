@@ -9,11 +9,7 @@
 // except according to those terms.
 
 // aux-build:proc-macro-gates.rs
-// gate-test-proc_macro_non_items
-// gate-test-proc_macro_mod line
-// gate-test-proc_macro_expr
-// gate-test-proc_macro_mod
-// gate-test-proc_macro_gen
+// gate-test-proc_macro_hygiene
 
 #![feature(stmt_expr_attributes)]
 
@@ -22,7 +18,7 @@ extern crate proc_macro_gates as foo;
 use foo::*;
 
 fn _test_inner() {
-    #![a] // OK
+    #![a] //~ ERROR: non-builtin inner attributes are unstable
 }
 
 #[a] //~ ERROR: custom attributes cannot be applied to modules
@@ -30,6 +26,7 @@ mod _test2 {}
 
 mod _test2_inner {
     #![a] //~ ERROR: custom attributes cannot be applied to modules
+          //~| ERROR: non-builtin inner attributes are unstable
 }
 
 #[a = y] //~ ERROR: must only be followed by a delimiter token

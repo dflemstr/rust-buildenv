@@ -91,8 +91,7 @@
 #![feature(lang_items)]
 #![feature(link_llvm_intrinsics)]
 #![feature(never_type)]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(exhaustive_patterns)]
 #![feature(macro_at_most_once_rep)]
 #![feature(no_core)]
@@ -107,6 +106,7 @@
 #![feature(staged_api)]
 #![feature(stmt_expr_attributes)]
 #![feature(unboxed_closures)]
+#![feature(unsized_locals)]
 #![feature(untagged_unions)]
 #![feature(unwind_attributes)]
 #![feature(doc_alias)]
@@ -117,10 +117,19 @@
 #![feature(powerpc_target_feature)]
 #![feature(mips_target_feature)]
 #![feature(aarch64_target_feature)]
+#![feature(wasm_target_feature)]
 #![feature(const_slice_len)]
 #![feature(const_str_as_bytes)]
 #![feature(const_str_len)]
+#![feature(const_let)]
+#![feature(const_int_rotate)]
+#![feature(const_int_wrapping)]
+#![feature(const_int_sign)]
+#![feature(const_int_conversion)]
+#![feature(const_transmute)]
+#![feature(reverse_bits)]
 #![feature(non_exhaustive)]
+#![feature(structural_match)]
 
 #[prelude_import]
 #[allow(unused)]
@@ -196,6 +205,7 @@ pub mod iter;
 pub mod option;
 pub mod raw;
 pub mod result;
+pub mod ffi;
 
 pub mod slice;
 pub mod str;
@@ -219,7 +229,7 @@ mod nonzero;
 mod tuple;
 mod unit;
 
-// Pull in the the `coresimd` crate directly into libcore. This is where all the
+// Pull in the `coresimd` crate directly into libcore. This is where all the
 // architecture-specific (and vendor-specific) intrinsics are defined. AKA
 // things like SIMD and such. Note that the actual source for all this lies in a
 // different repository, rust-lang-nursery/stdsimd. That's why the setup here is

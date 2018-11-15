@@ -15,10 +15,6 @@
 //! function-like macros `#[proc_macro]`, macro attributes `#[proc_macro_attribute]` and
 //! custom derive attributes`#[proc_macro_derive]`.
 //!
-//! Note that this crate is intentionally bare-bones currently.
-//! This functionality is intended to be expanded over time as more surface
-//! area for macro authors is stabilized.
-//!
 //! See [the book](../book/first-edition/procedural-macros.html) for more.
 
 #![stable(feature = "proc_macro_lib", since = "1.15.0")]
@@ -31,8 +27,7 @@
        test(no_crate_inject, attr(deny(warnings))),
        test(attr(allow(dead_code, deprecated, unused_variables, unused_mut))))]
 
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(rustc_private)]
 #![feature(staged_api)]
 #![feature(lang_items)]
@@ -52,8 +47,8 @@ pub mod rustc;
 
 mod diagnostic;
 
-#[unstable(feature = "proc_macro_diagnostic", issue = "38356")]
-pub use diagnostic::{Diagnostic, Level};
+#[unstable(feature = "proc_macro_diagnostic", issue = "54140")]
+pub use diagnostic::{Diagnostic, Level, MultiSpan};
 
 use std::{ascii, fmt, iter};
 use std::path::PathBuf;
@@ -63,7 +58,7 @@ use std::str::FromStr;
 use syntax::errors::DiagnosticBuilder;
 use syntax::parse::{self, token};
 use syntax::symbol::Symbol;
-use syntax::tokenstream;
+use syntax::tokenstream::{self, DelimSpan};
 use syntax_pos::{Pos, FileName};
 
 /// The main type provided by this crate, representing an abstract stream of
@@ -73,9 +68,6 @@ use syntax_pos::{Pos, FileName};
 ///
 /// This is both the input and output of `#[proc_macro]`, `#[proc_macro_attribute]`
 /// and `#[proc_macro_derive]` definitions.
-///
-/// The API of this type is intentionally bare-bones, but it'll be expanded over
-/// time!
 #[stable(feature = "proc_macro_lib", since = "1.15.0")]
 #[derive(Clone)]
 pub struct TokenStream(tokenstream::TokenStream);
@@ -150,7 +142,7 @@ impl fmt::Debug for TokenStream {
     }
 }
 
-#[unstable(feature = "proc_macro_quote", issue = "38356")]
+#[unstable(feature = "proc_macro_quote", issue = "54722")]
 pub use quote::{quote, quote_span};
 
 /// Creates a token stream containing a single token tree.
@@ -260,7 +252,7 @@ pub mod token_stream {
 /// To quote `$` itself, use `$$`.
 ///
 /// This is a dummy macro, the actual implementation is in `quote::quote`.`
-#[unstable(feature = "proc_macro_quote", issue = "38356")]
+#[unstable(feature = "proc_macro_quote", issue = "54722")]
 #[macro_export]
 macro_rules! quote { () => {} }
 
@@ -282,7 +274,7 @@ macro_rules! diagnostic_method {
     ($name:ident, $level:expr) => (
         /// Create a new `Diagnostic` with the given `message` at the span
         /// `self`.
-        #[unstable(feature = "proc_macro_diagnostic", issue = "38356")]
+        #[unstable(feature = "proc_macro_diagnostic", issue = "54140")]
         pub fn $name<T: Into<String>>(self, message: T) -> Diagnostic {
             Diagnostic::spanned(self, $level, message)
         }
@@ -291,7 +283,7 @@ macro_rules! diagnostic_method {
 
 impl Span {
     /// A span that resolves at the macro definition site.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_def_site", issue = "54724")]
     pub fn def_site() -> Span {
         ::__internal::with_sess(|_, data| data.def_site)
     }
@@ -306,7 +298,7 @@ impl Span {
     }
 
     /// The original source file into which this span points.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn source_file(&self) -> SourceFile {
         SourceFile {
             source_file: __internal::lookup_char_pos(self.0.lo()).file,
@@ -315,7 +307,7 @@ impl Span {
 
     /// The `Span` for the tokens in the previous macro expansion from which
     /// `self` was generated from, if any.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn parent(&self) -> Option<Span> {
         self.0.parent().map(Span)
     }
@@ -323,13 +315,13 @@ impl Span {
     /// The span for the origin source code that `self` was generated from. If
     /// this `Span` wasn't generated from other macro expansions then the return
     /// value is the same as `*self`.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn source(&self) -> Span {
         Span(self.0.source_callsite())
     }
 
     /// Get the starting line/column in the source file for this span.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn start(&self) -> LineColumn {
         let loc = __internal::lookup_char_pos(self.0.lo());
         LineColumn {
@@ -339,7 +331,7 @@ impl Span {
     }
 
     /// Get the ending line/column in the source file for this span.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn end(&self) -> LineColumn {
         let loc = __internal::lookup_char_pos(self.0.hi());
         LineColumn {
@@ -351,7 +343,7 @@ impl Span {
     /// Create a new span encompassing `self` and `other`.
     ///
     /// Returns `None` if `self` and `other` are from different files.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn join(&self, other: Span) -> Option<Span> {
         let self_loc = __internal::lookup_char_pos(self.0.lo());
         let other_loc = __internal::lookup_char_pos(other.0.lo());
@@ -363,20 +355,20 @@ impl Span {
 
     /// Creates a new span with the same line/column information as `self` but
     /// that resolves symbols as though it were at `other`.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn resolved_at(&self, other: Span) -> Span {
         Span(self.0.with_ctxt(other.0.ctxt()))
     }
 
     /// Creates a new span with the same name resolution behavior as `self` but
     /// with the line/column information of `other`.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn located_at(&self, other: Span) -> Span {
         other.resolved_at(*self)
     }
 
     /// Compares to spans to see if they're equal.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn eq(&self, other: &Span) -> bool {
         self.0 == other.0
     }
@@ -399,33 +391,33 @@ impl fmt::Debug for Span {
 }
 
 /// A line-column pair representing the start or end of a `Span`.
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LineColumn {
     /// The 1-indexed line in the source file on which the span starts or ends (inclusive).
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub line: usize,
     /// The 0-indexed column (in UTF-8 characters) in the source file on which
     /// the span starts or ends (inclusive).
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub column: usize
 }
 
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl !Send for LineColumn {}
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl !Sync for LineColumn {}
 
 /// The source file of a given `Span`.
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 #[derive(Clone)]
 pub struct SourceFile {
     source_file: Lrc<syntax_pos::SourceFile>,
 }
 
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl !Send for SourceFile {}
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl !Sync for SourceFile {}
 
 impl SourceFile {
@@ -439,7 +431,7 @@ impl SourceFile {
     /// the command line, the path as given may not actually be valid.
     ///
     /// [`is_real`]: #method.is_real
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn path(&self) -> PathBuf {
         match self.source_file.name {
             FileName::Real(ref path) => path.clone(),
@@ -449,7 +441,7 @@ impl SourceFile {
 
     /// Returns `true` if this source file is a real source file, and not generated by an external
     /// macro's expansion.
-    #[unstable(feature = "proc_macro_span", issue = "38356")]
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
     pub fn is_real(&self) -> bool {
         // This is a hack until intercrate spans are implemented and we can have real source files
         // for spans generated in external macros.
@@ -459,7 +451,7 @@ impl SourceFile {
 }
 
 
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl fmt::Debug for SourceFile {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("SourceFile")
@@ -469,14 +461,14 @@ impl fmt::Debug for SourceFile {
     }
 }
 
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl PartialEq for SourceFile {
     fn eq(&self, other: &Self) -> bool {
         Lrc::ptr_eq(&self.source_file, &other.source_file)
     }
 }
 
-#[unstable(feature = "proc_macro_span", issue = "38356")]
+#[unstable(feature = "proc_macro_span", issue = "54725")]
 impl Eq for SourceFile {}
 
 /// A single token or a delimited sequence of token trees (e.g. `[1, (), ..]`).
@@ -543,7 +535,7 @@ impl TokenTree {
     }
 }
 
-/// Prints token treee in a form convenient for debugging.
+/// Prints token tree in a form convenient for debugging.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 impl fmt::Debug for TokenTree {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -609,7 +601,7 @@ impl fmt::Display for TokenTree {
 pub struct Group {
     delimiter: Delimiter,
     stream: TokenStream,
-    span: Span,
+    span: DelimSpan,
 }
 
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
@@ -650,7 +642,7 @@ impl Group {
         Group {
             delimiter: delimiter,
             stream: stream,
-            span: Span::call_site(),
+            span: DelimSpan::from_single(Span::call_site().0),
         }
     }
 
@@ -671,9 +663,36 @@ impl Group {
 
     /// Returns the span for the delimiters of this token stream, spanning the
     /// entire `Group`.
+    ///
+    /// ```text
+    /// pub fn span(&self) -> Span {
+    ///            ^^^^^^^
+    /// ```
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn span(&self) -> Span {
-        self.span
+        Span(self.span.entire())
+    }
+
+    /// Returns the span pointing to the opening delimiter of this group.
+    ///
+    /// ```text
+    /// pub fn span_open(&self) -> Span {
+    ///                 ^
+    /// ```
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn span_open(&self) -> Span {
+        Span(self.span.open)
+    }
+
+    /// Returns the span pointing to the closing delimiter of this group.
+    ///
+    /// ```text
+    /// pub fn span_close(&self) -> Span {
+    ///                        ^
+    /// ```
+    #[unstable(feature = "proc_macro_span", issue = "54725")]
+    pub fn span_close(&self) -> Span {
+        Span(self.span.close)
     }
 
     /// Configures the span for this `Group`'s delimiters, but not its internal
@@ -684,7 +703,7 @@ impl Group {
     /// tokens at the level of the `Group`.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn set_span(&mut self, span: Span) {
-        self.span = span;
+        self.span = DelimSpan::from_single(span.0);
     }
 }
 
@@ -711,7 +730,7 @@ impl fmt::Debug for Group {
 
 /// An `Punct` is an single punctuation character like `+`, `-` or `#`.
 ///
-/// Multicharacter operators like `+=` are represented as two instances of `Punct` with different
+/// Multi-character operators like `+=` are represented as two instances of `Punct` with different
 /// forms of `Spacing` returned.
 #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
 #[derive(Clone)]
@@ -769,7 +788,7 @@ impl Punct {
 
     /// Returns the spacing of this punctuation character, indicating whether it's immediately
     /// followed by another `Punct` in the token stream, so they can potentially be combined into
-    /// a multicharacter operator (`Joint`), or it's followed by some other token or whitespace
+    /// a multi-character operator (`Joint`), or it's followed by some other token or whitespace
     /// (`Alone`) so the operator has certainly ended.
     #[stable(feature = "proc_macro_lib2", since = "1.29.0")]
     pub fn spacing(&self) -> Spacing {
@@ -862,7 +881,7 @@ impl Ident {
     }
 
     /// Same as `Ident::new`, but creates a raw identifier (`r#ident`).
-    #[unstable(feature = "proc_macro_raw_ident", issue = "38356")]
+    #[unstable(feature = "proc_macro_raw_ident", issue = "54723")]
     pub fn new_raw(string: &str, span: Span) -> Ident {
         if !Ident::is_valid(string) {
             panic!("`{:?}` is not a valid identifier", string)
@@ -928,7 +947,7 @@ macro_rules! suffixed_int_literals {
         /// This function will create an integer like `1u32` where the integer
         /// value specified is the first part of the token and the integral is
         /// also suffixed at the end.
-        /// Literals created from negative numbers may not survive rountrips through
+        /// Literals created from negative numbers may not survive round-trips through
         /// `TokenStream` or strings and may be broken into two tokens (`-` and positive literal).
         ///
         /// Literals created through this method have the `Span::call_site()`
@@ -1028,7 +1047,7 @@ impl Literal {
 
     /// Creates a new suffixed floating-point literal.
     ///
-    /// This consturctor will create a literal like `1.0f32` where the value
+    /// This constructor will create a literal like `1.0f32` where the value
     /// specified is the preceding part of the token and `f32` is the suffix of
     /// the token. This token will always be inferred to be an `f32` in the
     /// compiler.
@@ -1077,7 +1096,7 @@ impl Literal {
 
     /// Creates a new suffixed floating-point literal.
     ///
-    /// This consturctor will create a literal like `1.0f64` where the value
+    /// This constructor will create a literal like `1.0f64` where the value
     /// specified is the preceding part of the token and `f64` is the suffix of
     /// the token. This token will always be inferred to be an `f64` in the
     /// compiler.

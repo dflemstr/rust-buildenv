@@ -45,8 +45,7 @@
       html_root_url = "https://doc.rust-lang.org/nightly/")]
 #![forbid(unsafe_code)]
 
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(try_from)]
 // See librustc_cratesio_shim/Cargo.toml for a comment explaining this.
 #[allow(unused_extern_crates)]
@@ -54,6 +53,7 @@ extern crate rustc_cratesio_shim;
 
 #[macro_use]
 extern crate bitflags;
+extern crate smallvec;
 
 use std::cmp::Ordering;
 use std::fmt;

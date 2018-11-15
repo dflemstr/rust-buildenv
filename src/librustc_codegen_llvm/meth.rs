@@ -39,7 +39,7 @@ impl<'a, 'tcx> VirtualIndex {
         // Load the data pointer from the object.
         debug!("get_fn({:?}, {:?})", llvtable, self);
 
-        let llvtable = bx.pointercast(llvtable, fn_ty.llvm_type(bx.cx).ptr_to().ptr_to());
+        let llvtable = bx.pointercast(llvtable, fn_ty.ptr_to_llvm_type(bx.cx).ptr_to());
         let ptr_align = bx.tcx().data_layout.pointer_align;
         let ptr = bx.load(bx.inbounds_gep(llvtable, &[C_usize(bx.cx, self.0)]), ptr_align);
         bx.nonnull_metadata(ptr);
@@ -72,7 +72,7 @@ impl<'a, 'tcx> VirtualIndex {
 pub fn get_vtable(
     cx: &CodegenCx<'ll, 'tcx>,
     ty: Ty<'tcx>,
-    trait_ref: Option<ty::PolyExistentialTraitRef<'tcx>>,
+    trait_ref: ty::PolyExistentialTraitRef<'tcx>,
 ) -> &'ll Value {
     let tcx = cx.tcx;
 
@@ -86,23 +86,23 @@ pub fn get_vtable(
     // Not in the cache. Build it.
     let nullptr = C_null(Type::i8p(cx));
 
+    let methods = tcx.vtable_methods(trait_ref.with_self_ty(tcx, ty));
+    let methods = methods.iter().cloned().map(|opt_mth| {
+        opt_mth.map_or(nullptr, |(def_id, substs)| {
+            callee::resolve_and_get_fn_for_vtable(cx, def_id, substs)
+        })
+    });
+
     let (size, align) = cx.size_and_align_of(ty);
-    let mut components: Vec<_> = [
+    // /////////////////////////////////////////////////////////////////////////////////////////////
+    // If you touch this code, be sure to also make the corresponding changes to
+    // `get_vtable` in rust_mir/interpret/traits.rs
+    // /////////////////////////////////////////////////////////////////////////////////////////////
+    let components: Vec<_> = [
         callee::get_fn(cx, monomorphize::resolve_drop_in_place(cx.tcx, ty)),
         C_usize(cx, size.bytes()),
         C_usize(cx, align.abi())
-    ].iter().cloned().collect();
-
-    if let Some(trait_ref) = trait_ref {
-        let trait_ref = trait_ref.with_self_ty(tcx, ty);
-        let methods = tcx.vtable_methods(trait_ref);
-        let methods = methods.iter().cloned().map(|opt_mth| {
-            opt_mth.map_or(nullptr, |(def_id, substs)| {
-                callee::resolve_and_get_fn(cx, def_id, substs)
-            })
-        });
-        components.extend(methods);
-    }
+    ].iter().cloned().chain(methods).collect();
 
     let vtable_const = C_struct(cx, &components, false);
     let align = cx.data_layout().pointer_align;

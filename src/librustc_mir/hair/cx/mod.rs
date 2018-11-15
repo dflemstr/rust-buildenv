@@ -15,16 +15,17 @@
 //!
 
 use hair::*;
+use hair::util::UserAnnotatedTyHelpers;
 
 use rustc_data_structures::indexed_vec::Idx;
 use rustc::hir::def_id::{DefId, LOCAL_CRATE};
-use rustc::hir::map::blocks::FnLikeNode;
 use rustc::hir::Node;
 use rustc::middle::region;
 use rustc::infer::InferCtxt;
 use rustc::ty::subst::Subst;
 use rustc::ty::{self, Ty, TyCtxt};
 use rustc::ty::subst::{Kind, Substs};
+use rustc::ty::layout::VariantIdx;
 use syntax::ast::{self, LitKind};
 use syntax::attr;
 use syntax::symbol::Symbol;
@@ -67,10 +68,7 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
         let constness = match body_owner_kind {
             hir::BodyOwnerKind::Const |
             hir::BodyOwnerKind::Static(_) => hir::Constness::Const,
-            hir::BodyOwnerKind::Fn => {
-                let fn_like = FnLikeNode::from_node(infcx.tcx.hir.get(src_id));
-                fn_like.map_or(hir::Constness::NotConst, |f| f.constness())
-            }
+            hir::BodyOwnerKind::Fn => hir::Constness::NotConst,
         };
 
         let attrs = tcx.hir.attrs(src_id);
@@ -83,7 +81,7 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
         // Respect -C overflow-checks.
         check_overflow |= tcx.sess.overflow_checks();
 
-        // Constants and const fn's always need overflow checks.
+        // Constants always need overflow checks.
         check_overflow |= constness == hir::Constness::Const;
 
         let lint_level = lint_level_for_hir_id(tcx, src_id);
@@ -122,7 +120,7 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
     }
 
     pub fn unit_ty(&mut self) -> Ty<'tcx> {
-        self.tcx.mk_nil()
+        self.tcx.mk_unit()
     }
 
     pub fn true_literal(&mut self) -> &'tcx ty::Const<'tcx> {
@@ -168,7 +166,7 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
             LitKind::Str(ref s, _) => {
                 let s = s.as_str();
                 let id = self.tcx.allocate_bytes(s.as_bytes());
-                ConstValue::new_slice(Scalar::Ptr(id.into()), s.len() as u64, self.tcx)
+                ConstValue::new_slice(Scalar::Ptr(id.into()), s.len() as u64, &self.tcx)
             },
             LitKind::ByteStr(ref data) => {
                 let id = self.tcx.allocate_bytes(data);
@@ -231,7 +229,7 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
         bug!("found no method `{}` in `{:?}`", method_name, trait_def_id);
     }
 
-    pub fn all_fields(&mut self, adt_def: &ty::AdtDef, variant_index: usize) -> Vec<Field> {
+    pub fn all_fields(&mut self, adt_def: &ty::AdtDef, variant_index: VariantIdx) -> Vec<Field> {
         (0..adt_def.variants[variant_index].fields.len())
             .map(Field::new)
             .collect()
@@ -273,6 +271,16 @@ impl<'a, 'gcx, 'tcx> Cx<'a, 'gcx, 'tcx> {
 
     pub fn type_moves_by_default(&self, ty: Ty<'tcx>, span: Span) -> bool {
         self.infcx.type_moves_by_default(self.param_env, ty, span)
+    }
+}
+
+impl UserAnnotatedTyHelpers<'gcx, 'tcx> for Cx<'_, 'gcx, 'tcx> {
+    fn tcx(&self) -> TyCtxt<'_, 'gcx, 'tcx> {
+        self.tcx()
+    }
+
+    fn tables(&self) -> &ty::TypeckTables<'tcx> {
+        self.tables()
     }
 }
 

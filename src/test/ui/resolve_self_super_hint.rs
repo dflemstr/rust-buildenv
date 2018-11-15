@@ -19,16 +19,18 @@ mod a {
     mod b {
         use alloc::HashMap;
         //~^ ERROR unresolved import `alloc` [E0432]
-        //~| Did you mean `a::alloc`?
+        //~| Did you mean `super::alloc`?
         mod c {
             use alloc::HashMap;
             //~^ ERROR unresolved import `alloc` [E0432]
-            //~| Did you mean `a::alloc`?
+            //~| Did you mean `std::alloc`?
             mod d {
                 use alloc::HashMap;
                 //~^ ERROR unresolved import `alloc` [E0432]
-                //~| Did you mean `a::alloc`?
+                //~| Did you mean `std::alloc`?
             }
         }
     }
 }
+
+fn main() {}

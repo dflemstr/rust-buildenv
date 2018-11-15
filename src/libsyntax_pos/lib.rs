@@ -21,12 +21,11 @@
 #![feature(const_fn)]
 #![feature(crate_visibility_modifier)]
 #![feature(custom_attribute)]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(non_exhaustive)]
 #![feature(optin_builtin_traits)]
 #![feature(specialization)]
-#![feature(stdsimd)]
+#![cfg_attr(not(stage0), feature(stdsimd))]
 
 use std::borrow::Cow;
 use std::cell::Cell;
@@ -88,7 +87,7 @@ scoped_thread_local!(pub static GLOBALS: Globals);
 #[derive(Debug, Eq, PartialEq, Clone, Ord, PartialOrd, Hash, RustcDecodable, RustcEncodable)]
 pub enum FileName {
     Real(PathBuf),
-    /// e.g. "std" macros
+    /// A macro.  This includes the full name of the macro, so that there are no clashes.
     Macros(String),
     /// call to `quote!`
     QuoteExpansion,
@@ -611,6 +610,17 @@ impl MultiSpan {
     /// Returns all primary spans.
     pub fn primary_spans(&self) -> &[Span] {
         &self.primary_spans
+    }
+
+    /// Returns `true` if this contains only a dummy primary span with any hygienic context.
+    pub fn is_dummy(&self) -> bool {
+        let mut is_dummy = true;
+        for span in &self.primary_spans {
+            if !span.is_dummy() {
+                is_dummy = false;
+            }
+        }
+        is_dummy
     }
 
     /// Replaces all occurrences of one Span with another. Used to move Spans in areas that don't
@@ -1256,9 +1266,9 @@ pub struct LocWithOpt {
 
 // used to be structural records. Better names, anyone?
 #[derive(Debug)]
-pub struct SourceFileAndLine { pub fm: Lrc<SourceFile>, pub line: usize }
+pub struct SourceFileAndLine { pub sf: Lrc<SourceFile>, pub line: usize }
 #[derive(Debug)]
-pub struct SourceFileAndBytePos { pub fm: Lrc<SourceFile>, pub pos: BytePos }
+pub struct SourceFileAndBytePos { pub sf: Lrc<SourceFile>, pub pos: BytePos }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LineInfo {
@@ -1293,7 +1303,7 @@ pub struct MacroBacktrace {
 }
 
 // _____________________________________________________________________________
-// SpanLinesError, SpanSnippetError, DistinctSources, MalformedCodemapPositions
+// SpanLinesError, SpanSnippetError, DistinctSources, MalformedSourceMapPositions
 //
 
 pub type FileLinesResult = Result<FileLines, SpanLinesError>;
@@ -1308,7 +1318,7 @@ pub enum SpanLinesError {
 pub enum SpanSnippetError {
     IllFormedSpan(Span),
     DistinctSources(DistinctSources),
-    MalformedForCodemap(MalformedCodemapPositions),
+    MalformedForSourcemap(MalformedSourceMapPositions),
     SourceNotAvailable { filename: FileName }
 }
 
@@ -1319,7 +1329,7 @@ pub struct DistinctSources {
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct MalformedCodemapPositions {
+pub struct MalformedSourceMapPositions {
     pub name: FileName,
     pub source_len: usize,
     pub begin_pos: BytePos,

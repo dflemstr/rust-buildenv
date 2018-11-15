@@ -10,14 +10,16 @@
 
 #![feature(rustc_attrs)]
 
-use std::fmt::{Debug, Display};
 use std::borrow::Borrow;
 
 #[rustc_dump_program_clauses] //~ ERROR program clause dump
-trait Foo<'a, 'b, S, T, U> where S: Debug, T: Borrow<U>, U: ?Sized, 'a: 'b, U: 'b {
-    fn s(_: S) -> S;
-    fn t(_: T) -> T;
-    fn u(_: U) -> U;
+trait Foo<'a, 'b, T, U>
+where
+    T: Borrow<U> + ?Sized,
+    U: ?Sized + 'b,
+    'a: 'b,
+    Box<T>:, // NOTE(#53696) this checks an empty list of bounds.
+{
 }
 
 fn main() {
