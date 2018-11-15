@@ -110,10 +110,10 @@ impl Builder<'a, 'll, 'tcx> {
         }
         if self.cx.sess().count_llvm_insns() {
             *self.cx.stats
-                .borrow_mut()
-                .llvm_insns
-                .entry(category.to_string())
-                .or_insert(0) += 1;
+                    .borrow_mut()
+                    .llvm_insns
+                    .entry(category.to_string())
+                    .or_insert(0) += 1;
         }
     }
 
@@ -482,20 +482,26 @@ impl Builder<'a, 'll, 'tcx> {
         }
     }
 
-    pub fn atomic_load(&self, ptr: &'ll Value, order: AtomicOrdering, align: Align) -> &'ll Value {
+    pub fn atomic_load(&self, ptr: &'ll Value, order: AtomicOrdering, size: Size) -> &'ll Value {
         self.count_insn("load.atomic");
         unsafe {
             let load = llvm::LLVMRustBuildAtomicLoad(self.llbuilder, ptr, noname(), order);
-            // FIXME(eddyb) Isn't it UB to use `pref` instead of `abi` here?
-            // However, 64-bit atomic loads on `i686-apple-darwin` appear to
-            // require `___atomic_load` with ABI-alignment, so it's staying.
-            llvm::LLVMSetAlignment(load, align.pref() as c_uint);
+            // LLVM requires the alignment of atomic loads to be at least the size of the type.
+            llvm::LLVMSetAlignment(load, size.bytes() as c_uint);
             load
         }
     }
 
 
     pub fn range_metadata(&self, load: &'ll Value, range: Range<u128>) {
+        if self.sess().target.target.arch == "amdgpu" {
+            // amdgpu/LLVM does something weird and thinks a i64 value is
+            // split into a v2i32, halving the bitwidth LLVM expects,
+            // tripping an assertion. So, for now, just disable this
+            // optimization.
+            return;
+        }
+
         unsafe {
             let llty = val_ty(load);
             let v = [
@@ -556,15 +562,14 @@ impl Builder<'a, 'll, 'tcx> {
     }
 
     pub fn atomic_store(&self, val: &'ll Value, ptr: &'ll Value,
-                        order: AtomicOrdering, align: Align) {
+                        order: AtomicOrdering, size: Size) {
         debug!("Store {:?} -> {:?}", val, ptr);
         self.count_insn("store.atomic");
         let ptr = self.check_store(val, ptr);
         unsafe {
             let store = llvm::LLVMRustBuildAtomicStore(self.llbuilder, val, ptr, order);
-            // FIXME(eddyb) Isn't it UB to use `pref` instead of `abi` here?
-            // Also see `atomic_load` for more context.
-            llvm::LLVMSetAlignment(store, align.pref() as c_uint);
+            // LLVM requires the alignment of atomic stores to be at least the size of the type.
+            llvm::LLVMSetAlignment(store, size.bytes() as c_uint);
         }
     }
 
@@ -727,9 +732,9 @@ impl Builder<'a, 'll, 'tcx> {
     }
 
     pub fn inline_asm_call(&self, asm: *const c_char, cons: *const c_char,
-                         inputs: &[&'ll Value], output: &'ll Type,
-                         volatile: bool, alignstack: bool,
-                         dia: AsmDialect) -> &'ll Value {
+                           inputs: &[&'ll Value], output: &'ll Type,
+                           volatile: bool, alignstack: bool,
+                           dia: AsmDialect) -> Option<&'ll Value> {
         self.count_insn("inlineasm");
 
         let volatile = if volatile { llvm::True }
@@ -745,9 +750,17 @@ impl Builder<'a, 'll, 'tcx> {
         debug!("Asm Output Type: {:?}", output);
         let fty = Type::func(&argtys[..], output);
         unsafe {
-            let v = llvm::LLVMRustInlineAsm(
-                fty, asm, cons, volatile, alignstack, dia);
-            self.call(v, inputs, None)
+            // Ask LLVM to verify that the constraints are well-formed.
+            let constraints_ok = llvm::LLVMRustInlineAsmVerify(fty, cons);
+            debug!("Constraint verification result: {:?}", constraints_ok);
+            if constraints_ok {
+                let v = llvm::LLVMRustInlineAsm(
+                    fty, asm, cons, volatile, alignstack, dia);
+                Some(self.call(v, inputs, None))
+            } else {
+                // LLVM has detected an issue with our constraints, bail out
+                None
+            }
         }
     }
 
@@ -765,6 +778,24 @@ impl Builder<'a, 'll, 'tcx> {
         unsafe {
             llvm::LLVMRustBuildCall(self.llbuilder, llfn, args.as_ptr(),
                                     args.len() as c_uint, bundle, noname())
+        }
+    }
+
+    pub fn memcpy(&self, dst: &'ll Value, dst_align: u64,
+                  src: &'ll Value, src_align: u64,
+                  size: &'ll Value, is_volatile: bool) -> &'ll Value {
+        unsafe {
+            llvm::LLVMRustBuildMemCpy(self.llbuilder, dst, dst_align as c_uint,
+                                      src, src_align as c_uint, size, is_volatile)
+        }
+    }
+
+    pub fn memmove(&self, dst: &'ll Value, dst_align: u64,
+                  src: &'ll Value, src_align: u64,
+                  size: &'ll Value, is_volatile: bool) -> &'ll Value {
+        unsafe {
+            llvm::LLVMRustBuildMemMove(self.llbuilder, dst, dst_align as c_uint,
+                                      src, src_align as c_uint, size, is_volatile)
         }
     }
 
@@ -843,8 +874,7 @@ impl Builder<'a, 'll, 'tcx> {
             // FIXME: add a non-fast math version once
             // https://bugs.llvm.org/show_bug.cgi?id=36732
             // is fixed.
-            let instr = llvm::LLVMRustBuildVectorReduceFAdd(self.llbuilder, acc, src)
-                .expect("LLVMRustBuildVectorReduceFAdd is not available in LLVM version < 5.0");
+            let instr = llvm::LLVMRustBuildVectorReduceFAdd(self.llbuilder, acc, src);
             llvm::LLVMRustSetHasUnsafeAlgebra(instr);
             instr
         }
@@ -855,66 +885,43 @@ impl Builder<'a, 'll, 'tcx> {
             // FIXME: add a non-fast math version once
             // https://bugs.llvm.org/show_bug.cgi?id=36732
             // is fixed.
-            let instr = llvm::LLVMRustBuildVectorReduceFMul(self.llbuilder, acc, src)
-                .expect("LLVMRustBuildVectorReduceFMul is not available in LLVM version < 5.0");
+            let instr = llvm::LLVMRustBuildVectorReduceFMul(self.llbuilder, acc, src);
             llvm::LLVMRustSetHasUnsafeAlgebra(instr);
             instr
         }
     }
     pub fn vector_reduce_add(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.add");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceAdd(self.llbuilder, src);
-            instr.expect("LLVMRustBuildVectorReduceAdd is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceAdd(self.llbuilder, src) }
     }
     pub fn vector_reduce_mul(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.mul");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceMul(self.llbuilder, src);
-            instr.expect("LLVMRustBuildVectorReduceMul is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceMul(self.llbuilder, src) }
     }
     pub fn vector_reduce_and(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.and");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceAnd(self.llbuilder, src);
-            instr.expect("LLVMRustBuildVectorReduceAnd is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceAnd(self.llbuilder, src) }
     }
     pub fn vector_reduce_or(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.or");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceOr(self.llbuilder, src);
-            instr.expect("LLVMRustBuildVectorReduceOr is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceOr(self.llbuilder, src) }
     }
     pub fn vector_reduce_xor(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.xor");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceXor(self.llbuilder, src);
-            instr.expect("LLVMRustBuildVectorReduceXor is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceXor(self.llbuilder, src) }
     }
     pub fn vector_reduce_fmin(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.fmin");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceFMin(self.llbuilder, src, /*NoNaNs:*/ false);
-            instr.expect("LLVMRustBuildVectorReduceFMin is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceFMin(self.llbuilder, src, /*NoNaNs:*/ false) }
     }
     pub fn vector_reduce_fmax(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.fmax");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceFMax(self.llbuilder, src, /*NoNaNs:*/ false);
-            instr.expect("LLVMRustBuildVectorReduceFMax is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceFMax(self.llbuilder, src, /*NoNaNs:*/ false) }
     }
     pub fn vector_reduce_fmin_fast(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.fmin_fast");
         unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceFMin(self.llbuilder, src, /*NoNaNs:*/ true)
-                .expect("LLVMRustBuildVectorReduceFMin is not available in LLVM version < 5.0");
+            let instr = llvm::LLVMRustBuildVectorReduceFMin(self.llbuilder, src, /*NoNaNs:*/ true);
             llvm::LLVMRustSetHasUnsafeAlgebra(instr);
             instr
         }
@@ -922,25 +929,18 @@ impl Builder<'a, 'll, 'tcx> {
     pub fn vector_reduce_fmax_fast(&self, src: &'ll Value) -> &'ll Value {
         self.count_insn("vector.reduce.fmax_fast");
         unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceFMax(self.llbuilder, src, /*NoNaNs:*/ true)
-                .expect("LLVMRustBuildVectorReduceFMax is not available in LLVM version < 5.0");
+            let instr = llvm::LLVMRustBuildVectorReduceFMax(self.llbuilder, src, /*NoNaNs:*/ true);
             llvm::LLVMRustSetHasUnsafeAlgebra(instr);
             instr
         }
     }
     pub fn vector_reduce_min(&self, src: &'ll Value, is_signed: bool) -> &'ll Value {
         self.count_insn("vector.reduce.min");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceMin(self.llbuilder, src, is_signed);
-            instr.expect("LLVMRustBuildVectorReduceMin is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceMin(self.llbuilder, src, is_signed) }
     }
     pub fn vector_reduce_max(&self, src: &'ll Value, is_signed: bool) -> &'ll Value {
         self.count_insn("vector.reduce.max");
-        unsafe {
-            let instr = llvm::LLVMRustBuildVectorReduceMax(self.llbuilder, src, is_signed);
-            instr.expect("LLVMRustBuildVectorReduceMax is not available in LLVM version < 5.0")
-        }
+        unsafe { llvm::LLVMRustBuildVectorReduceMax(self.llbuilder, src, is_signed) }
     }
 
     pub fn extract_value(&self, agg_val: &'ll Value, idx: u64) -> &'ll Value {
@@ -1077,7 +1077,7 @@ impl Builder<'a, 'll, 'tcx> {
     ) -> &'ll Value {
         unsafe {
             llvm::LLVMRustBuildAtomicCmpXchg(self.llbuilder, dst, cmp, src,
-                                         order, failure_order, weak)
+                                             order, failure_order, weak)
         }
     }
     pub fn atomic_rmw(
@@ -1178,7 +1178,7 @@ impl Builder<'a, 'll, 'tcx> {
             })
             .collect();
 
-        return Cow::Owned(casted_args);
+        Cow::Owned(casted_args)
     }
 
     pub fn lifetime_start(&self, ptr: &'ll Value, size: Size) {

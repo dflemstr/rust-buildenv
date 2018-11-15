@@ -349,6 +349,25 @@ macro_rules! try {
 /// write!(&mut v, "s = {:?}", s).unwrap(); // uses io::Write::write_fmt
 /// assert_eq!(v, b"s = \"abc 123\"");
 /// ```
+///
+/// Note: This macro can be used in `no_std` setups as well.
+/// In a `no_std` setup you are responsible for the implementation details of the components.
+///
+/// ```no_run
+/// # extern crate core;
+/// use core::fmt::Write;
+///
+/// struct Example;
+///
+/// impl Write for Example {
+///     fn write_str(&mut self, _s: &str) -> core::fmt::Result {
+///          unimplemented!();
+///     }
+/// }
+///
+/// let mut m = Example{};
+/// write!(&mut m, "Hello World").expect("Not written");
+/// ```
 #[macro_export]
 #[stable(feature = "rust1", since = "1.0.0")]
 macro_rules! write {
@@ -420,7 +439,7 @@ macro_rules! writeln {
 ///
 /// If the determination that the code is unreachable proves incorrect, the
 /// program immediately terminates with a [`panic!`].  The function [`unreachable_unchecked`],
-/// which belongs to the [`std::hint`] module, informs the compilier to
+/// which belongs to the [`std::hint`] module, informs the compiler to
 /// optimize the code out of the release version entirely.
 ///
 /// [`panic!`]:  ../std/macro.panic.html
@@ -541,7 +560,7 @@ macro_rules! unimplemented {
 /// into libsyntax itself.
 ///
 /// For more information, see documentation for `std`'s macros.
-#[cfg(dox)]
+#[cfg(rustdoc)]
 mod builtin {
 
     /// Unconditionally causes compilation to fail with the given error message when encountered.

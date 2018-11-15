@@ -14,22 +14,20 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 
 */
 
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(in_band_lifetimes)]
-#![feature(impl_header_lifetime_elision)]
 #![feature(slice_patterns)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(box_patterns)]
 #![feature(box_syntax)]
 #![feature(crate_visibility_modifier)]
-#![feature(const_fn)]
 #![feature(core_intrinsics)]
+#![feature(const_fn)]
 #![feature(decl_macro)]
-#![cfg_attr(stage0, feature(macro_vis_matcher))]
 #![feature(exhaustive_patterns)]
 #![feature(range_contains)]
 #![feature(rustc_diagnostic_macros)]
+#![feature(rustc_attrs)]
 #![feature(never_type)]
 #![feature(specialization)]
 #![feature(try_trait)]
@@ -38,6 +36,8 @@ Rust MIR: a lowered representation of Rust. Also: an experiment!
 #![feature(slice_concat_ext)]
 #![feature(if_while_or_patterns)]
 #![feature(try_from)]
+#![feature(reverse_bits)]
+#![feature(underscore_imports)]
 
 #![recursion_limit="256"]
 
@@ -78,6 +78,7 @@ mod borrow_check;
 mod build;
 mod dataflow;
 mod hair;
+mod lints;
 mod shim;
 pub mod transform;
 pub mod util;
@@ -92,8 +93,9 @@ pub fn provide(providers: &mut Providers) {
     borrow_check::provide(providers);
     shim::provide(providers);
     transform::provide(providers);
-    providers.const_eval = interpret::const_eval_provider;
-    providers.const_to_allocation = interpret::const_to_allocation_provider;
+    monomorphize::partitioning::provide(providers);
+    providers.const_eval = const_eval::const_eval_provider;
+    providers.const_eval_raw = const_eval::const_eval_raw_provider;
     providers.check_match = hair::pattern::check_match;
 }
 

@@ -8,24 +8,34 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// NOTE Instantiating an empty enum is UB. This test may break in the future.
+
 // LLDB can't handle zero-sized values
 // ignore-lldb
 
+
+// Require LLVM with DW_TAG_variant_part and a gdb that can read it.
+// gdb 8.2.0 crashes on this test case, see
+// https://sourceware.org/bugzilla/show_bug.cgi?id=23626
+// This will be fixed in the next release, which will be >= 8.2.1.
+// min-system-llvm-version: 7.0
+// min-gdb-version: 8.2.1
 
 // compile-flags:-g
 // gdb-command:run
 
 // gdb-command:print first
-// gdbg-check:$1 = {<No data fields>}
-// gdbr-check:$1 = <error reading variable>
+// gdbr-check:$1 = nil_enum::ANilEnum {<No data fields>}
 
 // gdb-command:print second
-// gdbg-check:$2 = {<No data fields>}
-// gdbr-check:$2 = <error reading variable>
+// gdbr-check:$2 = nil_enum::AnotherNilEnum {<No data fields>}
 
 #![allow(unused_variables)]
 #![feature(omit_gdb_pretty_printer_section)]
+#![feature(maybe_uninit)]
 #![omit_gdb_pretty_printer_section]
+
+use std::mem::MaybeUninit;
 
 enum ANilEnum {}
 enum AnotherNilEnum {}
@@ -35,8 +45,8 @@ enum AnotherNilEnum {}
 // The error from gdbr is expected since nil enums are not supposed to exist.
 fn main() {
     unsafe {
-        let first: ANilEnum = ::std::mem::zeroed();
-        let second: AnotherNilEnum = ::std::mem::zeroed();
+        let first: ANilEnum = MaybeUninit::uninitialized().into_inner();
+        let second: AnotherNilEnum = MaybeUninit::uninitialized().into_inner();
 
         zzz(); // #break
     }

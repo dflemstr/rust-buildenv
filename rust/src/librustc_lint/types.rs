@@ -13,7 +13,8 @@
 use rustc::hir::Node;
 use rustc::ty::subst::Substs;
 use rustc::ty::{self, AdtKind, ParamEnv, Ty, TyCtxt};
-use rustc::ty::layout::{self, IntegerExt, LayoutOf};
+use rustc::ty::layout::{self, IntegerExt, LayoutOf, VariantIdx};
+use rustc_data_structures::indexed_vec::Idx;
 use util::nodemap::FxHashSet;
 use lint::{LateContext, LintContext, LintArray};
 use lint::{LintPass, LateLintPass};
@@ -24,6 +25,7 @@ use std::{i8, i16, i32, i64, u8, u16, u32, u64, f32, f64};
 use syntax::{ast, attr};
 use syntax::errors::Applicability;
 use rustc_target::spec::abi::Abi;
+use syntax::edition::Edition;
 use syntax_pos::Span;
 use syntax::source_map;
 
@@ -38,7 +40,8 @@ declare_lint! {
 declare_lint! {
     OVERFLOWING_LITERALS,
     Warn,
-    "literal out of range for its type"
+    "literal out of range for its type",
+    Edition::Edition2018 => Deny
 }
 
 declare_lint! {
@@ -375,13 +378,13 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for TypeLimits {
             let (t, actually) = match ty {
                 ty::Int(t) => {
                     let ity = attr::IntType::SignedInt(t);
-                    let bits = layout::Integer::from_attr(cx.tcx, ity).size().bits();
+                    let bits = layout::Integer::from_attr(&cx.tcx, ity).size().bits();
                     let actually = (val << (128 - bits)) as i128 >> (128 - bits);
                     (format!("{:?}", t), actually.to_string())
                 }
                 ty::Uint(t) => {
                     let ity = attr::IntType::UnsignedInt(t);
-                    let bits = layout::Integer::from_attr(cx.tcx, ity).size().bits();
+                    let bits = layout::Integer::from_attr(&cx.tcx, ity).size().bits();
                     let actually = (val << (128 - bits)) >> (128 - bits);
                     (format!("{:?}", t), actually.to_string())
                 }
@@ -450,10 +453,13 @@ fn is_repr_nullable_ptr<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
     if def.variants.len() == 2 {
         let data_idx;
 
-        if def.variants[0].fields.is_empty() {
-            data_idx = 1;
-        } else if def.variants[1].fields.is_empty() {
-            data_idx = 0;
+        let zero = VariantIdx::new(0);
+        let one = VariantIdx::new(1);
+
+        if def.variants[zero].fields.is_empty() {
+            data_idx = one;
+        } else if def.variants[one].fields.is_empty() {
+            data_idx = zero;
         } else {
             return false;
         }
@@ -691,7 +697,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
                 }
 
                 let sig = cx.erase_late_bound_regions(&sig);
-                if !sig.output().is_nil() {
+                if !sig.output().is_unit() {
                     let r = self.check_type_for_ffi(cache, sig.output());
                     match r {
                         FfiSafe => {}
@@ -716,12 +722,14 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
             ty::Param(..) |
             ty::Infer(..) |
+            ty::Bound(..) |
             ty::Error |
             ty::Closure(..) |
             ty::Generator(..) |
             ty::GeneratorWitness(..) |
+            ty::UnnormalizedProjection(..) |
             ty::Projection(..) |
-            ty::Anon(..) |
+            ty::Opaque(..) |
             ty::FnDef(..) => bug!("Unexpected type in foreign function"),
         }
     }
@@ -731,7 +739,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
         // any generic types right now:
         let ty = self.cx.tcx.normalize_erasing_regions(ParamEnv::reveal_all(), ty);
 
-        match self.check_type_for_ffi(&mut FxHashSet(), ty) {
+        match self.check_type_for_ffi(&mut FxHashSet::default(), ty) {
             FfiResult::FfiSafe => {}
             FfiResult::FfiPhantom(ty) => {
                 self.cx.span_lint(IMPROPER_CTYPES,
@@ -767,7 +775,7 @@ impl<'a, 'tcx> ImproperCTypesVisitor<'a, 'tcx> {
 
         if let hir::Return(ref ret_hir) = decl.output {
             let ret_ty = sig.output();
-            if !ret_ty.is_nil() {
+            if !ret_ty.is_unit() {
                 self.check_type_for_ffi_and_report_errors(ret_hir.span, ret_ty);
             }
         }
@@ -791,7 +799,7 @@ impl LintPass for ImproperCTypes {
 
 impl<'a, 'tcx> LateLintPass<'a, 'tcx> for ImproperCTypes {
     fn check_foreign_item(&mut self, cx: &LateContext, it: &hir::ForeignItem) {
-        let mut vis = ImproperCTypesVisitor { cx: cx };
+        let mut vis = ImproperCTypesVisitor { cx };
         let abi = cx.tcx.hir.get_foreign_abi(it.id);
         if abi != Abi::RustIntrinsic && abi != Abi::PlatformIntrinsic {
             match it.node {
@@ -825,7 +833,7 @@ impl<'a, 'tcx> LateLintPass<'a, 'tcx> for VariantSizeDifferences {
                 Ok(layout) => {
                     let variants = &layout.variants;
                     if let layout::Variants::Tagged { ref variants, ref tag, .. } = variants {
-                        let discr_size = tag.value.size(cx.tcx).bytes();
+                        let discr_size = tag.value.size(&cx.tcx).bytes();
 
                         debug!("enum `{}` is {} bytes large with layout:\n{:#?}",
                                t, layout.size.bytes(), layout);

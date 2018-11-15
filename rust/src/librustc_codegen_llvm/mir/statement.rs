@@ -15,6 +15,7 @@ use builder::Builder;
 
 use super::FunctionCx;
 use super::LocalRef;
+use super::OperandValue;
 
 impl FunctionCx<'a, 'll, 'tcx> {
     pub fn codegen_statement(&mut self,
@@ -82,17 +83,32 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     self.codegen_place(&bx, output)
                 }).collect();
 
-                let input_vals = inputs.iter().map(|input| {
-                    self.codegen_operand(&bx, input).immediate()
-                }).collect();
+                let input_vals = inputs.iter()
+                    .fold(Vec::with_capacity(inputs.len()), |mut acc, (span, input)| {
+                        let op = self.codegen_operand(&bx, input);
+                        if let OperandValue::Immediate(_) = op.val {
+                            acc.push(op.immediate());
+                        } else {
+                            span_err!(bx.sess(), span.to_owned(), E0669,
+                                     "invalid value for constraint in inline assembly");
+                        }
+                        acc
+                });
 
-                asm::codegen_inline_asm(&bx, asm, outputs, input_vals);
+                if input_vals.len() == inputs.len() {
+                    let res = asm::codegen_inline_asm(&bx, asm, outputs, input_vals);
+                    if !res {
+                        span_err!(bx.sess(), statement.source_info.span, E0668,
+                                  "malformed inline assembly");
+                    }
+                }
                 bx
             }
-            mir::StatementKind::ReadForMatch(_) |
-            mir::StatementKind::EndRegion(_) |
-            mir::StatementKind::Validate(..) |
-            mir::StatementKind::UserAssertTy(..) |
+            mir::StatementKind::FakeRead(..) |
+            mir::StatementKind::EndRegion(..) |
+            mir::StatementKind::Retag { .. } |
+            mir::StatementKind::EscapeToRaw { .. } |
+            mir::StatementKind::AscribeUserType(..) |
             mir::StatementKind::Nop => bx,
         }
     }

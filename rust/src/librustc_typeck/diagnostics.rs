@@ -3084,6 +3084,66 @@ containing the unsized type is the last and only unsized type field in the
 struct.
 "##,
 
+E0378: r##"
+The `DispatchFromDyn` trait currently can only be implemented for
+builtin pointer types and structs that are newtype wrappers around them
+— that is, the struct must have only one field (except for`PhantomData`),
+and that field must itself implement `DispatchFromDyn`.
+
+Examples:
+
+```
+#![feature(dispatch_from_dyn, unsize)]
+use std::{
+    marker::Unsize,
+    ops::DispatchFromDyn,
+};
+
+struct Ptr<T: ?Sized>(*const T);
+
+impl<T: ?Sized, U: ?Sized> DispatchFromDyn<Ptr<U>> for Ptr<T>
+where
+    T: Unsize<U>,
+{}
+```
+
+```
+#![feature(dispatch_from_dyn)]
+use std::{
+    ops::DispatchFromDyn,
+    marker::PhantomData,
+};
+
+struct Wrapper<T> {
+    ptr: T,
+    _phantom: PhantomData<()>,
+}
+
+impl<T, U> DispatchFromDyn<Wrapper<U>> for Wrapper<T>
+where
+    T: DispatchFromDyn<U>,
+{}
+```
+
+Example of illegal `DispatchFromDyn` implementation
+(illegal because of extra field)
+
+```compile-fail,E0378
+#![feature(dispatch_from_dyn)]
+use std::ops::DispatchFromDyn;
+
+struct WrapperExtraField<T> {
+    ptr: T,
+    extra_stuff: i32,
+}
+
+impl<T, U> DispatchFromDyn<WrapperExtraField<U>> for WrapperExtraField<T>
+where
+    T: DispatchFromDyn<U>,
+{}
+```
+"##,
+
 E0390: r##"
 You tried to implement methods for a primitive type. Erroneous code example:
 
@@ -4750,6 +4810,22 @@ ambiguity for some types, we disallow calling methods on raw pointers when
 the type is unknown.
 "##,
 
+E0714: r##"
+A `#[marker]` trait contained an associated item.
+
+The items of marker traits cannot be overridden, so there's no need to have them
+when they cannot be changed per-type anyway.  If you wanted them for ergonomic
+reasons, consider making an extension trait instead.
+"##,
+
+E0715: r##"
+An `impl` for a `#[marker]` trait tried to override an associated item.
+
+Because marker traits are allowed to have multiple implementations for the same
+type, it's not allowed to override anything in those implementations, as it
+would be ambiguous which override should actually be used.
+"##,
+
 }
 
 register_diagnostics! {
@@ -4833,4 +4909,5 @@ register_diagnostics! {
     E0641, // cannot cast to/from a pointer with an unknown kind
     E0645, // trait aliases not finished
     E0698, // type inside generator must be known in this context
+    E0719, // duplicate values for associated type binding
 }

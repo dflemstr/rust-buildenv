@@ -17,11 +17,15 @@ mod operand;
 mod machine;
 mod memory;
 mod operator;
+pub(crate) mod snapshot; // for const_eval
 mod step;
 mod terminator;
 mod traits;
 mod validity;
 mod intrinsics;
+mod visitor;
+
+pub use rustc::mir::interpret::*; // have all the `interpret` symbols in one place: here
 
 pub use self::eval_context::{
     EvalContext, Frame, StackPopCleanup, LocalValue,
@@ -31,19 +35,10 @@ pub use self::place::{Place, PlaceTy, MemPlace, MPlaceTy};
 
 pub use self::memory::{Memory, MemoryKind};
 
-pub use self::machine::Machine;
+pub use self::machine::{Machine, AllocMap, MayLeak};
 
-pub use self::operand::{Value, ValTy, Operand, OpTy};
+pub use self::operand::{ScalarMaybeUndef, Immediate, ImmTy, Operand, OpTy};
 
-// reexports for compatibility
-pub use const_eval::{
-    eval_promoted,
-    mk_borrowck_eval_cx,
-    mk_eval_cx,
-    CompileTimeEvaluator,
-    const_to_allocation_provider,
-    const_eval_provider,
-    const_field,
-    const_variant_index,
-    op_to_const,
-};
+pub use self::visitor::ValueVisitor;
+
+pub use self::validity::RefTracking;

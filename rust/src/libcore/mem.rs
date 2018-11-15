@@ -143,6 +143,19 @@ pub fn forget<T>(t: T) {
     ManuallyDrop::new(t);
 }
 
+/// Like [`forget`], but also accepts unsized values.
+///
+/// This function is just a shim intended to be removed when the `unsized_locals` feature gets
+/// stabilized.
+///
+/// [`forget`]: fn.forget.html
+#[inline]
+#[cfg(not(stage0))]
+#[unstable(feature = "forget_unsized", issue = "0")]
+pub fn forget_unsized<T: ?Sized>(t: T) {
+    unsafe { intrinsics::forget(t) }
+}
+
 /// Returns the size of a type in bytes.
 ///
 /// More specifically, this is the offset in bytes between successive elements
@@ -202,7 +215,7 @@ pub fn forget<T>(t: T) {
 ///
 /// ## Size of Enums
 ///
-/// Enums that carry no data other than the descriminant have the same size as C enums
+/// Enums that carry no data other than the discriminant have the same size as C enums
 /// on the platform they are compiled for.
 ///
 /// ## Size of Unions
@@ -285,8 +298,9 @@ pub fn forget<T>(t: T) {
 /// [alignment]: ./fn.align_of.html
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_promotable]
 pub const fn size_of<T>() -> usize {
-    unsafe { intrinsics::size_of::<T>() }
+    intrinsics::size_of::<T>()
 }
 
 /// Returns the size of the pointed-to value in bytes.
@@ -335,7 +349,7 @@ pub fn size_of_val<T: ?Sized>(val: &T) -> usize {
 #[stable(feature = "rust1", since = "1.0.0")]
 #[rustc_deprecated(reason = "use `align_of` instead", since = "1.2.0")]
 pub fn min_align_of<T>() -> usize {
-    unsafe { intrinsics::min_align_of::<T>() }
+    intrinsics::min_align_of::<T>()
 }
 
 /// Returns the [ABI]-required minimum alignment of the type of the value that `val` points to.
@@ -376,8 +390,9 @@ pub fn min_align_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_promotable]
 pub const fn align_of<T>() -> usize {
-    unsafe { intrinsics::min_align_of::<T>() }
+    intrinsics::min_align_of::<T>()
 }
 
 /// Returns the [ABI]-required minimum alignment of the type of the value that `val` points to.
@@ -455,8 +470,9 @@ pub fn align_of_val<T: ?Sized>(val: &T) -> usize {
 /// ```
 #[inline]
 #[stable(feature = "needs_drop", since = "1.21.0")]
-pub fn needs_drop<T>() -> bool {
-    unsafe { intrinsics::needs_drop::<T>() }
+#[rustc_const_unstable(feature = "const_needs_drop")]
+pub const fn needs_drop<T>() -> bool {
+    intrinsics::needs_drop::<T>()
 }
 
 /// Creates a value whose bytes are all zero.
@@ -486,6 +502,7 @@ pub fn needs_drop<T>() -> bool {
 /// assert_eq!(0, x);
 /// ```
 #[inline]
+#[rustc_deprecated(since = "2.0.0", reason = "use `mem::MaybeUninit::zeroed` instead")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn zeroed<T>() -> T {
     intrinsics::init()
@@ -580,6 +597,7 @@ pub unsafe fn zeroed<T>() -> T {
 /// [copy_no]: ../intrinsics/fn.copy_nonoverlapping.html
 /// [`Drop`]: ../ops/trait.Drop.html
 #[inline]
+#[rustc_deprecated(since = "2.0.0", reason = "use `mem::MaybeUninit::uninitialized` instead")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn uninitialized<T>() -> T {
     intrinsics::uninit()
@@ -804,7 +822,7 @@ pub fn drop<T>(_x: T) { }
 #[inline]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub unsafe fn transmute_copy<T, U>(src: &T) -> U {
-    ptr::read(src as *const T as *const U)
+    ptr::read_unaligned(src as *const T as *const U)
 }
 
 /// Opaque type representing the discriminant of an enum.
@@ -937,36 +955,61 @@ impl<T> ManuallyDrop<T> {
     /// ManuallyDrop::new(Box::new(()));
     /// ```
     #[stable(feature = "manually_drop", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_manually_drop_new")]
     #[inline]
     pub const fn new(value: T) -> ManuallyDrop<T> {
         ManuallyDrop { value }
     }
 
-    /// Extract the value from the ManuallyDrop container.
+    /// Extract the value from the `ManuallyDrop` container.
+    ///
+    /// This allows the value to be dropped again.
     ///
     /// # Examples
     ///
     /// ```rust
     /// use std::mem::ManuallyDrop;
     /// let x = ManuallyDrop::new(Box::new(()));
-    /// let _: Box<()> = ManuallyDrop::into_inner(x);
+    /// let _: Box<()> = ManuallyDrop::into_inner(x); // This drops the `Box`.
     /// ```
     #[stable(feature = "manually_drop", since = "1.20.0")]
     #[inline]
-    pub fn into_inner(slot: ManuallyDrop<T>) -> T {
+    pub const fn into_inner(slot: ManuallyDrop<T>) -> T {
         slot.value
+    }
+
+    /// Takes the contained value out.
+    ///
+    /// This method is primarily intended for moving out values in drop.
+    /// Instead of using [`ManuallyDrop::drop`] to manually drop the value,
+    /// you can use this method to take the value and use it however desired.
+    /// `Drop` will be invoked on the returned value following normal end-of-scope rules.
+    ///
+    /// If you have ownership of the container, you can use [`ManuallyDrop::into_inner`] instead.
+    ///
+    /// # Safety
+    ///
+    /// This function semantically moves out the contained value without preventing further usage.
+    /// It is up to the user of this method to ensure that this container is not used again.
+    #[must_use = "if you don't need the value, you can use `ManuallyDrop::drop` instead"]
+    #[unstable(feature = "manually_drop_take", issue = "55422")]
+    #[inline]
+    pub unsafe fn take(slot: &mut ManuallyDrop<T>) -> T {
+        ManuallyDrop::into_inner(ptr::read(slot))
     }
 }
 
 impl<T: ?Sized> ManuallyDrop<T> {
     /// Manually drops the contained value.
     ///
+    /// If you have ownership of the value, you can use [`ManuallyDrop::into_inner`] instead.
+    ///
     /// # Safety
     ///
     /// This function runs the destructor of the contained value and thus the wrapped value
     /// now represents uninitialized data. It is up to the user of this method to ensure the
     /// uninitialized data is not actually used.
+    ///
+    /// [`ManuallyDrop::into_inner`]: #method.into_inner
     #[stable(feature = "manually_drop", since = "1.20.0")]
     #[inline]
     pub unsafe fn drop(slot: &mut ManuallyDrop<T>) {
@@ -988,5 +1031,108 @@ impl<T: ?Sized> DerefMut for ManuallyDrop<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
+    }
+}
+
+/// A newtype to construct uninitialized instances of `T`
+#[allow(missing_debug_implementations)]
+#[unstable(feature = "maybe_uninit", issue = "53491")]
+// NOTE after stabilizing `MaybeUninit` proceed to deprecate `mem::{uninitialized,zeroed}`
+pub union MaybeUninit<T> {
+    uninit: (),
+    value: ManuallyDrop<T>,
+}
+
+impl<T> MaybeUninit<T> {
+    /// Create a new `MaybeUninit` initialized with the given value.
+    ///
+    /// Note that dropping a `MaybeUninit` will never call `T`'s drop code.
+    /// It is your responsibility to make sure `T` gets dropped if it got initialized.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub const fn new(val: T) -> MaybeUninit<T> {
+        MaybeUninit { value: ManuallyDrop::new(val) }
+    }
+
+    /// Create a new `MaybeUninit` in an uninitialized state.
+    ///
+    /// Note that dropping a `MaybeUninit` will never call `T`'s drop code.
+    /// It is your responsibility to make sure `T` gets dropped if it got initialized.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub const fn uninitialized() -> MaybeUninit<T> {
+        MaybeUninit { uninit: () }
+    }
+
+    /// Create a new `MaybeUninit` in an uninitialized state, with the memory being
+    /// filled with `0` bytes.  It depends on `T` whether that already makes for
+    /// proper initialization. For example, `MaybeUninit<usize>::zeroed()` is initialized,
+    /// but `MaybeUninit<&'static i32>::zeroed()` is not because references must not
+    /// be null.
+    ///
+    /// Note that dropping a `MaybeUninit` will never call `T`'s drop code.
+    /// It is your responsibility to make sure `T` gets dropped if it got initialized.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub fn zeroed() -> MaybeUninit<T> {
+        let mut u = MaybeUninit::<T>::uninitialized();
+        unsafe {
+            u.as_mut_ptr().write_bytes(0u8, 1);
+        }
+        u
+    }
+
+    /// Set the value of the `MaybeUninit`. This overwrites any previous value without dropping it.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub fn set(&mut self, val: T) {
+        unsafe {
+            self.value = ManuallyDrop::new(val);
+        }
+    }
+
+    /// Extract the value from the `MaybeUninit` container.  This is a great way
+    /// to ensure that the data will get dropped, because the resulting `T` is
+    /// subject to the usual drop handling.
+    ///
+    /// # Unsafety
+    ///
+    /// It is up to the caller to guarantee that the `MaybeUninit` really is in an initialized
+    /// state, otherwise this will immediately cause undefined behavior.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub unsafe fn into_inner(self) -> T {
+        ManuallyDrop::into_inner(self.value)
+    }
+
+    /// Get a reference to the contained value.
+    ///
+    /// # Unsafety
+    ///
+    /// It is up to the caller to guarantee that the `MaybeUninit` really is in an initialized
+    /// state, otherwise this will immediately cause undefined behavior.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub unsafe fn get_ref(&self) -> &T {
+        &*self.value
+    }
+
+    /// Get a mutable reference to the contained value.
+    ///
+    /// # Unsafety
+    ///
+    /// It is up to the caller to guarantee that the `MaybeUninit` really is in an initialized
+    /// state, otherwise this will immediately cause undefined behavior.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub unsafe fn get_mut(&mut self) -> &mut T {
+        &mut *self.value
+    }
+
+    /// Get a pointer to the contained value. Reading from this pointer will be undefined
+    /// behavior unless the `MaybeUninit` is initialized.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub fn as_ptr(&self) -> *const T {
+        unsafe { &*self.value as *const T }
+    }
+
+    /// Get a mutable pointer to the contained value. Reading from this pointer will be undefined
+    /// behavior unless the `MaybeUninit` is initialized.
+    #[unstable(feature = "maybe_uninit", issue = "53491")]
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        unsafe { &mut *self.value as *mut T }
     }
 }

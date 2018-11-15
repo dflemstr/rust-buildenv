@@ -26,8 +26,7 @@
 #![feature(in_band_lifetimes)]
 #![allow(unused_attributes)]
 #![feature(libc)]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(quote)]
 #![feature(range_contains)]
 #![feature(rustc_diagnostic_macros)]
@@ -66,13 +65,12 @@ extern crate rustc_errors as errors;
 extern crate serialize;
 extern crate cc; // Used to locate MSVC
 extern crate tempfile;
+extern crate memmap;
 
 use back::bytecode::RLIB_BYTECODE_EXTENSION;
 
 pub use llvm_util::target_features;
-
 use std::any::Any;
-use std::path::PathBuf;
 use std::sync::mpsc;
 use rustc_data_structures::sync::Lrc;
 
@@ -88,20 +86,17 @@ use rustc::util::time_graph;
 use rustc::util::nodemap::{FxHashSet, FxHashMap};
 use rustc::util::profiling::ProfileCategory;
 use rustc_mir::monomorphize;
+use rustc_codegen_utils::{CompiledModule, ModuleKind};
 use rustc_codegen_utils::codegen_backend::CodegenBackend;
 use rustc_data_structures::svh::Svh;
 
 mod diagnostics;
 
 mod back {
-    pub use rustc_codegen_utils::symbol_names;
     mod archive;
     pub mod bytecode;
-    mod command;
-    pub mod linker;
     pub mod link;
-    mod lto;
-    pub mod symbol_export;
+    pub mod lto;
     pub mod write;
     mod rpath;
     pub mod wasm;
@@ -195,15 +190,15 @@ impl CodegenBackend for LlvmCodegenBackend {
     }
 
     fn provide(&self, providers: &mut ty::query::Providers) {
-        back::symbol_names::provide(providers);
-        back::symbol_export::provide(providers);
-        base::provide(providers);
+        rustc_codegen_utils::symbol_export::provide(providers);
+        rustc_codegen_utils::symbol_names::provide(providers);
+        base::provide_both(providers);
         attributes::provide(providers);
     }
 
     fn provide_extern(&self, providers: &mut ty::query::Providers) {
-        back::symbol_export::provide_extern(providers);
-        base::provide_extern(providers);
+        rustc_codegen_utils::symbol_export::provide_extern(providers);
+        base::provide_both(providers);
         attributes::provide_extern(providers);
     }
 
@@ -273,34 +268,21 @@ struct ModuleCodegen {
     /// as the crate name and disambiguator.
     /// We currently generate these names via CodegenUnit::build_cgu_name().
     name: String,
-    source: ModuleSource,
+    module_llvm: ModuleLlvm,
     kind: ModuleKind,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
-enum ModuleKind {
-    Regular,
-    Metadata,
-    Allocator,
+struct CachedModuleCodegen {
+    name: String,
+    source: WorkProduct,
 }
 
 impl ModuleCodegen {
-    fn llvm(&self) -> Option<&ModuleLlvm> {
-        match self.source {
-            ModuleSource::Codegened(ref llvm) => Some(llvm),
-            ModuleSource::Preexisting(_) => None,
-        }
-    }
-
     fn into_compiled_module(self,
-                                emit_obj: bool,
-                                emit_bc: bool,
-                                emit_bc_compressed: bool,
-                                outputs: &OutputFilenames) -> CompiledModule {
-        let pre_existing = match self.source {
-            ModuleSource::Preexisting(_) => true,
-            ModuleSource::Codegened(_) => false,
-        };
+                            emit_obj: bool,
+                            emit_bc: bool,
+                            emit_bc_compressed: bool,
+                            outputs: &OutputFilenames) -> CompiledModule {
         let object = if emit_obj {
             Some(outputs.temp_path(OutputType::Object, Some(&self.name)))
         } else {
@@ -313,7 +295,7 @@ impl ModuleCodegen {
         };
         let bytecode_compressed = if emit_bc_compressed {
             Some(outputs.temp_path(OutputType::Bitcode, Some(&self.name))
-                    .with_extension(RLIB_BYTECODE_EXTENSION))
+                        .with_extension(RLIB_BYTECODE_EXTENSION))
         } else {
             None
         };
@@ -321,30 +303,11 @@ impl ModuleCodegen {
         CompiledModule {
             name: self.name.clone(),
             kind: self.kind,
-            pre_existing,
             object,
             bytecode,
             bytecode_compressed,
         }
     }
-}
-
-#[derive(Debug)]
-struct CompiledModule {
-    name: String,
-    kind: ModuleKind,
-    pre_existing: bool,
-    object: Option<PathBuf>,
-    bytecode: Option<PathBuf>,
-    bytecode_compressed: Option<PathBuf>,
-}
-
-enum ModuleSource {
-    /// Copy the `.o` files or whatever from the incr. comp. directory.
-    Preexisting(WorkProduct),
-
-    /// Rebuild from this LLVM module.
-    Codegened(ModuleLlvm),
 }
 
 struct ModuleLlvm {
@@ -394,7 +357,7 @@ struct CodegenResults {
     crate_hash: Svh,
     metadata: rustc::middle::cstore::EncodedMetadata,
     windows_subsystem: Option<String>,
-    linker_info: back::linker::LinkerInfo,
+    linker_info: rustc_codegen_utils::linker::LinkerInfo,
     crate_info: CrateInfo,
 }
 

@@ -49,8 +49,6 @@ use hir::map::{self, Map};
 use super::itemlikevisit::DeepVisitor;
 
 use std::cmp;
-use std::u32;
-use std::result::Result::Err;
 
 #[derive(Copy, Clone)]
 pub enum FnKind<'a> {
@@ -299,6 +297,9 @@ pub trait Visitor<'v> : Sized {
     fn visit_fn(&mut self, fk: FnKind<'v>, fd: &'v FnDecl, b: BodyId, s: Span, id: NodeId) {
         walk_fn(self, fk, fd, b, s, id)
     }
+    fn visit_use(&mut self, path: &'v Path, id: NodeId, hir_id: HirId) {
+        walk_use(self, path, id, hir_id)
+    }
     fn visit_trait_item(&mut self, ti: &'v TraitItem) {
         walk_trait_item(self, ti)
     }
@@ -437,7 +438,9 @@ pub fn walk_lifetime<'v, V: Visitor<'v>>(visitor: &mut V, lifetime: &'v Lifetime
             visitor.visit_ident(ident);
         }
         LifetimeName::Param(ParamName::Fresh(_)) |
+        LifetimeName::Param(ParamName::Error) |
         LifetimeName::Static |
+        LifetimeName::Error |
         LifetimeName::Implicit |
         LifetimeName::Underscore => {}
     }
@@ -470,8 +473,7 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item) {
             }
         }
         ItemKind::Use(ref path, _) => {
-            visitor.visit_id(item.id);
-            visitor.visit_path(path, item.hir_id);
+            visitor.visit_use(path, item.id, item.hir_id);
         }
         ItemKind::Static(ref typ, _, body) |
         ItemKind::Const(ref typ, body) => {
@@ -553,6 +555,14 @@ pub fn walk_item<'v, V: Visitor<'v>>(visitor: &mut V, item: &'v Item) {
     walk_list!(visitor, visit_attribute, &item.attrs);
 }
 
+pub fn walk_use<'v, V: Visitor<'v>>(visitor: &mut V,
+                                    path: &'v Path,
+                                    item_id: NodeId,
+                                    hir_id: HirId) {
+    visitor.visit_id(item_id);
+    visitor.visit_path(path, hir_id);
+}
+
 pub fn walk_enum_def<'v, V: Visitor<'v>>(visitor: &mut V,
                                          enum_definition: &'v EnumDef,
                                          generics: &'v Generics,
@@ -604,6 +614,10 @@ pub fn walk_ty<'v, V: Visitor<'v>>(visitor: &mut V, typ: &'v Ty) {
         TyKind::Path(ref qpath) => {
             visitor.visit_qpath(qpath, typ.hir_id, typ.span);
         }
+        TyKind::Def(item_id, ref lifetimes) => {
+            visitor.visit_nested_item(item_id);
+            walk_list!(visitor, visit_generic_arg, lifetimes);
+        }
         TyKind::Array(ref ty, ref length) => {
             visitor.visit_ty(ty);
             visitor.visit_anon_const(length)
@@ -647,6 +661,9 @@ pub fn walk_path_segment<'v, V: Visitor<'v>>(visitor: &mut V,
                                              path_span: Span,
                                              segment: &'v PathSegment) {
     visitor.visit_ident(segment.ident);
+    if let Some(id) = segment.id {
+        visitor.visit_id(id);
+    }
     if let Some(ref args) = segment.args {
         visitor.visit_generic_args(path_span, args);
     }
@@ -744,7 +761,7 @@ pub fn walk_generic_param<'v, V: Visitor<'v>>(visitor: &mut V, param: &'v Generi
     walk_list!(visitor, visit_attribute, &param.attrs);
     match param.name {
         ParamName::Plain(ident) => visitor.visit_ident(ident),
-        ParamName::Fresh(_) => {}
+        ParamName::Error | ParamName::Fresh(_) => {}
     }
     match param.kind {
         GenericParamKind::Lifetime { .. } => {}
@@ -1067,31 +1084,26 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
         ExprKind::Break(ref destination, ref opt_expr) => {
             if let Some(ref label) = destination.label {
                 visitor.visit_label(label);
-                match destination.target_id {
-                    Ok(node_id) => visitor.visit_def_mention(Def::Label(node_id)),
-                    Err(_) => {},
-                };
+                if let Ok(node_id) = destination.target_id {
+                    visitor.visit_def_mention(Def::Label(node_id))
+                }
             }
             walk_list!(visitor, visit_expr, opt_expr);
         }
         ExprKind::Continue(ref destination) => {
             if let Some(ref label) = destination.label {
                 visitor.visit_label(label);
-                match destination.target_id {
-                    Ok(node_id) => visitor.visit_def_mention(Def::Label(node_id)),
-                    Err(_) => {},
-                };
+                if let Ok(node_id) = destination.target_id {
+                    visitor.visit_def_mention(Def::Label(node_id))
+                }
             }
         }
         ExprKind::Ret(ref optional_expression) => {
             walk_list!(visitor, visit_expr, optional_expression);
         }
         ExprKind::InlineAsm(_, ref outputs, ref inputs) => {
-            for output in outputs {
-                visitor.visit_expr(output)
-            }
-            for input in inputs {
-                visitor.visit_expr(input)
+            for expr in outputs.iter().chain(inputs.iter()) {
+                visitor.visit_expr(expr)
             }
         }
         ExprKind::Yield(ref subexpression) => {
@@ -1102,7 +1114,11 @@ pub fn walk_expr<'v, V: Visitor<'v>>(visitor: &mut V, expression: &'v Expr) {
 
 pub fn walk_arm<'v, V: Visitor<'v>>(visitor: &mut V, arm: &'v Arm) {
     walk_list!(visitor, visit_pat, &arm.pats);
-    walk_list!(visitor, visit_expr, &arm.guard);
+    if let Some(ref g) = arm.guard {
+        match g {
+            Guard::If(ref e) => visitor.visit_expr(e),
+        }
+    }
     visitor.visit_expr(&arm.body);
     walk_list!(visitor, visit_attribute, &arm.attrs);
 }
@@ -1135,8 +1151,8 @@ pub struct IdRange {
 impl IdRange {
     pub fn max() -> IdRange {
         IdRange {
-            min: NodeId::from_u32(u32::MAX),
-            max: NodeId::from_u32(u32::MIN),
+            min: NodeId::MAX,
+            max: NodeId::from_u32(0),
         }
     }
 
@@ -1152,7 +1168,6 @@ impl IdRange {
         self.min = cmp::min(self.min, id);
         self.max = cmp::max(self.max, NodeId::from_u32(id.as_u32() + 1));
     }
-
 }
 
 

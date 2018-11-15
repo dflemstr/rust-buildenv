@@ -16,7 +16,7 @@ use decoder::proc_macro_def_path_table;
 use schema::CrateRoot;
 use rustc_data_structures::sync::{Lrc, RwLock, Lock};
 
-use rustc::hir::def_id::{CrateNum, CRATE_DEF_INDEX};
+use rustc::hir::def_id::CrateNum;
 use rustc_data_structures::svh::Svh;
 use rustc::middle::allocator::AllocatorKind;
 use rustc::middle::cstore::DepKind;
@@ -29,8 +29,6 @@ use rustc::middle::cstore::{ExternCrate, ExternCrateSource};
 use rustc::util::common::record_time;
 use rustc::util::nodemap::FxHashSet;
 use rustc::hir::map::Definitions;
-
-use rustc_metadata_utils::validate_crate_name;
 
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -100,6 +98,18 @@ enum LoadResult {
     Loaded(Library),
 }
 
+enum LoadError<'a> {
+    LocatorError(locator::Context<'a>),
+}
+
+impl<'a> LoadError<'a> {
+    fn report(self) -> ! {
+        match self {
+            LoadError::LocatorError(mut locate_ctxt) => locate_ctxt.report_errs(),
+        }
+    }
+}
+
 impl<'a> CrateLoader<'a> {
     pub fn new(sess: &'a Session, cstore: &'a CStore, local_crate_name: &str) -> Self {
         CrateLoader {
@@ -132,7 +142,8 @@ impl<'a> CrateLoader<'a> {
             // from the strings on the command line.
             let source = &self.cstore.get_crate_data(cnum).source;
             if let Some(locs) = self.sess.opts.externs.get(&*name.as_str()) {
-                let found = locs.iter().any(|l| {
+                // Only use `--extern crate_name=path` here, not `--extern crate_name`.
+                let found = locs.iter().filter_map(|l| l.as_ref()).any(|l| {
                     let l = fs::canonicalize(l).ok();
                     source.dylib.as_ref().map(|p| &p.0) == l.as_ref() ||
                     source.rlib.as_ref().map(|p| &p.0) == l.as_ref()
@@ -243,6 +254,7 @@ impl<'a> CrateLoader<'a> {
 
         let cmeta = cstore::CrateMetadata {
             name: crate_root.name,
+            imported_name: ident,
             extern_crate: Lock::new(None),
             def_path_table: Lrc::new(def_path_table),
             trait_impls,
@@ -267,16 +279,17 @@ impl<'a> CrateLoader<'a> {
         (cnum, cmeta)
     }
 
-    fn resolve_crate(&mut self,
-                     root: &Option<CratePaths>,
-                     ident: Symbol,
-                     name: Symbol,
-                     hash: Option<&Svh>,
-                     extra_filename: Option<&str>,
-                     span: Span,
-                     path_kind: PathKind,
-                     mut dep_kind: DepKind)
-                     -> (CrateNum, Lrc<cstore::CrateMetadata>) {
+    fn resolve_crate<'b>(
+        &'b mut self,
+        root: &'b Option<CratePaths>,
+        ident: Symbol,
+        name: Symbol,
+        hash: Option<&'b Svh>,
+        extra_filename: Option<&'b str>,
+        span: Span,
+        path_kind: PathKind,
+        mut dep_kind: DepKind,
+    ) -> Result<(CrateNum, Lrc<cstore::CrateMetadata>), LoadError<'b>> {
         info!("resolving crate `extern crate {} as {}`", name, ident);
         let result = if let Some(cnum) = self.existing_match(name, hash, path_kind) {
             LoadResult::Previous(cnum)
@@ -320,7 +333,7 @@ impl<'a> CrateLoader<'a> {
                 };
 
                 self.load(&mut proc_macro_locator)
-            }).unwrap_or_else(|| locate_ctxt.report_errs())
+            }).ok_or_else(move || LoadError::LocatorError(locate_ctxt))?
         };
 
         match result {
@@ -332,10 +345,10 @@ impl<'a> CrateLoader<'a> {
                 data.dep_kind.with_lock(|data_dep_kind| {
                     *data_dep_kind = cmp::max(*data_dep_kind, dep_kind);
                 });
-                (cnum, data)
+                Ok((cnum, data))
             }
             LoadResult::Loaded(library) => {
-                self.register_crate(root, ident, span, library, dep_kind)
+                Ok(self.register_crate(root, ident, span, library, dep_kind))
             }
         }
     }
@@ -440,7 +453,7 @@ impl<'a> CrateLoader<'a> {
             let (local_cnum, ..) = self.resolve_crate(
                 root, dep.name, dep.name, Some(&dep.hash), Some(&dep.extra_filename), span,
                 PathKind::Dependency, dep_kind,
-            );
+            ).unwrap_or_else(|err| err.report());
             local_cnum
         })).collect()
     }
@@ -694,7 +707,8 @@ impl<'a> CrateLoader<'a> {
 
         let dep_kind = DepKind::Implicit;
         let (cnum, data) =
-            self.resolve_crate(&None, name, name, None, None, DUMMY_SP, PathKind::Crate, dep_kind);
+            self.resolve_crate(&None, name, name, None, None, DUMMY_SP, PathKind::Crate, dep_kind)
+                .unwrap_or_else(|err| err.report());
 
         // Sanity check the loaded crate to ensure it is indeed a panic runtime
         // and the panic strategy is indeed what we thought it was.
@@ -802,7 +816,8 @@ impl<'a> CrateLoader<'a> {
                 let dep_kind = DepKind::Explicit;
                 let (_, data) =
                     self.resolve_crate(&None, symbol, symbol, None, None, DUMMY_SP,
-                                       PathKind::Crate, dep_kind);
+                                       PathKind::Crate, dep_kind)
+                        .unwrap_or_else(|err| err.report());
 
                 // Sanity check the loaded crate to ensure it is indeed a sanitizer runtime
                 if !data.root.sanitizer_runtime {
@@ -825,7 +840,8 @@ impl<'a> CrateLoader<'a> {
             let dep_kind = DepKind::Implicit;
             let (_, data) =
                 self.resolve_crate(&None, symbol, symbol, None, None, DUMMY_SP,
-                                   PathKind::Crate, dep_kind);
+                                   PathKind::Crate, dep_kind)
+                    .unwrap_or_else(|err| err.report());
 
             // Sanity check the loaded crate to ensure it is indeed a profiler runtime
             if !data.root.profiler_runtime {
@@ -848,7 +864,6 @@ impl<'a> CrateLoader<'a> {
             needs_allocator = needs_allocator || data.root.needs_allocator;
         });
         if !needs_allocator {
-            self.sess.injected_allocator.set(None);
             self.sess.allocator_kind.set(None);
             return
         }
@@ -856,20 +871,15 @@ impl<'a> CrateLoader<'a> {
         // At this point we've determined that we need an allocator. Let's see
         // if our compilation session actually needs an allocator based on what
         // we're emitting.
-        let mut need_lib_alloc = false;
-        let mut need_exe_alloc = false;
-        for ct in self.sess.crate_types.borrow().iter() {
-            match *ct {
-                config::CrateType::Executable => need_exe_alloc = true,
-                config::CrateType::Dylib |
-                config::CrateType::ProcMacro |
-                config::CrateType::Cdylib |
-                config::CrateType::Staticlib => need_lib_alloc = true,
-                config::CrateType::Rlib => {}
-            }
-        }
-        if !need_lib_alloc && !need_exe_alloc {
-            self.sess.injected_allocator.set(None);
+        let all_rlib = self.sess.crate_types.borrow()
+            .iter()
+            .all(|ct| {
+                match *ct {
+                    config::CrateType::Rlib => true,
+                    _ => false,
+                }
+            });
+        if all_rlib {
             self.sess.allocator_kind.set(None);
             return
         }
@@ -908,102 +918,27 @@ impl<'a> CrateLoader<'a> {
         });
         if global_allocator.is_some() {
             self.sess.allocator_kind.set(Some(AllocatorKind::Global));
-            self.sess.injected_allocator.set(None);
             return
         }
 
         // Ok we haven't found a global allocator but we still need an
-        // allocator. At this point we'll either fall back to the "library
-        // allocator" or the "exe allocator" depending on a few variables. Let's
-        // figure out which one.
-        //
-        // Note that here we favor linking to the "library allocator" as much as
-        // possible. If we're not creating rustc's version of libstd
-        // (need_lib_alloc and prefer_dynamic) then we select `None`, and if the
-        // exe allocation crate doesn't exist for this target then we also
-        // select `None`.
-        let exe_allocation_crate_data =
-            if need_lib_alloc && !self.sess.opts.cg.prefer_dynamic {
-                None
-            } else {
-                self.sess
-                    .target
-                    .target
-                    .options
-                    .exe_allocation_crate
-                    .as_ref()
-                    .map(|name| {
-                        // We've determined that we're injecting an "exe allocator" which means
-                        // that we're going to load up a whole new crate. An example of this is
-                        // that we're producing a normal binary on Linux which means we need to
-                        // load the `alloc_jemalloc` crate to link as an allocator.
-                        let name = Symbol::intern(name);
-                        let (cnum, data) = self.resolve_crate(&None,
-                                                              name,
-                                                              name,
-                                                              None,
-                                                              None,
-                                                              DUMMY_SP,
-                                                              PathKind::Crate,
-                                                              DepKind::Implicit);
-                        self.sess.injected_allocator.set(Some(cnum));
-                        data
-                    })
-            };
-
-        let allocation_crate_data = exe_allocation_crate_data.or_else(|| {
-            // No allocator was injected
-            self.sess.injected_allocator.set(None);
-
-            if attr::contains_name(&krate.attrs, "default_lib_allocator") {
-                // Prefer self as the allocator if there's a collision
-                return None;
+        // allocator. At this point our allocator request is typically fulfilled
+        // by the standard library, denoted by the `#![default_lib_allocator]`
+        // attribute.
+        let mut has_default = attr::contains_name(&krate.attrs, "default_lib_allocator");
+        self.cstore.iter_crate_data(|_, data| {
+            if data.root.has_default_lib_allocator {
+                has_default = true;
             }
-            // We're not actually going to inject an allocator, we're going to
-            // require that something in our crate graph is the default lib
-            // allocator. This is typically libstd, so this'll rarely be an
-            // error.
-            let mut allocator = None;
-            self.cstore.iter_crate_data(|_, data| {
-                if allocator.is_none() && data.root.has_default_lib_allocator {
-                    allocator = Some(data.clone());
-                }
-            });
-            allocator
         });
 
-        match allocation_crate_data {
-            Some(data) => {
-                // We have an allocator. We detect separately what kind it is, to allow for some
-                // flexibility in misconfiguration.
-                let attrs = data.get_item_attrs(CRATE_DEF_INDEX, self.sess);
-                let kind_interned = attr::first_attr_value_str_by_name(&attrs, "rustc_alloc_kind")
-                    .map(Symbol::as_str);
-                let kind_str = kind_interned
-                    .as_ref()
-                    .map(|s| s as &str);
-                let alloc_kind = match kind_str {
-                    None |
-                    Some("lib") => AllocatorKind::DefaultLib,
-                    Some("exe") => AllocatorKind::DefaultExe,
-                    Some(other) => {
-                        self.sess.err(&format!("Allocator kind {} not known", other));
-                        return;
-                    }
-                };
-                self.sess.allocator_kind.set(Some(alloc_kind));
-            },
-            None => {
-                if !attr::contains_name(&krate.attrs, "default_lib_allocator") {
-                    self.sess.err("no global memory allocator found but one is \
-                                   required; link to std or \
-                                   add #[global_allocator] to a static item \
-                                   that implements the GlobalAlloc trait.");
-                    return;
-                }
-                self.sess.allocator_kind.set(Some(AllocatorKind::DefaultLib));
-            }
+        if !has_default {
+            self.sess.err("no global memory allocator found but one is \
+                           required; link to std or \
+                           add #[global_allocator] to a static item \
+                           that implements the GlobalAlloc trait.");
         }
+        self.sess.allocator_kind.set(Some(AllocatorKind::DefaultLib));
 
         fn has_global_allocator(krate: &ast::Crate) -> bool {
             struct Finder(bool);
@@ -1066,8 +1001,6 @@ impl<'a> CrateLoader<'a> {
 
 impl<'a> CrateLoader<'a> {
     pub fn postprocess(&mut self, krate: &ast::Crate) {
-        // inject the sanitizer runtime before the allocator runtime because all
-        // sanitizers force the use of the `alloc_system` allocator
         self.inject_sanitizer_runtime();
         self.inject_profiler_runtime();
         self.inject_allocator_crate(krate);
@@ -1087,7 +1020,7 @@ impl<'a> CrateLoader<'a> {
                        item.ident, orig_name);
                 let orig_name = match orig_name {
                     Some(orig_name) => {
-                        validate_crate_name(Some(self.sess), &orig_name.as_str(),
+                        ::validate_crate_name(Some(self.sess), &orig_name.as_str(),
                                             Some(item.span));
                         orig_name
                     }
@@ -1102,7 +1035,7 @@ impl<'a> CrateLoader<'a> {
                 let (cnum, ..) = self.resolve_crate(
                     &None, item.ident.name, orig_name, None, None,
                     item.span, PathKind::Crate, dep_kind,
-                );
+                ).unwrap_or_else(|err| err.report());
 
                 let def_id = definitions.opt_local_def_id(item.id).unwrap();
                 let path_len = definitions.def_path(def_id.index).data.len();
@@ -1114,7 +1047,7 @@ impl<'a> CrateLoader<'a> {
                         path_len,
                         direct: true,
                     },
-                    &mut FxHashSet(),
+                    &mut FxHashSet::default(),
                 );
                 self.cstore.add_extern_mod_stmt_cnum(item.id, cnum);
                 cnum
@@ -1130,7 +1063,7 @@ impl<'a> CrateLoader<'a> {
     ) -> CrateNum {
         let cnum = self.resolve_crate(
             &None, name, name, None, None, span, PathKind::Crate, DepKind::Explicit
-        ).0;
+        ).unwrap_or_else(|err| err.report()).0;
 
         self.update_extern_crate(
             cnum,
@@ -1141,9 +1074,33 @@ impl<'a> CrateLoader<'a> {
                 path_len: usize::max_value(),
                 direct: true,
             },
-            &mut FxHashSet(),
+            &mut FxHashSet::default(),
         );
 
         cnum
+    }
+
+    pub fn maybe_process_path_extern(
+        &mut self,
+        name: Symbol,
+        span: Span,
+    ) -> Option<CrateNum> {
+        let cnum = self.resolve_crate(
+            &None, name, name, None, None, span, PathKind::Crate, DepKind::Explicit
+        ).ok()?.0;
+
+        self.update_extern_crate(
+            cnum,
+            ExternCrate {
+                src: ExternCrateSource::Path,
+                span,
+                // to have the least priority in `update_extern_crate`
+                path_len: usize::max_value(),
+                direct: true,
+            },
+            &mut FxHashSet::default(),
+        );
+
+        Some(cnum)
     }
 }

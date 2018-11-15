@@ -13,11 +13,12 @@
        html_root_url = "https://doc.rust-lang.org/nightly/")]
 
 #![feature(crate_visibility_modifier)]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_sort_by_cached_key)]
 
+#[macro_use]
+extern crate bitflags;
 #[macro_use]
 extern crate log;
 #[macro_use]
@@ -43,8 +44,9 @@ use rustc::lint;
 use rustc::hir::def::*;
 use rustc::hir::def::Namespace::*;
 use rustc::hir::def_id::{CRATE_DEF_INDEX, LOCAL_CRATE, DefId};
-use rustc::ty;
 use rustc::hir::{Freevar, FreevarMap, TraitCandidate, TraitMap, GlobMap};
+use rustc::session::config::nightly_options;
+use rustc::ty;
 use rustc::util::nodemap::{NodeMap, NodeSet, FxHashMap, FxHashSet, DefIdMap};
 
 use rustc_metadata::creader::CrateLoader;
@@ -56,6 +58,7 @@ use syntax::ast::{self, Name, NodeId, Ident, FloatTy, IntTy, UintTy};
 use syntax::ext::base::SyntaxExtension;
 use syntax::ext::base::Determinacy::{self, Determined, Undetermined};
 use syntax::ext::base::MacroKind;
+use syntax::feature_gate::{emit_feature_err, GateIssue};
 use syntax::symbol::{Symbol, keywords};
 use syntax::util::lev_distance::find_best_match_for_name;
 
@@ -66,27 +69,25 @@ use syntax::ast::{FnDecl, ForeignItem, ForeignItemKind, GenericParamKind, Generi
 use syntax::ast::{Item, ItemKind, ImplItem, ImplItemKind};
 use syntax::ast::{Label, Local, Mutability, Pat, PatKind, Path};
 use syntax::ast::{QSelf, TraitItemKind, TraitRef, Ty, TyKind};
-use syntax::feature_gate::{feature_err, GateIssue};
 use syntax::ptr::P;
 
 use syntax_pos::{Span, DUMMY_SP, MultiSpan};
 use errors::{Applicability, DiagnosticBuilder, DiagnosticId};
 
 use std::cell::{Cell, RefCell};
-use std::cmp;
+use std::{cmp, fmt, iter, ptr};
 use std::collections::BTreeSet;
-use std::fmt;
-use std::iter;
 use std::mem::replace;
+use rustc_data_structures::ptr_key::PtrKey;
 use rustc_data_structures::sync::Lrc;
 
 use resolve_imports::{ImportDirective, ImportDirectiveSubclass, NameResolution, ImportResolver};
-use macros::{InvocationData, LegacyBinding};
+use macros::{InvocationData, LegacyBinding, ParentScope};
 
 // NB: This module needs to be declared first so diagnostics are
 // registered before they are used.
 mod diagnostics;
-
+mod error_reporting;
 mod macros;
 mod check_unused;
 mod build_reduced_graph;
@@ -160,8 +161,6 @@ enum ResolutionError<'a> {
     SelfImportCanOnlyAppearOnceInTheList,
     /// error E0431: `self` import can only appear in an import list with a non-empty prefix
     SelfImportOnlyInImportListWithNonEmptyPrefix,
-    /// error E0432: unresolved import
-    UnresolvedImport(Option<(Span, &'a str, &'a str)>),
     /// error E0433: failed to resolve
     FailedToResolve(&'a str),
     /// error E0434: can't capture dynamic environment in a fn item
@@ -198,12 +197,25 @@ fn resolve_struct_error<'sess, 'a>(resolver: &'sess Resolver,
 
             let cm = resolver.session.source_map();
             match outer_def {
-                Def::SelfTy(_, maybe_impl_defid) => {
-                    if let Some(impl_span) = maybe_impl_defid.map_or(None,
-                            |def_id| resolver.definitions.opt_span(def_id)) {
-                        err.span_label(reduce_impl_span_to_impl_keyword(cm, impl_span),
-                                    "`Self` type implicitly declared here, on the `impl`");
+                Def::SelfTy(maybe_trait_defid, maybe_impl_defid) => {
+                    if let Some(impl_span) = maybe_impl_defid.and_then(|def_id| {
+                        resolver.definitions.opt_span(def_id)
+                    }) {
+                        err.span_label(
+                            reduce_impl_span_to_impl_keyword(cm, impl_span),
+                            "`Self` type implicitly declared here, by this `impl`",
+                        );
                     }
+                    match (maybe_trait_defid, maybe_impl_defid) {
+                        (Some(_), None) => {
+                            err.span_label(span, "can't use `Self` here");
+                        }
+                        (_, Some(_)) => {
+                            err.span_label(span, "use a type here instead");
+                        }
+                        (None, None) => bug!("`impl` without trait nor type?"),
+                    }
+                    return err;
                 },
                 Def::TyParam(typaram_defid) => {
                     if let Some(typaram_span) = resolver.definitions.opt_span(typaram_defid) {
@@ -357,17 +369,6 @@ fn resolve_struct_error<'sess, 'a>(resolver: &'sess Resolver,
             err.span_label(span, "can only appear in an import list with a non-empty prefix");
             err
         }
-        ResolutionError::UnresolvedImport(name) => {
-            let (span, msg) = match name {
-                Some((sp, n, _)) => (sp, format!("unresolved import `{}`", n)),
-                None => (span, "unresolved import".to_owned()),
-            };
-            let mut err = struct_span_err!(resolver.session, span, E0432, "{}", msg);
-            if let Some((_, _, p)) = name {
-                err.span_label(span, p);
-            }
-            err
-        }
         ResolutionError::FailedToResolve(msg) => {
             let mut err = struct_span_err!(resolver.session, span, E0433,
                                            "failed to resolve. {}", msg);
@@ -481,15 +482,13 @@ enum PathSource<'a> {
     TraitItem(Namespace),
     // Path in `pub(path)`
     Visibility,
-    // Path in `use a::b::{...};`
-    ImportPrefix,
 }
 
 impl<'a> PathSource<'a> {
     fn namespace(self) -> Namespace {
         match self {
             PathSource::Type | PathSource::Trait(_) | PathSource::Struct |
-            PathSource::Visibility | PathSource::ImportPrefix => TypeNS,
+            PathSource::Visibility => TypeNS,
             PathSource::Expr(..) | PathSource::Pat | PathSource::TupleStruct => ValueNS,
             PathSource::TraitItem(ns) => ns,
         }
@@ -497,7 +496,7 @@ impl<'a> PathSource<'a> {
 
     fn global_by_default(self) -> bool {
         match self {
-            PathSource::Visibility | PathSource::ImportPrefix => true,
+            PathSource::Visibility => true,
             PathSource::Type | PathSource::Expr(..) | PathSource::Pat |
             PathSource::Struct | PathSource::TupleStruct |
             PathSource::Trait(_) | PathSource::TraitItem(..) => false,
@@ -509,7 +508,7 @@ impl<'a> PathSource<'a> {
             PathSource::Type | PathSource::Expr(..) | PathSource::Pat |
             PathSource::Struct | PathSource::TupleStruct => true,
             PathSource::Trait(_) | PathSource::TraitItem(..) |
-            PathSource::Visibility | PathSource::ImportPrefix => false,
+            PathSource::Visibility => false,
         }
     }
 
@@ -521,7 +520,6 @@ impl<'a> PathSource<'a> {
             PathSource::Struct => "struct, variant or union type",
             PathSource::TupleStruct => "tuple struct/variant",
             PathSource::Visibility => "module",
-            PathSource::ImportPrefix => "module or enum",
             PathSource::TraitItem(ns) => match ns {
                 TypeNS => "associated type",
                 ValueNS => "method or associated constant",
@@ -540,9 +538,9 @@ impl<'a> PathSource<'a> {
         match self {
             PathSource::Type => match def {
                 Def::Struct(..) | Def::Union(..) | Def::Enum(..) |
-                Def::Trait(..) | Def::TyAlias(..) | Def::AssociatedTy(..) |
-                Def::PrimTy(..) | Def::TyParam(..) | Def::SelfTy(..) |
-                Def::Existential(..) |
+                Def::Trait(..) | Def::TraitAlias(..) | Def::TyAlias(..) |
+                Def::AssociatedTy(..) | Def::PrimTy(..) | Def::TyParam(..) |
+                Def::SelfTy(..) | Def::Existential(..) |
                 Def::ForeignTy(..) => true,
                 _ => false,
             },
@@ -559,17 +557,21 @@ impl<'a> PathSource<'a> {
                 Def::StructCtor(_, CtorKind::Const) | Def::StructCtor(_, CtorKind::Fn) |
                 Def::VariantCtor(_, CtorKind::Const) | Def::VariantCtor(_, CtorKind::Fn) |
                 Def::Const(..) | Def::Static(..) | Def::Local(..) | Def::Upvar(..) |
-                Def::Fn(..) | Def::Method(..) | Def::AssociatedConst(..) => true,
+                Def::Fn(..) | Def::Method(..) | Def::AssociatedConst(..) |
+                Def::SelfCtor(..) => true,
                 _ => false,
             },
             PathSource::Pat => match def {
                 Def::StructCtor(_, CtorKind::Const) |
                 Def::VariantCtor(_, CtorKind::Const) |
-                Def::Const(..) | Def::AssociatedConst(..) => true,
+                Def::Const(..) | Def::AssociatedConst(..) |
+                Def::SelfCtor(..) => true,
                 _ => false,
             },
             PathSource::TupleStruct => match def {
-                Def::StructCtor(_, CtorKind::Fn) | Def::VariantCtor(_, CtorKind::Fn) => true,
+                Def::StructCtor(_, CtorKind::Fn) |
+                Def::VariantCtor(_, CtorKind::Fn) |
+                Def::SelfCtor(..) => true,
                 _ => false,
             },
             PathSource::Struct => match def {
@@ -580,10 +582,6 @@ impl<'a> PathSource<'a> {
             PathSource::TraitItem(ns) => match def {
                 Def::AssociatedConst(..) | Def::Method(..) if ns == ValueNS => true,
                 Def::AssociatedTy(..) if ns == TypeNS => true,
-                _ => false,
-            },
-            PathSource::ImportPrefix => match def {
-                Def::Mod(..) | Def::Enum(..) => true,
                 _ => false,
             },
             PathSource::Visibility => match def {
@@ -621,8 +619,45 @@ impl<'a> PathSource<'a> {
             (PathSource::Pat, false) | (PathSource::TupleStruct, false) => "E0531",
             (PathSource::TraitItem(..), true) => "E0575",
             (PathSource::TraitItem(..), false) => "E0576",
-            (PathSource::Visibility, true) | (PathSource::ImportPrefix, true) => "E0577",
-            (PathSource::Visibility, false) | (PathSource::ImportPrefix, false) => "E0578",
+            (PathSource::Visibility, true) => "E0577",
+            (PathSource::Visibility, false) => "E0578",
+        }
+    }
+}
+
+// A minimal representation of a path segment. We use this in resolve because
+// we synthesize 'path segments' which don't have the rest of an AST or HIR
+// PathSegment.
+#[derive(Clone, Copy, Debug)]
+pub struct Segment {
+    ident: Ident,
+    id: Option<NodeId>,
+}
+
+impl Segment {
+    fn from_path(path: &Path) -> Vec<Segment> {
+        path.segments.iter().map(|s| s.into()).collect()
+    }
+
+    fn from_ident(ident: Ident) -> Segment {
+        Segment {
+            ident,
+            id: None,
+        }
+    }
+
+    fn names_to_string(segments: &[Segment]) -> String {
+        names_to_string(&segments.iter()
+                            .map(|seg| seg.ident)
+                            .collect::<Vec<_>>())
+    }
+}
+
+impl<'a> From<&'a ast::PathSegment> for Segment {
+    fn from(seg: &'a ast::PathSegment) -> Segment {
+        Segment {
+            ident: seg.ident,
+            id: Some(seg.id),
         }
     }
 }
@@ -776,7 +811,7 @@ impl<'a, 'tcx, 'cl> Visitor<'tcx> for Resolver<'a, 'cl> {
         self.label_ribs.push(Rib::new(rib_kind));
 
         // Add each argument to the rib.
-        let mut bindings_list = FxHashMap();
+        let mut bindings_list = FxHashMap::default();
         for argument in &declaration.inputs {
             self.resolve_pattern(&argument.pat, PatternSource::FnParam, &mut bindings_list);
 
@@ -926,7 +961,7 @@ struct Rib<'a> {
 impl<'a> Rib<'a> {
     fn new(kind: RibKind<'a>) -> Rib<'a> {
         Rib {
-            bindings: FxHashMap(),
+            bindings: Default::default(),
             kind,
         }
     }
@@ -1010,8 +1045,10 @@ pub struct ModuleData<'a> {
     normal_ancestor_id: DefId,
 
     resolutions: RefCell<FxHashMap<(Ident, Namespace), &'a RefCell<NameResolution<'a>>>>,
-    legacy_macro_resolutions: RefCell<Vec<(Mark, Ident, MacroKind, Option<Def>)>>,
-    macro_resolutions: RefCell<Vec<(Box<[Ident]>, Span)>>,
+    legacy_macro_resolutions: RefCell<Vec<(Ident, MacroKind, ParentScope<'a>,
+                                           Option<&'a NameBinding<'a>>)>>,
+    macro_resolutions: RefCell<Vec<(Vec<Segment>, ParentScope<'a>, Span)>>,
+    builtin_attrs: RefCell<Vec<(Ident, ParentScope<'a>)>>,
 
     // Macro invocations that can expand into items in this module.
     unresolved_invocations: RefCell<FxHashSet<Mark>>,
@@ -1047,10 +1084,11 @@ impl<'a> ModuleData<'a> {
             parent,
             kind,
             normal_ancestor_id,
-            resolutions: RefCell::new(FxHashMap()),
+            resolutions: Default::default(),
             legacy_macro_resolutions: RefCell::new(Vec::new()),
             macro_resolutions: RefCell::new(Vec::new()),
-            unresolved_invocations: RefCell::new(FxHashSet()),
+            builtin_attrs: RefCell::new(Vec::new()),
+            unresolved_invocations: Default::default(),
             no_implicit_prelude: false,
             glob_importers: RefCell::new(Vec::new()),
             globs: RefCell::new(Vec::new()),
@@ -1109,6 +1147,17 @@ impl<'a> ModuleData<'a> {
     fn nearest_item_scope(&'a self) -> Module<'a> {
         if self.is_trait() { self.parent.unwrap() } else { self }
     }
+
+    fn is_ancestor_of(&self, mut other: &Self) -> bool {
+        while !ptr::eq(self, other) {
+            if let Some(parent) = other.parent {
+                other = parent;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 impl<'a> fmt::Debug for ModuleData<'a> {
@@ -1151,7 +1200,7 @@ enum NameBindingKind<'a> {
     }
 }
 
-struct PrivacyError<'a>(Span, Name, &'a NameBinding<'a>);
+struct PrivacyError<'a>(Span, Ident, &'a NameBinding<'a>);
 
 struct UseError<'a> {
     err: DiagnosticBuilder<'a>,
@@ -1164,9 +1213,7 @@ struct UseError<'a> {
 }
 
 struct AmbiguityError<'a> {
-    span: Span,
-    name: Name,
-    lexical: bool,
+    ident: Ident,
     b1: &'a NameBinding<'a>,
     b2: &'a NameBinding<'a>,
 }
@@ -1197,10 +1244,6 @@ impl<'a> NameBinding<'a> {
         }
     }
 
-    fn get_macro<'b: 'a>(&self, resolver: &mut Resolver<'a, 'b>) -> Lrc<SyntaxExtension> {
-        resolver.get_macro(self.def_ignoring_ambiguity())
-    }
-
     // We sometimes need to treat variants as `pub` for backwards compatibility
     fn pseudo_vis(&self) -> ty::Visibility {
         if self.is_variant() && self.def().def_id().is_local() {
@@ -1222,7 +1265,7 @@ impl<'a> NameBinding<'a> {
         match self.kind {
             NameBindingKind::Import {
                 directive: &ImportDirective {
-                    subclass: ImportDirectiveSubclass::ExternCrate(_), ..
+                    subclass: ImportDirectiveSubclass::ExternCrate { .. }, ..
                 }, ..
             } => true,
             _ => false,
@@ -1234,15 +1277,6 @@ impl<'a> NameBinding<'a> {
             NameBindingKind::Import { .. } => true,
             _ => false,
         }
-    }
-
-    fn is_renamed_extern_crate(&self) -> bool {
-        if let NameBindingKind::Import { directive, ..} = self.kind {
-            if let ImportDirectiveSubclass::ExternCrate(Some(_)) = directive.subclass {
-                return true;
-            }
-        }
-        false
     }
 
     fn is_glob_import(&self) -> bool {
@@ -1267,8 +1301,35 @@ impl<'a> NameBinding<'a> {
         }
     }
 
+    fn macro_kind(&self) -> Option<MacroKind> {
+        match self.def_ignoring_ambiguity() {
+            Def::Macro(_, kind) => Some(kind),
+            Def::NonMacroAttr(..) => Some(MacroKind::Attr),
+            _ => None,
+        }
+    }
+
     fn descr(&self) -> &'static str {
         if self.is_extern_crate() { "extern crate" } else { self.def().kind_name() }
+    }
+
+    // Suppose that we resolved macro invocation with `invoc_parent_expansion` to binding `binding`
+    // at some expansion round `max(invoc, binding)` when they both emerged from macros.
+    // Then this function returns `true` if `self` may emerge from a macro *after* that
+    // in some later round and screw up our previously found resolution.
+    // See more detailed explanation in
+    // https://github.com/rust-lang/rust/pull/53778#issuecomment-419224049
+    fn may_appear_after(&self, invoc_parent_expansion: Mark, binding: &NameBinding) -> bool {
+        // self > max(invoc, binding) => !(self <= invoc || self <= binding)
+        // Expansions are partially ordered, so "may appear after" is an inversion of
+        // "certainly appears before or simultaneously" and includes unordered cases.
+        let self_parent_expansion = self.expansion;
+        let other_parent_expansion = binding.expansion;
+        let certainly_before_other_or_simultaneously =
+            other_parent_expansion.is_descendant_of(self_parent_expansion);
+        let certainly_before_invoc_or_simultaneously =
+            invoc_parent_expansion.is_descendant_of(self_parent_expansion);
+        !(certainly_before_other_or_simultaneously || certainly_before_invoc_or_simultaneously)
     }
 }
 
@@ -1276,13 +1337,14 @@ impl<'a> NameBinding<'a> {
 ///
 /// All other types are defined somewhere and possibly imported, but the primitive ones need
 /// special handling, since they have no place of origin.
+#[derive(Default)]
 struct PrimitiveTypeTable {
     primitive_types: FxHashMap<Name, PrimTy>,
 }
 
 impl PrimitiveTypeTable {
     fn new() -> PrimitiveTypeTable {
-        let mut table = PrimitiveTypeTable { primitive_types: FxHashMap() };
+        let mut table = PrimitiveTypeTable::default();
 
         table.intern("bool", Bool);
         table.intern("char", Char);
@@ -1309,6 +1371,12 @@ impl PrimitiveTypeTable {
     }
 }
 
+#[derive(Default, Clone)]
+pub struct ExternPreludeEntry<'a> {
+    extern_crate_item: Option<&'a NameBinding<'a>>,
+    pub introduced_by_item: bool,
+}
+
 /// The main resolver class.
 ///
 /// This is the visitor that walks the whole crate.
@@ -1321,7 +1389,7 @@ pub struct Resolver<'a, 'b: 'a> {
     graph_root: Module<'a>,
 
     prelude: Option<Module<'a>>,
-    extern_prelude: FxHashSet<Name>,
+    pub extern_prelude: FxHashMap<Ident, ExternPreludeEntry<'a>>,
 
     /// n.b. This is used only for better diagnostics, not name resolution itself.
     has_self: FxHashSet<DefId>,
@@ -1352,6 +1420,9 @@ pub struct Resolver<'a, 'b: 'a> {
     /// The current self type if inside an impl (used for better errors).
     current_self_type: Option<Ty>,
 
+    /// The current self item if inside an ADT (used for better errors).
+    current_self_item: Option<NodeId>,
+
     /// The idents for the primitive types.
     primitive_type_table: PrimitiveTypeTable,
 
@@ -1379,6 +1450,7 @@ pub struct Resolver<'a, 'b: 'a> {
     block_map: NodeMap<Module<'a>>,
     module_map: FxHashMap<DefId, Module<'a>>,
     extern_module_map: FxHashMap<(DefId, bool /* MacrosOnly? */), Module<'a>>,
+    binding_parent_modules: FxHashMap<PtrKey<'a, NameBinding<'a>>, Module<'a>>,
 
     pub make_glob_map: bool,
     /// Maps imports to the names of items actually imported (this actually maps
@@ -1399,19 +1471,16 @@ pub struct Resolver<'a, 'b: 'a> {
     ambiguity_errors: Vec<AmbiguityError<'a>>,
     /// `use` injections are delayed for better placement and deduplication
     use_injections: Vec<UseError<'a>>,
-    /// `use` injections for proc macros wrongly imported with #[macro_use]
-    proc_mac_errors: Vec<macros::ProcMacError>,
     /// crate-local macro expanded `macro_export` referred to by a module-relative path
     macro_expanded_macro_export_errors: BTreeSet<(Span, Span)>,
-    /// macro-expanded `macro_rules` shadowing existing macros
-    disallowed_shadowing: Vec<&'a LegacyBinding<'a>>,
 
     arenas: &'a ResolverArenas<'a>,
     dummy_binding: &'a NameBinding<'a>,
 
     crate_loader: &'a mut CrateLoader<'b>,
     macro_names: FxHashSet<Ident>,
-    macro_prelude: FxHashMap<Name, &'a NameBinding<'a>>,
+    builtin_macros: FxHashMap<Name, &'a NameBinding<'a>>,
+    macro_use_prelude: FxHashMap<Name, &'a NameBinding<'a>>,
     pub all_macros: FxHashMap<Name, Def>,
     macro_map: FxHashMap<DefId, Lrc<SyntaxExtension>>,
     macro_defs: FxHashMap<Mark, DefId>,
@@ -1429,9 +1498,6 @@ pub struct Resolver<'a, 'b: 'a> {
     /// Avoid duplicated errors for "name already defined".
     name_already_seen: FxHashMap<Name, Span>,
 
-    /// A set of procedural macros imported by `#[macro_use]` that have already been warned about
-    warned_proc_macros: FxHashSet<Name>,
-
     potentially_unused_imports: Vec<&'a ImportDirective<'a>>,
 
     /// This table maps struct IDs into struct constructor IDs,
@@ -1442,12 +1508,10 @@ pub struct Resolver<'a, 'b: 'a> {
     current_type_ascription: Vec<Span>,
 
     injected_crate: Option<Module<'a>>,
-
-    /// Only supposed to be used by rustdoc, otherwise should be false.
-    pub ignore_extern_prelude_feature: bool,
 }
 
 /// Nothing really interesting here, it just provides memory for the rest of the crate.
+#[derive(Default)]
 pub struct ResolverArenas<'a> {
     modules: arena::TypedArena<ModuleData<'a>>,
     local_modules: RefCell<Vec<Module<'a>>>,
@@ -1500,7 +1564,11 @@ impl<'a, 'b: 'a, 'cl: 'b> ty::DefIdTree for &'a Resolver<'b, 'cl> {
 /// This interface is used through the AST→HIR step, to embed full paths into the HIR. After that
 /// the resolver is no longer needed as all the relevant information is inline.
 impl<'a, 'cl> hir::lowering::Resolver for Resolver<'a, 'cl> {
-    fn resolve_hir_path(&mut self, path: &mut hir::Path, is_value: bool) {
+    fn resolve_hir_path(
+        &mut self,
+        path: &ast::Path,
+        is_value: bool,
+    ) -> hir::Path {
         self.resolve_hir_path_cb(path, is_value,
                                  |resolver, span, error| resolve_error(resolver, span, error))
     }
@@ -1510,33 +1578,22 @@ impl<'a, 'cl> hir::lowering::Resolver for Resolver<'a, 'cl> {
         span: Span,
         crate_root: Option<&str>,
         components: &[&str],
-        args: Option<P<hir::GenericArgs>>,
         is_value: bool
     ) -> hir::Path {
-        let mut segments = iter::once(keywords::CrateRoot.ident())
+        let segments = iter::once(keywords::CrateRoot.ident())
             .chain(
                 crate_root.into_iter()
                     .chain(components.iter().cloned())
                     .map(Ident::from_str)
-            ).map(hir::PathSegment::from_ident).collect::<Vec<_>>();
+            ).map(|i| self.new_ast_path_segment(i)).collect::<Vec<_>>();
 
-        if let Some(args) = args {
-            let ident = segments.last().unwrap().ident;
-            *segments.last_mut().unwrap() = hir::PathSegment {
-                ident,
-                args: Some(args),
-                infer_types: true,
-            };
-        }
 
-        let mut path = hir::Path {
+        let path = ast::Path {
             span,
-            def: Def::Err,
-            segments: segments.into(),
+            segments,
         };
 
-        self.resolve_hir_path(&mut path, is_value);
-        path
+        self.resolve_hir_path(&path, is_value)
     }
 
     fn get_resolution(&mut self, id: NodeId) -> Option<PathResolution> {
@@ -1562,23 +1619,27 @@ impl<'a, 'crateloader> Resolver<'a, 'crateloader> {
         use std::iter;
         let mut errored = false;
 
-        let mut path = if path_str.starts_with("::") {
-            hir::Path {
+        let path = if path_str.starts_with("::") {
+            ast::Path {
                 span,
-                def: Def::Err,
-                segments: iter::once(keywords::CrateRoot.ident()).chain({
-                    path_str.split("::").skip(1).map(Ident::from_str)
-                }).map(hir::PathSegment::from_ident).collect(),
+                segments: iter::once(keywords::CrateRoot.ident())
+                    .chain({
+                        path_str.split("::").skip(1).map(Ident::from_str)
+                    })
+                    .map(|i| self.new_ast_path_segment(i))
+                    .collect(),
             }
         } else {
-            hir::Path {
+            ast::Path {
                 span,
-                def: Def::Err,
-                segments: path_str.split("::").map(Ident::from_str)
-                                  .map(hir::PathSegment::from_ident).collect(),
+                segments: path_str
+                    .split("::")
+                    .map(Ident::from_str)
+                    .map(|i| self.new_ast_path_segment(i))
+                    .collect(),
             }
         };
-        self.resolve_hir_path_cb(&mut path, is_value, |_, _, _| errored = true);
+        let path = self.resolve_hir_path_cb(&path, is_value, |_, _, _| errored = true);
         if errored || path.def == Def::Err {
             Err(())
         } else {
@@ -1587,37 +1648,54 @@ impl<'a, 'crateloader> Resolver<'a, 'crateloader> {
     }
 
     /// resolve_hir_path, but takes a callback in case there was an error
-    fn resolve_hir_path_cb<F>(&mut self, path: &mut hir::Path, is_value: bool, error_callback: F)
+    fn resolve_hir_path_cb<F>(
+        &mut self,
+        path: &ast::Path,
+        is_value: bool,
+        error_callback: F,
+    ) -> hir::Path
         where F: for<'c, 'b> FnOnce(&'c mut Resolver, Span, ResolutionError<'b>)
     {
         let namespace = if is_value { ValueNS } else { TypeNS };
-        let hir::Path { ref segments, span, ref mut def } = *path;
-        let path: Vec<_> = segments.iter().map(|seg| seg.ident).collect();
+        let span = path.span;
+        let segments = &path.segments;
+        let path = Segment::from_path(&path);
         // FIXME (Manishearth): Intra doc links won't get warned of epoch changes
-        match self.resolve_path(None, &path, Some(namespace), true, span, CrateLint::No) {
+        let def = match self.resolve_path_without_parent_scope(None, &path, Some(namespace),
+                                                               true, span, CrateLint::No) {
             PathResult::Module(ModuleOrUniformRoot::Module(module)) =>
-                *def = module.def().unwrap(),
+                module.def().unwrap(),
             PathResult::NonModule(path_res) if path_res.unresolved_segments() == 0 =>
-                *def = path_res.base_def(),
-            PathResult::NonModule(..) => match self.resolve_path(
-                None,
-                &path,
-                None,
-                true,
-                span,
-                CrateLint::No,
-            ) {
-                PathResult::Failed(span, msg, _) => {
-                    error_callback(self, span, ResolutionError::FailedToResolve(&msg));
-                }
-                _ => {}
-            },
+                path_res.base_def(),
+            PathResult::NonModule(..) => {
+                let msg = "type-relative paths are not supported in this context";
+                error_callback(self, span, ResolutionError::FailedToResolve(msg));
+                Def::Err
+            }
             PathResult::Module(ModuleOrUniformRoot::UniformRoot(_)) |
             PathResult::Indeterminate => unreachable!(),
             PathResult::Failed(span, msg, _) => {
                 error_callback(self, span, ResolutionError::FailedToResolve(&msg));
+                Def::Err
             }
+        };
+
+        let segments: Vec<_> = segments.iter().map(|seg| {
+            let mut hir_seg = hir::PathSegment::from_ident(seg.ident);
+            hir_seg.def = Some(self.def_map.get(&seg.id).map_or(Def::Err, |p| p.base_def()));
+            hir_seg
+        }).collect();
+        hir::Path {
+            span,
+            def,
+            segments: segments.into(),
         }
+    }
+
+    fn new_ast_path_segment(&self, ident: Ident) -> ast::PathSegment {
+        let mut seg = ast::PathSegment::from_ident(ident);
+        seg.id = self.session.next_node_id();
+        seg
     }
 }
 
@@ -1636,28 +1714,32 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             no_implicit_prelude: attr::contains_name(&krate.attrs, "no_implicit_prelude"),
             ..ModuleData::new(None, root_module_kind, root_def_id, Mark::root(), krate.span)
         });
-        let mut module_map = FxHashMap();
+        let mut module_map = FxHashMap::default();
         module_map.insert(DefId::local(CRATE_DEF_INDEX), graph_root);
 
         let mut definitions = Definitions::new();
         DefCollector::new(&mut definitions, Mark::root())
             .collect_root(crate_name, session.local_crate_disambiguator());
 
-        let mut extern_prelude: FxHashSet<Name> =
-            session.opts.externs.iter().map(|kv| Symbol::intern(kv.0)).collect();
+        let mut extern_prelude: FxHashMap<Ident, ExternPreludeEntry> =
+            session.opts.externs.iter().map(|kv| (Ident::from_str(kv.0), Default::default()))
+                                       .collect();
+
         if !attr::contains_name(&krate.attrs, "no_core") {
+            extern_prelude.insert(Ident::from_str("core"), Default::default());
             if !attr::contains_name(&krate.attrs, "no_std") {
-                extern_prelude.insert(Symbol::intern("std"));
-            } else {
-                extern_prelude.insert(Symbol::intern("core"));
+                extern_prelude.insert(Ident::from_str("std"), Default::default());
+                if session.rust_2018() {
+                    extern_prelude.insert(Ident::from_str("meta"), Default::default());
+                }
             }
         }
 
-        let mut invocations = FxHashMap();
+        let mut invocations = FxHashMap::default();
         invocations.insert(Mark::root(),
                            arenas.alloc_invocation_data(InvocationData::root(graph_root)));
 
-        let mut macro_defs = FxHashMap();
+        let mut macro_defs = FxHashMap::default();
         macro_defs.insert(Mark::root(), root_def_id);
 
         Resolver {
@@ -1673,8 +1755,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             prelude: None,
             extern_prelude,
 
-            has_self: FxHashSet(),
-            field_names: FxHashMap(),
+            has_self: FxHashSet::default(),
+            field_names: FxHashMap::default(),
 
             determined_imports: Vec::new(),
             indeterminate_imports: Vec::new(),
@@ -1689,6 +1771,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
 
             current_trait_ref: None,
             current_self_type: None,
+            current_self_item: None,
 
             primitive_type_table: PrimitiveTypeTable::new(),
 
@@ -1696,26 +1779,25 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             import_map: NodeMap(),
             freevars: NodeMap(),
             freevars_seen: NodeMap(),
-            export_map: FxHashMap(),
+            export_map: FxHashMap::default(),
             trait_map: NodeMap(),
             module_map,
             block_map: NodeMap(),
-            extern_module_map: FxHashMap(),
+            extern_module_map: FxHashMap::default(),
+            binding_parent_modules: FxHashMap::default(),
 
             make_glob_map: make_glob_map == MakeGlobMap::Yes,
             glob_map: NodeMap(),
 
-            used_imports: FxHashSet(),
+            used_imports: FxHashSet::default(),
             maybe_unused_trait_imports: NodeSet(),
             maybe_unused_extern_crates: Vec::new(),
 
-            unused_labels: FxHashMap(),
+            unused_labels: FxHashMap::default(),
 
             privacy_errors: Vec::new(),
             ambiguity_errors: Vec::new(),
             use_injections: Vec::new(),
-            proc_mac_errors: Vec::new(),
-            disallowed_shadowing: Vec::new(),
             macro_expanded_macro_export_errors: BTreeSet::new(),
 
             arenas,
@@ -1727,36 +1809,27 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             }),
 
             crate_loader,
-            macro_names: FxHashSet(),
-            macro_prelude: FxHashMap(),
-            all_macros: FxHashMap(),
-            macro_map: FxHashMap(),
+            macro_names: FxHashSet::default(),
+            builtin_macros: FxHashMap::default(),
+            macro_use_prelude: FxHashMap::default(),
+            all_macros: FxHashMap::default(),
+            macro_map: FxHashMap::default(),
             invocations,
             macro_defs,
-            local_macro_def_scopes: FxHashMap(),
-            name_already_seen: FxHashMap(),
+            local_macro_def_scopes: FxHashMap::default(),
+            name_already_seen: FxHashMap::default(),
             whitelisted_legacy_custom_derives: Vec::new(),
-            warned_proc_macros: FxHashSet(),
             potentially_unused_imports: Vec::new(),
             struct_constructors: DefIdMap(),
             found_unresolved_macro: false,
-            unused_macros: FxHashSet(),
+            unused_macros: FxHashSet::default(),
             current_type_ascription: Vec::new(),
             injected_crate: None,
-            ignore_extern_prelude_feature: false,
         }
     }
 
     pub fn arenas() -> ResolverArenas<'a> {
-        ResolverArenas {
-            modules: arena::TypedArena::new(),
-            local_modules: RefCell::new(Vec::new()),
-            name_bindings: arena::TypedArena::new(),
-            import_directives: arena::TypedArena::new(),
-            name_resolutions: arena::TypedArena::new(),
-            invocation_data: arena::TypedArena::new(),
-            legacy_bindings: arena::TypedArena::new(),
-        }
+        Default::default()
     }
 
     /// Runs the function on each namespace.
@@ -1800,7 +1873,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         self.arenas.alloc_module(module)
     }
 
-    fn record_use(&mut self, ident: Ident, ns: Namespace, binding: &'a NameBinding<'a>, span: Span)
+    fn record_use(&mut self, ident: Ident, ns: Namespace, binding: &'a NameBinding<'a>)
                   -> bool /* true if an error was reported */ {
         match binding.kind {
             NameBindingKind::Import { directive, binding, ref used }
@@ -1809,13 +1882,11 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 directive.used.set(true);
                 self.used_imports.insert((directive.id, ns));
                 self.add_to_glob_map(directive.id, ident);
-                self.record_use(ident, ns, binding, span)
+                self.record_use(ident, ns, binding)
             }
             NameBindingKind::Import { .. } => false,
             NameBindingKind::Ambiguity { b1, b2 } => {
-                self.ambiguity_errors.push(AmbiguityError {
-                    span, name: ident.name, lexical: false, b1, b2,
-                });
+                self.ambiguity_errors.push(AmbiguityError { ident, b1, b2 });
                 true
             }
             _ => false
@@ -1946,20 +2017,10 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         }
 
         if !module.no_implicit_prelude {
-            // `record_used` means that we don't try to load crates during speculative resolution
-            if record_used && ns == TypeNS && self.extern_prelude.contains(&ident.name) {
-                if !self.session.features_untracked().extern_prelude &&
-                   !self.ignore_extern_prelude_feature {
-                    feature_err(&self.session.parse_sess, "extern_prelude",
-                                ident.span, GateIssue::Language,
-                                "access to extern crates through prelude is experimental").emit();
+            if ns == TypeNS {
+                if let Some(binding) = self.extern_prelude_get(ident, !record_used, false) {
+                    return Some(LexicalScopeBinding::Item(binding));
                 }
-
-                let crate_root = self.load_extern_prelude_crate_if_needed(ident);
-
-                let binding = (crate_root, ty::Visibility::Public,
-                               ident.span, Mark::root()).to_name_binding(self.arenas);
-                return Some(LexicalScopeBinding::Item(binding));
             }
             if ns == TypeNS && is_known_tool(ident.name) {
                 let binding = (Def::ToolMod, ty::Visibility::Public,
@@ -1981,13 +2042,6 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         }
 
         None
-    }
-
-    fn load_extern_prelude_crate_if_needed(&mut self, ident: Ident) -> Module<'a> {
-        let crate_id = self.crate_loader.process_path_extern(ident.name, ident.span);
-        let crate_root = self.get_module(DefId { krate: crate_id, index: CRATE_DEF_INDEX });
-        self.populate_module_if_necessary(&crate_root);
-        crate_root
     }
 
     fn hygienic_lexical_parent(&mut self, module: Module<'a>, span: &mut Span)
@@ -2181,6 +2235,21 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         None
     }
 
+    fn resolve_adt(&mut self, item: &Item, generics: &Generics) {
+        self.with_current_self_item(item, |this| {
+            this.with_type_parameter_rib(HasTypeParameters(generics, ItemRibKind), |this| {
+                let item_def_id = this.definitions.local_def_id(item.id);
+                if this.session.features_untracked().self_in_typedefs {
+                    this.with_self_rib(Def::SelfTy(None, Some(item_def_id)), |this| {
+                        visit::walk_item(this, item);
+                    });
+                } else {
+                    visit::walk_item(this, item);
+                }
+            });
+        });
+    }
+
     fn resolve_item(&mut self, item: &Item) {
         let name = item.ident.name;
         debug!("(resolving item) resolving {}", name);
@@ -2196,16 +2265,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             ItemKind::Enum(_, ref generics) |
             ItemKind::Struct(_, ref generics) |
             ItemKind::Union(_, ref generics) => {
-                self.with_type_parameter_rib(HasTypeParameters(generics, ItemRibKind), |this| {
-                    let item_def_id = this.definitions.local_def_id(item.id);
-                    if this.session.features_untracked().self_in_typedefs {
-                        this.with_self_rib(Def::SelfTy(None, Some(item_def_id)), |this| {
-                            visit::walk_item(this, item);
-                        });
-                    } else {
-                        visit::walk_item(this, item);
-                    }
-                });
+                self.resolve_adt(item, generics);
             }
 
             ItemKind::Impl(.., ref generics, ref opt_trait_ref, ref self_type, ref impl_items) =>
@@ -2283,63 +2343,12 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 });
             }
 
-            ItemKind::Use(ref use_tree) => {
-                // Imports are resolved as global by default, add starting root segment.
-                let path = Path {
-                    segments: use_tree.prefix.make_root().into_iter().collect(),
-                    span: use_tree.span,
-                };
-                self.resolve_use_tree(item.id, use_tree.span, item.id, use_tree, &path);
-            }
-
-            ItemKind::ExternCrate(_) | ItemKind::MacroDef(..) | ItemKind::GlobalAsm(_) => {
+            ItemKind::Use(..) | ItemKind::ExternCrate(..) |
+            ItemKind::MacroDef(..) | ItemKind::GlobalAsm(..) => {
                 // do nothing, these are just around to be encoded
             }
 
             ItemKind::Mac(_) => panic!("unexpanded macro in resolve!"),
-        }
-    }
-
-    /// For the most part, use trees are desugared into `ImportDirective` instances
-    /// when building the reduced graph (see `build_reduced_graph_for_use_tree`). But
-    /// there is one special case we handle here: an empty nested import like
-    /// `a::{b::{}}`, which desugares into...no import directives.
-    fn resolve_use_tree(
-        &mut self,
-        root_id: NodeId,
-        root_span: Span,
-        id: NodeId,
-        use_tree: &ast::UseTree,
-        prefix: &Path,
-    ) {
-        match use_tree.kind {
-            ast::UseTreeKind::Nested(ref items) => {
-                let path = Path {
-                    segments: prefix.segments
-                        .iter()
-                        .chain(use_tree.prefix.segments.iter())
-                        .cloned()
-                        .collect(),
-                    span: prefix.span.to(use_tree.prefix.span),
-                };
-
-                if items.len() == 0 {
-                    // Resolve prefix of an import with empty braces (issue #28388).
-                    self.smart_resolve_path_with_crate_lint(
-                        id,
-                        None,
-                        &path,
-                        PathSource::ImportPrefix,
-                        CrateLint::UsePath { root_id, root_span },
-                    );
-                } else {
-                    for &(ref tree, nested_id) in items {
-                        self.resolve_use_tree(root_id, root_span, nested_id, tree, &path);
-                    }
-                }
-            }
-            ast::UseTreeKind::Simple(..) => {},
-            ast::UseTreeKind::Glob => {},
         }
     }
 
@@ -2349,7 +2358,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         match type_parameters {
             HasTypeParameters(generics, rib_kind) => {
                 let mut function_type_rib = Rib::new(rib_kind);
-                let mut seen_bindings = FxHashMap();
+                let mut seen_bindings = FxHashMap::default();
                 for param in &generics.params {
                     match param.kind {
                         GenericParamKind::Lifetime { .. } => {}
@@ -2427,6 +2436,15 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         result
     }
 
+    fn with_current_self_item<T, F>(&mut self, self_item: &Item, f: F) -> T
+        where F: FnOnce(&mut Resolver) -> T
+    {
+        let previous_value = replace(&mut self.current_self_item, Some(self_item.id));
+        let result = f(self);
+        self.current_self_item = previous_value;
+        result
+    }
+
     /// This is called to resolve a trait reference from an `impl` (i.e. `impl Trait for Foo`)
     fn with_optional_trait_ref<T, F>(&mut self, opt_trait_ref: Option<&TraitRef>, f: F) -> T
         where F: FnOnce(&mut Resolver, Option<DefId>) -> T
@@ -2434,9 +2452,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         let mut new_val = None;
         let mut new_id = None;
         if let Some(trait_ref) = opt_trait_ref {
-            let path: Vec<_> = trait_ref.path.segments.iter()
-                .map(|seg| seg.ident)
-                .collect();
+            let path: Vec<_> = Segment::from_path(&trait_ref.path);
             let def = self.smart_resolve_path_fragment(
                 trait_ref.ref_id,
                 None,
@@ -2449,10 +2465,10 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 new_id = Some(def.def_id());
                 let span = trait_ref.path.span;
                 if let PathResult::Module(ModuleOrUniformRoot::Module(module)) =
-                    self.resolve_path(
+                    self.resolve_path_without_parent_scope(
                         None,
                         &path,
-                        None,
+                        Some(TypeNS),
                         false,
                         span,
                         CrateLint::SimplePath(trait_ref.ref_id),
@@ -2480,6 +2496,17 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         self.ribs[TypeNS].pop();
     }
 
+    fn with_self_struct_ctor_rib<F>(&mut self, impl_id: DefId, f: F)
+        where F: FnOnce(&mut Resolver)
+    {
+        let self_def = Def::SelfCtor(impl_id);
+        let mut self_type_rib = Rib::new(NormalRibKind);
+        self_type_rib.bindings.insert(keywords::SelfType.ident(), self_def);
+        self.ribs[ValueNS].push(self_type_rib);
+        f(self);
+        self.ribs[ValueNS].pop();
+    }
+
     fn resolve_implementation(&mut self,
                               generics: &Generics,
                               opt_trait_reference: &Option<TraitRef>,
@@ -2504,63 +2531,65 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                         this.visit_generics(generics);
                         // Resolve the items within the impl.
                         this.with_current_self_type(self_type, |this| {
-                            for impl_item in impl_items {
-                                this.resolve_visibility(&impl_item.vis);
+                            this.with_self_struct_ctor_rib(item_def_id, |this| {
+                                for impl_item in impl_items {
+                                    this.resolve_visibility(&impl_item.vis);
 
-                                // We also need a new scope for the impl item type parameters.
-                                let type_parameters = HasTypeParameters(&impl_item.generics,
-                                                                        TraitOrImplItemRibKind);
-                                this.with_type_parameter_rib(type_parameters, |this| {
-                                    use self::ResolutionError::*;
-                                    match impl_item.node {
-                                        ImplItemKind::Const(..) => {
-                                            // If this is a trait impl, ensure the const
-                                            // exists in trait
-                                            this.check_trait_item(impl_item.ident,
-                                                                  ValueNS,
-                                                                  impl_item.span,
-                                                |n, s| ConstNotMemberOfTrait(n, s));
-                                            this.with_constant_rib(|this|
-                                                visit::walk_impl_item(this, impl_item)
-                                            );
-                                        }
-                                        ImplItemKind::Method(..) => {
-                                            // If this is a trait impl, ensure the method
-                                            // exists in trait
-                                            this.check_trait_item(impl_item.ident,
-                                                                  ValueNS,
-                                                                  impl_item.span,
-                                                |n, s| MethodNotMemberOfTrait(n, s));
-
-                                            visit::walk_impl_item(this, impl_item);
-                                        }
-                                        ImplItemKind::Type(ref ty) => {
-                                            // If this is a trait impl, ensure the type
-                                            // exists in trait
-                                            this.check_trait_item(impl_item.ident,
-                                                                  TypeNS,
-                                                                  impl_item.span,
-                                                |n, s| TypeNotMemberOfTrait(n, s));
-
-                                            this.visit_ty(ty);
-                                        }
-                                        ImplItemKind::Existential(ref bounds) => {
-                                            // If this is a trait impl, ensure the type
-                                            // exists in trait
-                                            this.check_trait_item(impl_item.ident,
-                                                                  TypeNS,
-                                                                  impl_item.span,
-                                                |n, s| TypeNotMemberOfTrait(n, s));
-
-                                            for bound in bounds {
-                                                this.visit_param_bound(bound);
+                                    // We also need a new scope for the impl item type parameters.
+                                    let type_parameters = HasTypeParameters(&impl_item.generics,
+                                                                            TraitOrImplItemRibKind);
+                                    this.with_type_parameter_rib(type_parameters, |this| {
+                                        use self::ResolutionError::*;
+                                        match impl_item.node {
+                                            ImplItemKind::Const(..) => {
+                                                // If this is a trait impl, ensure the const
+                                                // exists in trait
+                                                this.check_trait_item(impl_item.ident,
+                                                                      ValueNS,
+                                                                      impl_item.span,
+                                                    |n, s| ConstNotMemberOfTrait(n, s));
+                                                this.with_constant_rib(|this|
+                                                    visit::walk_impl_item(this, impl_item)
+                                                );
                                             }
+                                            ImplItemKind::Method(..) => {
+                                                // If this is a trait impl, ensure the method
+                                                // exists in trait
+                                                this.check_trait_item(impl_item.ident,
+                                                                      ValueNS,
+                                                                      impl_item.span,
+                                                    |n, s| MethodNotMemberOfTrait(n, s));
+
+                                                visit::walk_impl_item(this, impl_item);
+                                            }
+                                            ImplItemKind::Type(ref ty) => {
+                                                // If this is a trait impl, ensure the type
+                                                // exists in trait
+                                                this.check_trait_item(impl_item.ident,
+                                                                      TypeNS,
+                                                                      impl_item.span,
+                                                    |n, s| TypeNotMemberOfTrait(n, s));
+
+                                                this.visit_ty(ty);
+                                            }
+                                            ImplItemKind::Existential(ref bounds) => {
+                                                // If this is a trait impl, ensure the type
+                                                // exists in trait
+                                                this.check_trait_item(impl_item.ident,
+                                                                      TypeNS,
+                                                                      impl_item.span,
+                                                    |n, s| TypeNotMemberOfTrait(n, s));
+
+                                                for bound in bounds {
+                                                    this.visit_param_bound(bound);
+                                                }
+                                            }
+                                            ImplItemKind::Macro(_) =>
+                                                panic!("unexpanded macro in resolve!"),
                                         }
-                                        ImplItemKind::Macro(_) =>
-                                            panic!("unexpanded macro in resolve!"),
-                                    }
-                                });
-                            }
+                                    });
+                                }
+                            });
                         });
                     });
                 });
@@ -2595,7 +2624,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         walk_list!(self, visit_expr, &local.init);
 
         // Resolve the pattern.
-        self.resolve_pattern(&local.pat, PatternSource::Let, &mut FxHashMap());
+        self.resolve_pattern(&local.pat, PatternSource::Let, &mut FxHashMap::default());
     }
 
     // build a map from pattern identifiers to binding-info's.
@@ -2603,7 +2632,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     // that expands into an or-pattern where one 'x' was from the
     // user and one 'x' came from the macro.
     fn binding_mode_map(&mut self, pat: &Pat) -> BindingMap {
-        let mut binding_map = FxHashMap();
+        let mut binding_map = FxHashMap::default();
 
         pat.walk(&mut |pat| {
             if let PatKind::Ident(binding_mode, ident, ref sub_pat) = pat.node {
@@ -2628,8 +2657,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             return;
         }
 
-        let mut missing_vars = FxHashMap();
-        let mut inconsistent_vars = FxHashMap();
+        let mut missing_vars = FxHashMap::default();
+        let mut inconsistent_vars = FxHashMap::default();
         for (i, p) in pats.iter().enumerate() {
             let map_i = self.binding_mode_map(&p);
 
@@ -2640,7 +2669,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
 
                 let map_j = self.binding_mode_map(&q);
                 for (&key, &binding_i) in &map_i {
-                    if map_j.len() == 0 {                   // Account for missing bindings when
+                    if map_j.is_empty() {                   // Account for missing bindings when
                         let binding_error = missing_vars    // map_j has none.
                             .entry(key.name)
                             .or_insert(BindingError {
@@ -2693,7 +2722,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     fn resolve_arm(&mut self, arm: &Arm) {
         self.ribs[ValueNS].push(Rib::new(NormalRibKind));
 
-        let mut bindings_list = FxHashMap();
+        let mut bindings_list = FxHashMap::default();
         for pattern in &arm.pats {
             self.resolve_pattern(&pattern, PatternSource::Match, &mut bindings_list);
         }
@@ -2701,7 +2730,9 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         // This has to happen *after* we determine which pat_idents are variants
         self.check_consistent_bindings(&arm.pats);
 
-        walk_list!(self, visit_expr, &arm.guard);
+        if let Some(ast::Guard::If(ref expr)) = arm.guard {
+            self.visit_expr(expr)
+        }
         self.visit_expr(&arm.body);
 
         self.ribs[ValueNS].pop();
@@ -2832,7 +2863,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                             Def::Const(..) if is_syntactic_ambiguity => {
                                 // Disambiguate in favor of a unit struct/variant
                                 // or constant pattern.
-                                self.record_use(ident, ValueNS, binding.unwrap(), ident.span);
+                                self.record_use(ident, ValueNS, binding.unwrap());
                                 Some(PathResolution::new(def))
                             }
                             Def::StructCtor(..) | Def::VariantCtor(..) |
@@ -2917,21 +2948,25 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         source: PathSource,
         crate_lint: CrateLint
     ) -> PathResolution {
-        let segments = &path.segments.iter()
-            .map(|seg| seg.ident)
-            .collect::<Vec<_>>();
-        self.smart_resolve_path_fragment(id, qself, segments, path.span, source, crate_lint)
+        self.smart_resolve_path_fragment(
+            id,
+            qself,
+            &Segment::from_path(path),
+            path.span,
+            source,
+            crate_lint,
+        )
     }
 
     fn smart_resolve_path_fragment(&mut self,
                                    id: NodeId,
                                    qself: Option<&QSelf>,
-                                   path: &[Ident],
+                                   path: &[Segment],
                                    span: Span,
                                    source: PathSource,
                                    crate_lint: CrateLint)
                                    -> PathResolution {
-        let ident_span = path.last().map_or(span, |ident| ident.span);
+        let ident_span = path.last().map_or(span, |ident| ident.ident.span);
         let ns = source.namespace();
         let is_expected = &|def| source.is_expected(def);
         let is_enum_variant = &|def| if let Def::Variant(..) = def { true } else { false };
@@ -2940,28 +2975,29 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         let report_errors = |this: &mut Self, def: Option<Def>| {
             // Make the base error.
             let expected = source.descr_expected();
-            let path_str = names_to_string(path);
+            let path_str = Segment::names_to_string(path);
+            let item_str = path.last().unwrap().ident;
             let code = source.error_code(def.is_some());
             let (base_msg, fallback_label, base_span) = if let Some(def) = def {
                 (format!("expected {}, found {} `{}`", expected, def.kind_name(), path_str),
                  format!("not a {}", expected),
                  span)
             } else {
-                let item_str = path[path.len() - 1];
-                let item_span = path[path.len() - 1].span;
+                let item_span = path.last().unwrap().ident.span;
                 let (mod_prefix, mod_str) = if path.len() == 1 {
                     (String::new(), "this scope".to_string())
-                } else if path.len() == 2 && path[0].name == keywords::CrateRoot.name() {
+                } else if path.len() == 2 && path[0].ident.name == keywords::CrateRoot.name() {
                     (String::new(), "the crate root".to_string())
                 } else {
                     let mod_path = &path[..path.len() - 1];
-                    let mod_prefix = match this.resolve_path(None, mod_path, Some(TypeNS),
-                                                             false, span, CrateLint::No) {
+                    let mod_prefix = match this.resolve_path_without_parent_scope(
+                        None, mod_path, Some(TypeNS), false, span, CrateLint::No
+                    ) {
                         PathResult::Module(ModuleOrUniformRoot::Module(module)) =>
                             module.def(),
                         _ => None,
                     }.map_or(String::new(), |def| format!("{} ", def.kind_name()));
-                    (mod_prefix, format!("`{}`", names_to_string(mod_path)))
+                    (mod_prefix, format!("`{}`", Segment::names_to_string(mod_path)))
                 };
                 (format!("cannot find {} `{}` in {}{}", expected, item_str, mod_prefix, mod_str),
                  format!("not found in {}", mod_str),
@@ -2969,6 +3005,17 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             };
             let code = DiagnosticId::Error(code.into());
             let mut err = this.session.struct_span_err_with_code(base_span, &base_msg, code);
+
+            // Emit help message for fake-self from other languages like `this`(javascript)
+            if ["this", "my"].contains(&&*item_str.as_str())
+                && this.self_value_is_available(path[0].ident.span, span) {
+                err.span_suggestion_with_applicability(
+                    span,
+                    "did you mean",
+                    "self".to_string(),
+                    Applicability::MaybeIncorrect,
+                );
+            }
 
             // Emit special messages for unresolved `Self` and `self`.
             if is_self_type(path, ns) {
@@ -2980,18 +3027,23 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     "traits and impls"
                 };
                 err.span_label(span, format!("`Self` is only available in {}", available_in));
+                if this.current_self_item.is_some() && nightly_options::is_nightly_build() {
+                    err.help("add #![feature(self_in_typedefs)] to the crate attributes \
+                              to enable");
+                }
                 return (err, Vec::new());
             }
             if is_self_value(path, ns) {
                 __diagnostic_used!(E0424);
                 err.code(DiagnosticId::Error("E0424".into()));
-                err.span_label(span, format!("`self` value is only available in \
+                err.span_label(span, format!("`self` value is a keyword \
+                                               only available in \
                                                methods with `self` parameter"));
                 return (err, Vec::new());
             }
 
             // Try to lookup the name in more relaxed fashion for better error reporting.
-            let ident = *path.last().unwrap();
+            let ident = path.last().unwrap().ident;
             let candidates = this.lookup_import_candidates(ident.name, ns, is_expected);
             if candidates.is_empty() && is_expected(Def::Enum(DefId::local(CRATE_DEF_INDEX))) {
                 let enum_candidates =
@@ -3018,7 +3070,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             }
             if path.len() == 1 && this.self_type_is_available(span) {
                 if let Some(candidate) = this.lookup_assoc_candidate(ident, ns, is_expected) {
-                    let self_is_available = this.self_value_is_available(path[0].span, span);
+                    let self_is_available = this.self_value_is_available(path[0].ident.span, span);
                     match candidate {
                         AssocSuggestion::Field => {
                             err.span_suggestion_with_applicability(
@@ -3028,7 +3080,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                                 Applicability::MachineApplicable,
                             );
                             if !self_is_available {
-                                err.span_label(span, format!("`self` value is only available in \
+                                err.span_label(span, format!("`self` value is a keyword \
+                                                               only available in \
                                                                methods with `self` parameter"));
                             }
                         }
@@ -3069,7 +3122,10 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                         return (err, candidates);
                     }
                     (Def::TyAlias(..), PathSource::Trait(_)) => {
-                        err.span_label(span, "type aliases cannot be used for traits");
+                        err.span_label(span, "type aliases cannot be used as traits");
+                        if nightly_options::is_nightly_build() {
+                            err.note("did you mean to use a trait alias?");
+                        }
                         return (err, candidates);
                     }
                     (Def::Mod(..), PathSource::Expr(Some(parent))) => match parent.node {
@@ -3114,11 +3170,11 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                             // parser issue where a struct literal is being used on an expression
                             // where a brace being opened means a block is being started. Look
                             // ahead for the next text to see if `span` is followed by a `{`.
-                            let cm = this.session.source_map();
+                            let sm = this.session.source_map();
                             let mut sp = span;
                             loop {
-                                sp = cm.next_point(sp);
-                                match cm.span_to_snippet(sp) {
+                                sp = sm.next_point(sp);
+                                match sm.span_to_snippet(sp) {
                                     Ok(ref snippet) => {
                                         if snippet.chars().any(|c| { !c.is_whitespace() }) {
                                             break;
@@ -3127,20 +3183,51 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                                     _ => break,
                                 }
                             }
-                            let followed_by_brace = match cm.span_to_snippet(sp) {
+                            let followed_by_brace = match sm.span_to_snippet(sp) {
                                 Ok(ref snippet) if snippet == "{" => true,
                                 _ => false,
                             };
-                            if let (PathSource::Expr(None), true) = (source, followed_by_brace) {
-                                err.span_label(
-                                    span,
-                                    format!("did you mean `({} {{ /* fields */ }})`?", path_str),
-                                );
-                            } else {
-                                err.span_label(
-                                    span,
-                                    format!("did you mean `{} {{ /* fields */ }}`?", path_str),
-                                );
+                            match source {
+                                PathSource::Expr(Some(parent)) => {
+                                    match parent.node {
+                                        ExprKind::MethodCall(ref path_assignment, _)  => {
+                                            err.span_suggestion_with_applicability(
+                                                sm.start_point(parent.span)
+                                                  .to(path_assignment.ident.span),
+                                                "use `::` to access an associated function",
+                                                format!("{}::{}",
+                                                        path_str,
+                                                        path_assignment.ident),
+                                                Applicability::MaybeIncorrect
+                                            );
+                                            return (err, candidates);
+                                        },
+                                        _ => {
+                                            err.span_label(
+                                                span,
+                                                format!("did you mean `{} {{ /* fields */ }}`?",
+                                                        path_str),
+                                            );
+                                            return (err, candidates);
+                                        },
+                                    }
+                                },
+                                PathSource::Expr(None) if followed_by_brace == true => {
+                                    err.span_label(
+                                        span,
+                                        format!("did you mean `({} {{ /* fields */ }})`?",
+                                                path_str),
+                                    );
+                                    return (err, candidates);
+                                },
+                                _ => {
+                                    err.span_label(
+                                        span,
+                                        format!("did you mean `{} {{ /* fields */ }}`?",
+                                                path_str),
+                                    );
+                                    return (err, candidates);
+                                },
                             }
                         }
                         return (err, candidates);
@@ -3221,7 +3308,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 // or `<T>::A::B`. If `B` should be resolved in value namespace then
                 // it needs to be added to the trait map.
                 if ns == ValueNS {
-                    let item_name = *path.last().unwrap();
+                    let item_name = path.last().unwrap().ident;
                     let traits = self.get_traits_containing_item(item_name, ns);
                     self.trait_map.insert(id, traits);
                 }
@@ -3256,12 +3343,15 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                         err.span_label(base_span,
                                        "expecting a type here because of type ascription");
                         if line_sp != line_base_sp {
-                            err.span_suggestion_short(sp,
-                                                      "did you mean to use `;` here instead?",
-                                                      ";".to_string());
+                            err.span_suggestion_short_with_applicability(
+                                sp,
+                                "did you mean to use `;` here instead?",
+                                ";".to_string(),
+                                Applicability::MaybeIncorrect,
+                            );
                         }
                         break;
-                    } else if snippet.trim().len() != 0  {
+                    } else if !snippet.trim().is_empty() {
                         debug!("tried to find type ascription `:` token, couldn't find it");
                         break;
                     }
@@ -3288,7 +3378,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     fn resolve_qpath_anywhere(&mut self,
                               id: NodeId,
                               qself: Option<&QSelf>,
-                              path: &[Ident],
+                              path: &[Segment],
                               primary_ns: Namespace,
                               span: Span,
                               defer_to_typeck: bool,
@@ -3309,10 +3399,12 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 };
             }
         }
-        let is_global = self.macro_prelude.get(&path[0].name).cloned()
-            .map(|binding| binding.get_macro(self).kind() == MacroKind::Bang).unwrap_or(false);
-        if primary_ns != MacroNS && (is_global ||
-                                     self.macro_names.contains(&path[0].modern())) {
+        if primary_ns != MacroNS &&
+           (self.macro_names.contains(&path[0].ident.modern()) ||
+            self.builtin_macros.get(&path[0].ident.name).cloned()
+                               .and_then(NameBinding::macro_kind) == Some(MacroKind::Bang) ||
+            self.macro_use_prelude.get(&path[0].ident.name).cloned()
+                                  .and_then(NameBinding::macro_kind) == Some(MacroKind::Bang)) {
             // Return some dummy definition, it's enough for error reporting.
             return Some(
                 PathResolution::new(Def::Macro(DefId::local(CRATE_DEF_INDEX), MacroKind::Bang))
@@ -3325,7 +3417,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     fn resolve_qpath(&mut self,
                      id: NodeId,
                      qself: Option<&QSelf>,
-                     path: &[Ident],
+                     path: &[Segment],
                      ns: Namespace,
                      span: Span,
                      global_by_default: bool,
@@ -3387,7 +3479,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             ));
         }
 
-        let result = match self.resolve_path(
+        let result = match self.resolve_path_without_parent_scope(
             None,
             &path,
             Some(ns),
@@ -3415,8 +3507,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             PathResult::Failed(..)
                     if (ns == TypeNS || path.len() > 1) &&
                        self.primitive_type_table.primitive_types
-                           .contains_key(&path[0].name) => {
-                let prim = self.primitive_type_table.primitive_types[&path[0].name];
+                           .contains_key(&path[0].ident.name) => {
+                let prim = self.primitive_type_table.primitive_types[&path[0].ident.name];
                 PathResolution::with_unresolved_segments(Def::PrimTy(prim), path.len() - 1)
             }
             PathResult::Module(ModuleOrUniformRoot::Module(module)) =>
@@ -3431,10 +3523,10 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         };
 
         if path.len() > 1 && !global_by_default && result.base_def() != Def::Err &&
-           path[0].name != keywords::CrateRoot.name() &&
-           path[0].name != keywords::DollarCrate.name() {
+           path[0].ident.name != keywords::CrateRoot.name() &&
+           path[0].ident.name != keywords::DollarCrate.name() {
             let unqualified_result = {
-                match self.resolve_path(
+                match self.resolve_path_without_parent_scope(
                     None,
                     &[*path.last().unwrap()],
                     Some(ns),
@@ -3457,11 +3549,29 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         Some(result)
     }
 
+    fn resolve_path_without_parent_scope(
+        &mut self,
+        base_module: Option<ModuleOrUniformRoot<'a>>,
+        path: &[Segment],
+        opt_ns: Option<Namespace>, // `None` indicates a module path
+        record_used: bool,
+        path_span: Span,
+        crate_lint: CrateLint,
+    ) -> PathResult<'a> {
+        // Macro and import paths must have full parent scope available during resolution,
+        // other paths will do okay with parent module alone.
+        assert!(opt_ns != None && opt_ns != Some(MacroNS));
+        let parent_scope = ParentScope { module: self.current_module, ..self.dummy_parent_scope() };
+        self.resolve_path(base_module, path, opt_ns, &parent_scope,
+                          record_used, path_span, crate_lint)
+    }
+
     fn resolve_path(
         &mut self,
         base_module: Option<ModuleOrUniformRoot<'a>>,
-        path: &[Ident],
+        path: &[Segment],
         opt_ns: Option<Namespace>, // `None` indicates a module path
+        parent_scope: &ParentScope<'a>,
         record_used: bool,
         path_span: Span,
         crate_lint: CrateLint,
@@ -3469,6 +3579,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         let mut module = base_module;
         let mut allow_super = true;
         let mut second_binding = None;
+        self.current_module = parent_scope.module;
 
         debug!(
             "resolve_path(path={:?}, opt_ns={:?}, record_used={:?}, \
@@ -3480,8 +3591,19 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             crate_lint,
         );
 
-        for (i, &ident) in path.iter().enumerate() {
-            debug!("resolve_path ident {} {:?}", i, ident);
+        for (i, &Segment { ident, id }) in path.iter().enumerate() {
+            debug!("resolve_path ident {} {:?} {:?}", i, ident, id);
+            let record_segment_def = |this: &mut Self, def| {
+                if record_used {
+                    if let Some(id) = id {
+                        if !this.def_map.contains_key(&id) {
+                            assert!(id != ast::DUMMY_NODE_ID, "Trying to resolve dummy id");
+                            this.record_def(id, PathResolution::new(def));
+                        }
+                    }
+                }
+            };
+
             let is_last = i == path.len() - 1;
             let ns = if is_last { opt_ns.unwrap_or(TypeNS) } else { TypeNS };
             let name = ident.name;
@@ -3519,7 +3641,6 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     }
                     if name == keywords::Extern.name() ||
                        name == keywords::CrateRoot.name() &&
-                       self.session.features_untracked().extern_absolute_paths &&
                        self.session.rust_2018() {
                         module = Some(ModuleOrUniformRoot::UniformRoot(name));
                         continue;
@@ -3542,7 +3663,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 } else {
                     format!("`{}`", name)
                 };
-                let msg = if i == 1 && path[0].name == keywords::CrateRoot.name() {
+                let msg = if i == 1 && path[0].ident.name == keywords::CrateRoot.name() {
                     format!("global paths cannot start with {}", name_str)
                 } else {
                     format!("{} in paths can only be used in start position", name_str)
@@ -3554,8 +3675,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 self.resolve_ident_in_module(module, ident, ns, record_used, path_span)
             } else if opt_ns == Some(MacroNS) {
                 assert!(ns == TypeNS);
-                self.resolve_lexical_macro_path_segment(ident, ns, record_used, record_used,
-                                                        false, path_span).map(|(b, _)| b)
+                self.early_resolve_ident_in_lexical_scope(ident, ns, None, parent_scope,
+                                                          record_used, record_used, path_span)
             } else {
                 let record_used_id =
                     if record_used { crate_lint.node_id().or(Some(CRATE_NODE_ID)) } else { None };
@@ -3565,6 +3686,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     // we found a local variable or type param
                     Some(LexicalScopeBinding::Def(def))
                             if opt_ns == Some(TypeNS) || opt_ns == Some(ValueNS) => {
+                        record_segment_def(self, def);
                         return PathResult::NonModule(PathResolution::with_unresolved_segments(
                             def, path.len() - 1
                         ));
@@ -3582,6 +3704,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     let maybe_assoc = opt_ns != Some(MacroNS) && PathSource::Type.is_expected(def);
                     if let Some(next_module) = binding.module() {
                         module = Some(ModuleOrUniformRoot::Module(next_module));
+                        record_segment_def(self, def);
                     } else if def == Def::ToolMod && i + 1 != path.len() {
                         let def = Def::NonMacroAttr(NonMacroAttrKind::Tool);
                         return PathResult::NonModule(PathResolution::new(def));
@@ -3631,7 +3754,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     } else if i == 0 {
                         format!("Use of undeclared type or module `{}`", ident)
                     } else {
-                        format!("Could not find `{}` in `{}`", ident, path[i - 1])
+                        format!("Could not find `{}` in `{}`", ident, path[i - 1].ident)
                     };
                     return PathResult::Failed(ident.span, msg, is_last);
                 }
@@ -3643,24 +3766,17 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         PathResult::Module(module.unwrap_or_else(|| {
             span_bug!(path_span, "resolve_path: empty(?) path {:?} has no module", path);
         }))
-
     }
 
     fn lint_if_path_starts_with_module(
         &self,
         crate_lint: CrateLint,
-        path: &[Ident],
+        path: &[Segment],
         path_span: Span,
         second_binding: Option<&NameBinding>,
     ) {
         // In the 2018 edition this lint is a hard error, so nothing to do
         if self.session.rust_2018() {
-            return
-        }
-
-        // In the 2015 edition there's no use in emitting lints unless the
-        // crate's already enabled the feature that we're going to suggest
-        if !self.session.features_untracked().crate_in_paths {
             return
         }
 
@@ -3672,7 +3788,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         };
 
         let first_name = match path.get(0) {
-            Some(ident) => ident.name,
+            Some(ident) => ident.ident.name,
             None => return,
         };
 
@@ -3684,7 +3800,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
 
         match path.get(1) {
             // If this import looks like `crate::...` it's already good
-            Some(ident) if ident.name == keywords::Crate.name() => return,
+            Some(Segment { ident, .. }) if ident.name == keywords::Crate.name() => return,
             // Otherwise go below to see if it's an extern crate
             Some(_) => {}
             // If the path has length one (and it's `CrateRoot` most likely)
@@ -3700,7 +3816,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             if let NameBindingKind::Import { directive: d, .. } = binding.kind {
                 // Careful: we still want to rewrite paths from
                 // renamed extern crates.
-                if let ImportDirectiveSubclass::ExternCrate(None) = d.subclass {
+                if let ImportDirectiveSubclass::ExternCrate { source: None, .. } = d.subclass {
                     return
                 }
             }
@@ -3775,7 +3891,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                             // report an error.
                             if record_used {
                                 resolve_error(self, span,
-                                        ResolutionError::CannotCaptureDynamicEnvironmentInFnItem);
+                                    ResolutionError::CannotCaptureDynamicEnvironmentInFnItem);
                             }
                             return Def::Err;
                         }
@@ -3783,7 +3899,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                             // Still doesn't deal with upvars
                             if record_used {
                                 resolve_error(self, span,
-                                        ResolutionError::AttemptToUseNonConstantValueInConstant);
+                                    ResolutionError::AttemptToUseNonConstantValueInConstant);
                             }
                             return Def::Err;
                         }
@@ -3812,7 +3928,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             }
             _ => {}
         }
-        return def;
+        def
     }
 
     fn lookup_assoc_candidate<FilterFn>(&mut self,
@@ -3877,7 +3993,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     }
 
     fn lookup_typo_candidate<FilterFn>(&mut self,
-                                       path: &[Ident],
+                                       path: &[Segment],
                                        ns: Namespace,
                                        filter_fn: FilterFn,
                                        span: Span)
@@ -3915,7 +4031,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                     } else {
                         // Items from the prelude
                         if !module.no_implicit_prelude {
-                            names.extend(self.extern_prelude.iter().cloned());
+                            names.extend(self.extern_prelude.iter().map(|(ident, _)| ident.name));
                             if let Some(prelude) = self.prelude {
                                 add_module_candidates(prelude, &mut names);
                             }
@@ -3933,15 +4049,16 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         } else {
             // Search in module.
             let mod_path = &path[..path.len() - 1];
-            if let PathResult::Module(module) = self.resolve_path(None, mod_path, Some(TypeNS),
-                                                                  false, span, CrateLint::No) {
+            if let PathResult::Module(module) = self.resolve_path_without_parent_scope(
+                None, mod_path, Some(TypeNS), false, span, CrateLint::No
+            ) {
                 if let ModuleOrUniformRoot::Module(module) = module {
                     add_module_candidates(module, &mut names);
                 }
             }
         }
 
-        let name = path[path.len() - 1].name;
+        let name = path[path.len() - 1].ident.name;
         // Make sure error reporting is deterministic.
         names.sort_by_cached_key(|name| name.as_str());
         match find_best_match_for_name(names.iter(), &name.as_str(), None) {
@@ -4025,7 +4142,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 self.visit_expr(subexpression);
 
                 self.ribs[ValueNS].push(Rib::new(NormalRibKind));
-                let mut bindings_list = FxHashMap();
+                let mut bindings_list = FxHashMap::default();
                 for pat in pats {
                     self.resolve_pattern(pat, PatternSource::IfLet, &mut bindings_list);
                 }
@@ -4050,7 +4167,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 self.with_resolved_label(label, expr.id, |this| {
                     this.visit_expr(subexpression);
                     this.ribs[ValueNS].push(Rib::new(NormalRibKind));
-                    let mut bindings_list = FxHashMap();
+                    let mut bindings_list = FxHashMap::default();
                     for pat in pats {
                         this.resolve_pattern(pat, PatternSource::WhileLet, &mut bindings_list);
                     }
@@ -4064,7 +4181,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             ExprKind::ForLoop(ref pattern, ref subexpression, ref block, label) => {
                 self.visit_expr(subexpression);
                 self.ribs[ValueNS].push(Rib::new(NormalRibKind));
-                self.resolve_pattern(pattern, PatternSource::For, &mut FxHashMap());
+                self.resolve_pattern(pattern, PatternSource::For, &mut FxHashMap::default());
 
                 self.resolve_labeled_block(label, expr.id, block);
 
@@ -4117,7 +4234,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 self.ribs[ValueNS].push(Rib::new(rib_kind));
                 self.label_ribs.push(Rib::new(rib_kind));
                 // Resolve arguments:
-                let mut bindings_list = FxHashMap();
+                let mut bindings_list = FxHashMap::default();
                 for argument in &fn_decl.inputs {
                     self.resolve_pattern(&argument.pat, PatternSource::FnParam, &mut bindings_list);
                     self.visit_ty(&argument.ty);
@@ -4262,10 +4379,9 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         where FilterFn: Fn(Def) -> bool
     {
         let mut candidates = Vec::new();
-        let mut worklist = Vec::new();
-        let mut seen_modules = FxHashSet();
+        let mut seen_modules = FxHashSet::default();
         let not_local_module = crate_name != keywords::Crate.ident();
-        worklist.push((start_module, Vec::<ast::PathSegment>::new(), not_local_module));
+        let mut worklist = vec![(start_module, Vec::<ast::PathSegment>::new(), not_local_module)];
 
         while let Some((in_module,
                         path_segments,
@@ -4306,7 +4422,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                         // declared as public (due to pruning, we don't explore
                         // outside crate private modules => no need to check this)
                         if !in_module_is_extern || name_binding.vis == ty::Visibility::Public {
-                            candidates.push(ImportSuggestion { path: path });
+                            candidates.push(ImportSuggestion { path });
                         }
                     }
                 }
@@ -4352,25 +4468,23 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                                           -> Vec<ImportSuggestion>
         where FilterFn: Fn(Def) -> bool
     {
-        let mut suggestions = vec![];
+        let mut suggestions = self.lookup_import_candidates_from_module(
+            lookup_name, namespace, self.graph_root, keywords::Crate.ident(), &filter_fn);
 
-        suggestions.extend(
-            self.lookup_import_candidates_from_module(
-                lookup_name, namespace, self.graph_root, keywords::Crate.ident(), &filter_fn
-            )
-        );
-
-        if self.session.features_untracked().extern_prelude {
+        if self.session.rust_2018() {
             let extern_prelude_names = self.extern_prelude.clone();
-            for &krate_name in extern_prelude_names.iter() {
-                let krate_ident = Ident::with_empty_ctxt(krate_name);
-                let external_prelude_module = self.load_extern_prelude_crate_if_needed(krate_ident);
+            for (ident, _) in extern_prelude_names.into_iter() {
+                if let Some(crate_id) = self.crate_loader.maybe_process_path_extern(ident.name,
+                                                                                    ident.span) {
+                    let crate_root = self.get_module(DefId {
+                        krate: crate_id,
+                        index: CRATE_DEF_INDEX,
+                    });
+                    self.populate_module_if_necessary(&crate_root);
 
-                suggestions.extend(
-                    self.lookup_import_candidates_from_module(
-                        lookup_name, namespace, external_prelude_module, krate_ident, &filter_fn
-                    )
-                );
+                    suggestions.extend(self.lookup_import_candidates_from_module(
+                        lookup_name, namespace, crate_root, ident, &filter_fn));
+                }
             }
         }
 
@@ -4382,9 +4496,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                    -> Option<(Module<'a>, ImportSuggestion)>
     {
         let mut result = None;
-        let mut worklist = Vec::new();
-        let mut seen_modules = FxHashSet();
-        worklist.push((self.graph_root, Vec::new()));
+        let mut seen_modules = FxHashSet::default();
+        let mut worklist = vec![(self.graph_root, Vec::new())];
 
         while let Some((in_module, path_segments)) = worklist.pop() {
             // abort if the module is already found
@@ -4406,7 +4519,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                             span: name_binding.span,
                             segments: path_segments,
                         };
-                        result = Some((module, ImportSuggestion { path: path }));
+                        result = Some((module, ImportSuggestion { path }));
                     } else {
                         // add the module to the lookup
                         if seen_modules.insert(module.def_id().unwrap()) {
@@ -4462,7 +4575,7 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             ast::VisibilityKind::Restricted { ref path, id, .. } => {
                 // Visibilities are resolved as global by default, add starting root segment.
                 let segments = path.make_root().iter().chain(path.segments.iter())
-                    .map(|seg| seg.ident)
+                    .map(|seg| Segment { ident: seg.ident, id: Some(seg.id) })
                     .collect::<Vec<_>>();
                 let def = self.smart_resolve_path_fragment(
                     id,
@@ -4496,35 +4609,58 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         vis.is_accessible_from(module.normal_ancestor_id, self)
     }
 
-    fn report_ambiguity_error(
-        &self, name: Name, span: Span, _lexical: bool,
-        def1: Def, is_import1: bool, is_glob1: bool, from_expansion1: bool, span1: Span,
-        def2: Def, is_import2: bool, _is_glob2: bool, _from_expansion2: bool, span2: Span,
-    ) {
+    fn set_binding_parent_module(&mut self, binding: &'a NameBinding<'a>, module: Module<'a>) {
+        if let Some(old_module) = self.binding_parent_modules.insert(PtrKey(binding), module) {
+            if !ptr::eq(module, old_module) {
+                span_bug!(binding.span, "parent module is reset for binding");
+            }
+        }
+    }
+
+    fn disambiguate_legacy_vs_modern(
+        &self,
+        legacy: &'a NameBinding<'a>,
+        modern: &'a NameBinding<'a>,
+    ) -> bool {
+        // Some non-controversial subset of ambiguities "modern macro name" vs "macro_rules"
+        // is disambiguated to mitigate regressions from macro modularization.
+        // Scoping for `macro_rules` behaves like scoping for `let` at module level, in general.
+        match (self.binding_parent_modules.get(&PtrKey(legacy)),
+               self.binding_parent_modules.get(&PtrKey(modern))) {
+            (Some(legacy), Some(modern)) =>
+                legacy.normal_ancestor_id == modern.normal_ancestor_id &&
+                modern.is_ancestor_of(legacy),
+            _ => false,
+        }
+    }
+
+    fn report_ambiguity_error(&self, ident: Ident, b1: &NameBinding, b2: &NameBinding) {
         let participle = |is_import: bool| if is_import { "imported" } else { "defined" };
-        let msg1 = format!("`{}` could refer to the name {} here", name, participle(is_import1));
+        let msg1 =
+            format!("`{}` could refer to the name {} here", ident, participle(b1.is_import()));
         let msg2 =
-            format!("`{}` could also refer to the name {} here", name, participle(is_import2));
-        let note = if from_expansion1 {
-            Some(if let Def::Macro(..) = def1 {
+            format!("`{}` could also refer to the name {} here", ident, participle(b2.is_import()));
+        let note = if b1.expansion != Mark::root() {
+            Some(if let Def::Macro(..) = b1.def() {
                 format!("macro-expanded {} do not shadow",
-                        if is_import1 { "macro imports" } else { "macros" })
+                        if b1.is_import() { "macro imports" } else { "macros" })
             } else {
                 format!("macro-expanded {} do not shadow when used in a macro invocation path",
-                        if is_import1 { "imports" } else { "items" })
+                        if b1.is_import() { "imports" } else { "items" })
             })
-        } else if is_glob1 {
-            Some(format!("consider adding an explicit import of `{}` to disambiguate", name))
+        } else if b1.is_glob_import() {
+            Some(format!("consider adding an explicit import of `{}` to disambiguate", ident))
         } else {
             None
         };
 
-        let mut err = struct_span_err!(self.session, span, E0659, "`{}` is ambiguous", name);
-        err.span_note(span1, &msg1);
-        match def2 {
-            Def::Macro(..) if span2.is_dummy() =>
-                err.note(&format!("`{}` is also a builtin macro", name)),
-            _ => err.span_note(span2, &msg2),
+        let mut err = struct_span_err!(self.session, ident.span, E0659, "`{}` is ambiguous", ident);
+        err.span_label(ident.span, "ambiguous name");
+        err.span_note(b1.span, &msg1);
+        match b2.def() {
+            Def::Macro(..) if b2.span.is_dummy() =>
+                err.note(&format!("`{}` is also a builtin macro", ident)),
+            _ => err.span_note(b2.span, &msg2),
         };
         if let Some(note) = note {
             err.note(&note);
@@ -4533,10 +4669,8 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
     }
 
     fn report_errors(&mut self, krate: &Crate) {
-        self.report_shadowing_errors();
         self.report_with_use_injections(krate);
-        self.report_proc_macro_import(krate);
-        let mut reported_spans = FxHashSet();
+        let mut reported_spans = FxHashSet::default();
 
         for &(span_use, span_def) in &self.macro_expanded_macro_export_errors {
             let msg = "macro-expanded `macro_export` macros from the current crate \
@@ -4549,21 +4683,17 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             );
         }
 
-        for &AmbiguityError { span, name, b1, b2, lexical } in &self.ambiguity_errors {
-            if reported_spans.insert(span) {
-                self.report_ambiguity_error(
-                    name, span, lexical,
-                    b1.def(), b1.is_import(), b1.is_glob_import(),
-                    b1.expansion != Mark::root(), b1.span,
-                    b2.def(), b2.is_import(), b2.is_glob_import(),
-                    b2.expansion != Mark::root(), b2.span,
-                );
+        for &AmbiguityError { ident, b1, b2 } in &self.ambiguity_errors {
+            if reported_spans.insert(ident.span) {
+                self.report_ambiguity_error(ident, b1, b2);
             }
         }
 
-        for &PrivacyError(span, name, binding) in &self.privacy_errors {
-            if !reported_spans.insert(span) { continue }
-            span_err!(self.session, span, E0603, "{} `{}` is private", binding.descr(), name);
+        for &PrivacyError(dedup_span, ident, binding) in &self.privacy_errors {
+            if reported_spans.insert(dedup_span) {
+                span_err!(self.session, ident.span, E0603, "{} `{}` is private",
+                          binding.descr(), ident.name);
+            }
         }
     }
 
@@ -4574,20 +4704,6 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
                 show_candidates(&mut err, span, &candidates, better, found_use);
             }
             err.emit();
-        }
-    }
-
-    fn report_shadowing_errors(&mut self) {
-        let mut reported_errors = FxHashSet();
-        for binding in replace(&mut self.disallowed_shadowing, Vec::new()) {
-            if self.resolve_legacy_scope(&binding.parent, binding.ident, false).is_some() &&
-               reported_errors.insert((binding.ident, binding.span)) {
-                let msg = format!("`{}` is already in scope", binding.ident);
-                self.session.struct_span_err(binding.span, &msg)
-                    .note("macro-expanded `macro_rules!`s may not shadow \
-                           existing macros (see RFC 1560)")
-                    .emit();
-            }
         }
     }
 
@@ -4671,10 +4787,17 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
             };
 
             let cm = self.session.source_map();
-            let rename_msg = "You can use `as` to change the binding name of the import";
+            let rename_msg = "you can use `as` to change the binding name of the import";
 
-            if let (Ok(snippet), false) = (cm.span_to_snippet(binding.span),
-                                           binding.is_renamed_extern_crate()) {
+            if let (
+                Ok(snippet),
+                NameBindingKind::Import { directive, ..},
+                _dummy @ false,
+            ) = (
+                cm.span_to_snippet(binding.span),
+                binding.kind.clone(),
+                binding.span.is_dummy(),
+            ) {
                 let suggested_name = if name.as_str().chars().next().unwrap().is_uppercase() {
                     format!("Other{}", name)
                 } else {
@@ -4683,13 +4806,30 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
 
                 err.span_suggestion_with_applicability(
                     binding.span,
-                    rename_msg,
-                    if snippet.ends_with(';') {
-                        format!("{} as {};", &snippet[..snippet.len() - 1], suggested_name)
-                    } else {
-                        format!("{} as {}", snippet, suggested_name)
+                    &rename_msg,
+                    match (&directive.subclass, snippet.as_ref()) {
+                        (ImportDirectiveSubclass::SingleImport { .. }, "self") =>
+                            format!("self as {}", suggested_name),
+                        (ImportDirectiveSubclass::SingleImport { source, .. }, _) =>
+                            format!(
+                                "{} as {}{}",
+                                &snippet[..((source.span.hi().0 - binding.span.lo().0) as usize)],
+                                suggested_name,
+                                if snippet.ends_with(";") {
+                                    ";"
+                                } else {
+                                    ""
+                                }
+                            ),
+                        (ImportDirectiveSubclass::ExternCrate { source, target, .. }, _) =>
+                            format!(
+                                "extern crate {} as {};",
+                                source.unwrap_or(target.name),
+                                suggested_name,
+                            ),
+                        (_, _) => unreachable!(),
                     },
-                    Applicability::MachineApplicable,
+                    Applicability::MaybeIncorrect,
                 );
             } else {
                 err.span_label(binding.span, rename_msg);
@@ -4699,14 +4839,43 @@ impl<'a, 'crateloader: 'a> Resolver<'a, 'crateloader> {
         err.emit();
         self.name_already_seen.insert(name, span);
     }
+
+    fn extern_prelude_get(&mut self, ident: Ident, speculative: bool, skip_feature_gate: bool)
+                          -> Option<&'a NameBinding<'a>> {
+        self.extern_prelude.get(&ident.modern()).cloned().and_then(|entry| {
+            if let Some(binding) = entry.extern_crate_item {
+                if !speculative && !skip_feature_gate && entry.introduced_by_item &&
+                   !self.session.features_untracked().extern_crate_item_prelude {
+                    emit_feature_err(&self.session.parse_sess, "extern_crate_item_prelude",
+                                     ident.span, GateIssue::Language,
+                                     "use of extern prelude names introduced \
+                                      with `extern crate` items is unstable");
+                }
+                Some(binding)
+            } else {
+                let crate_id = if !speculative {
+                    self.crate_loader.process_path_extern(ident.name, ident.span)
+                } else if let Some(crate_id) =
+                        self.crate_loader.maybe_process_path_extern(ident.name, ident.span) {
+                    crate_id
+                } else {
+                    return None;
+                };
+                let crate_root = self.get_module(DefId { krate: crate_id, index: CRATE_DEF_INDEX });
+                self.populate_module_if_necessary(&crate_root);
+                Some((crate_root, ty::Visibility::Public, ident.span, Mark::root())
+                    .to_name_binding(self.arenas))
+            }
+        })
+    }
 }
 
-fn is_self_type(path: &[Ident], namespace: Namespace) -> bool {
-    namespace == TypeNS && path.len() == 1 && path[0].name == keywords::SelfType.name()
+fn is_self_type(path: &[Segment], namespace: Namespace) -> bool {
+    namespace == TypeNS && path.len() == 1 && path[0].ident.name == keywords::SelfType.name()
 }
 
-fn is_self_value(path: &[Ident], namespace: Namespace) -> bool {
-    namespace == ValueNS && path.len() == 1 && path[0].name == keywords::SelfValue.name()
+fn is_self_value(path: &[Segment], namespace: Namespace) -> bool {
+    namespace == ValueNS && path.len() == 1 && path[0].ident.name == keywords::SelfValue.name()
 }
 
 fn names_to_string(idents: &[Ident]) -> String {
@@ -4779,7 +4948,12 @@ fn show_candidates(err: &mut DiagnosticBuilder,
             *candidate = format!("use {};\n{}", candidate, additional_newline);
         }
 
-        err.span_suggestions(span, &msg, path_strings);
+        err.span_suggestions_with_applicability(
+            span,
+            &msg,
+            path_strings.into_iter(),
+            Applicability::Unspecified,
+        );
     } else {
         let mut msg = msg;
         msg.push(':');

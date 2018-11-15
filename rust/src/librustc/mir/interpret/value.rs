@@ -8,7 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
-#![allow(unknown_lints)]
+use std::fmt;
 
 use ty::layout::{HasDataLayout, Size};
 use ty::subst::Substs;
@@ -24,15 +24,18 @@ pub enum ConstValue<'tcx> {
     /// to allow HIR creation to happen for everything before needing to be able to run constant
     /// evaluation
     Unevaluated(DefId, &'tcx Substs<'tcx>),
+
     /// Used only for types with layout::abi::Scalar ABI and ZSTs
     ///
     /// Not using the enum `Value` to encode that this must not be `Undef`
     Scalar(Scalar),
-    /// Used only for types with layout::abi::ScalarPair
+
+    /// Used only for *fat pointers* with layout::abi::ScalarPair
     ///
-    /// The second field may be undef in case of `Option<usize>::None`
-    ScalarPair(Scalar, ScalarMaybeUndef),
-    /// Used only for the remaining cases. An allocation + offset into the allocation.
+    /// Needed for pattern matching code related to slices and strings.
+    ScalarPair(Scalar, Scalar),
+
+    /// An allocation + offset into the allocation.
     /// Invariant: The AllocId matches the allocation.
     ByRef(AllocId, &'tcx Allocation, Size),
 }
@@ -62,23 +65,72 @@ impl<'tcx> ConstValue<'tcx> {
     pub fn new_slice(
         val: Scalar,
         len: u64,
-        cx: impl HasDataLayout
+        cx: &impl HasDataLayout
     ) -> Self {
         ConstValue::ScalarPair(val, Scalar::Bits {
             bits: len as u128,
             size: cx.data_layout().pointer_size.bytes() as u8,
-        }.into())
+        })
     }
 
     #[inline]
     pub fn new_dyn_trait(val: Scalar, vtable: Pointer) -> Self {
-        ConstValue::ScalarPair(val, Scalar::Ptr(vtable).into())
+        ConstValue::ScalarPair(val, Scalar::Ptr(vtable))
     }
 }
 
-impl<'tcx> Scalar {
+/// A `Scalar` represents an immediate, primitive value existing outside of a
+/// `memory::Allocation`. It is in many ways like a small chunk of a `Allocation`, up to 8 bytes in
+/// size. Like a range of bytes in an `Allocation`, a `Scalar` can either represent the raw bytes
+/// of a simple value or a pointer into another `Allocation`
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, RustcEncodable, RustcDecodable, Hash)]
+pub enum Scalar<Tag=(), Id=AllocId> {
+    /// The raw bytes of a simple value.
+    Bits {
+        /// The first `size` bytes are the value.
+        /// Do not try to read less or more bytes that that. The remaining bytes must be 0.
+        size: u8,
+        bits: u128,
+    },
+
+    /// A pointer into an `Allocation`. An `Allocation` in the `memory` module has a list of
+    /// relocations, but a `Scalar` is only large enough to contain one, so we just represent the
+    /// relocation and its associated offset together as a `Pointer` here.
+    Ptr(Pointer<Tag, Id>),
+}
+
+impl<Tag> fmt::Display for Scalar<Tag> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Scalar::Ptr(_) => write!(f, "a pointer"),
+            Scalar::Bits { bits, .. } => write!(f, "{}", bits),
+        }
+    }
+}
+
+impl<'tcx> Scalar<()> {
     #[inline]
-    pub fn ptr_null(cx: impl HasDataLayout) -> Self {
+    pub fn with_default_tag<Tag>(self) -> Scalar<Tag>
+        where Tag: Default
+    {
+        match self {
+            Scalar::Ptr(ptr) => Scalar::Ptr(ptr.with_default_tag()),
+            Scalar::Bits { bits, size } => Scalar::Bits { bits, size },
+        }
+    }
+}
+
+impl<'tcx, Tag> Scalar<Tag> {
+    #[inline]
+    pub fn erase_tag(self) -> Scalar {
+        match self {
+            Scalar::Ptr(ptr) => Scalar::Ptr(ptr.erase_tag()),
+            Scalar::Bits { bits, size } => Scalar::Bits { bits, size },
+        }
+    }
+
+    #[inline]
+    pub fn ptr_null(cx: &impl HasDataLayout) -> Self {
         Scalar::Bits {
             bits: 0,
             size: cx.data_layout().pointer_size.bytes() as u8,
@@ -91,66 +143,86 @@ impl<'tcx> Scalar {
     }
 
     #[inline]
-    pub fn ptr_signed_offset(self, i: i64, cx: impl HasDataLayout) -> EvalResult<'tcx, Self> {
-        let layout = cx.data_layout();
+    pub fn ptr_offset(self, i: Size, cx: &impl HasDataLayout) -> EvalResult<'tcx, Self> {
+        let dl = cx.data_layout();
         match self {
             Scalar::Bits { bits, size } => {
-                assert_eq!(size as u64, layout.pointer_size.bytes());
+                assert_eq!(size as u64, dl.pointer_size.bytes());
                 Ok(Scalar::Bits {
-                    bits: layout.signed_offset(bits as u64, i)? as u128,
+                    bits: dl.offset(bits as u64, i.bytes())? as u128,
                     size,
                 })
             }
-            Scalar::Ptr(ptr) => ptr.signed_offset(i, layout).map(Scalar::Ptr),
+            Scalar::Ptr(ptr) => ptr.offset(i, dl).map(Scalar::Ptr),
         }
     }
 
     #[inline]
-    pub fn ptr_offset(self, i: Size, cx: impl HasDataLayout) -> EvalResult<'tcx, Self> {
-        let layout = cx.data_layout();
+    pub fn ptr_wrapping_offset(self, i: Size, cx: &impl HasDataLayout) -> Self {
+        let dl = cx.data_layout();
         match self {
             Scalar::Bits { bits, size } => {
-                assert_eq!(size as u64, layout.pointer_size.bytes());
-                Ok(Scalar::Bits {
-                    bits: layout.offset(bits as u64, i.bytes())? as u128,
-                    size,
-                })
-            }
-            Scalar::Ptr(ptr) => ptr.offset(i, layout).map(Scalar::Ptr),
-        }
-    }
-
-    #[inline]
-    pub fn ptr_wrapping_signed_offset(self, i: i64, cx: impl HasDataLayout) -> Self {
-        let layout = cx.data_layout();
-        match self {
-            Scalar::Bits { bits, size } => {
-                assert_eq!(size as u64, layout.pointer_size.bytes());
+                assert_eq!(size as u64, dl.pointer_size.bytes());
                 Scalar::Bits {
-                    bits: layout.wrapping_signed_offset(bits as u64, i) as u128,
+                    bits: dl.overflowing_offset(bits as u64, i.bytes()).0 as u128,
                     size,
                 }
             }
-            Scalar::Ptr(ptr) => Scalar::Ptr(ptr.wrapping_signed_offset(i, layout)),
+            Scalar::Ptr(ptr) => Scalar::Ptr(ptr.wrapping_offset(i, dl)),
         }
     }
 
     #[inline]
-    pub fn is_null_ptr(self, cx: impl HasDataLayout) -> bool {
+    pub fn ptr_signed_offset(self, i: i64, cx: &impl HasDataLayout) -> EvalResult<'tcx, Self> {
+        let dl = cx.data_layout();
         match self {
-            Scalar::Bits { bits, size } =>  {
+            Scalar::Bits { bits, size } => {
+                assert_eq!(size as u64, dl.pointer_size().bytes());
+                Ok(Scalar::Bits {
+                    bits: dl.signed_offset(bits as u64, i)? as u128,
+                    size,
+                })
+            }
+            Scalar::Ptr(ptr) => ptr.signed_offset(i, dl).map(Scalar::Ptr),
+        }
+    }
+
+    #[inline]
+    pub fn ptr_wrapping_signed_offset(self, i: i64, cx: &impl HasDataLayout) -> Self {
+        let dl = cx.data_layout();
+        match self {
+            Scalar::Bits { bits, size } => {
+                assert_eq!(size as u64, dl.pointer_size.bytes());
+                Scalar::Bits {
+                    bits: dl.overflowing_signed_offset(bits as u64, i128::from(i)).0 as u128,
+                    size,
+                }
+            }
+            Scalar::Ptr(ptr) => Scalar::Ptr(ptr.wrapping_signed_offset(i, dl)),
+        }
+    }
+
+    /// Returns this pointers offset from the allocation base, or from NULL (for
+    /// integer pointers).
+    #[inline]
+    pub fn get_ptr_offset(self, cx: &impl HasDataLayout) -> Size {
+        match self {
+            Scalar::Bits { bits, size } => {
+                assert_eq!(size as u64, cx.pointer_size().bytes());
+                Size::from_bytes(bits as u64)
+            }
+            Scalar::Ptr(ptr) => ptr.offset,
+        }
+    }
+
+    #[inline]
+    pub fn is_null_ptr(self, cx: &impl HasDataLayout) -> bool {
+        match self {
+            Scalar::Bits { bits, size } => {
                 assert_eq!(size as u64, cx.data_layout().pointer_size.bytes());
                 bits == 0
             },
             Scalar::Ptr(_) => false,
-        }
-    }
-
-    #[inline]
-    pub fn is_null(self) -> bool {
-        match self {
-            Scalar::Bits { bits, .. } => bits == 0,
-            Scalar::Ptr(_) => false
         }
     }
 
@@ -168,7 +240,7 @@ impl<'tcx> Scalar {
     pub fn from_uint(i: impl Into<u128>, size: Size) -> Self {
         let i = i.into();
         debug_assert_eq!(truncate(i, size), i,
-                    "Unsigned value {} does not fit in {} bits", i, size.bits());
+                         "Unsigned value {} does not fit in {} bits", i, size.bits());
         Scalar::Bits { bits: i, size: size.bytes() as u8 }
     }
 
@@ -178,7 +250,7 @@ impl<'tcx> Scalar {
         // `into` performed sign extension, we have to truncate
         let truncated = truncate(i as u128, size);
         debug_assert_eq!(sign_extend(truncated, size) as i128, i,
-                    "Signed value {} does not fit in {} bits", i, size.bits());
+                         "Signed value {} does not fit in {} bits", i, size.bits());
         Scalar::Bits { bits: truncated, size: size.bytes() as u8 }
     }
 
@@ -205,7 +277,7 @@ impl<'tcx> Scalar {
     }
 
     #[inline]
-    pub fn to_ptr(self) -> EvalResult<'tcx, Pointer> {
+    pub fn to_ptr(self) -> EvalResult<'tcx, Pointer<Tag>> {
         match self {
             Scalar::Bits { bits: 0, .. } => err!(InvalidNullPointerUsage),
             Scalar::Bits { .. } => err!(ReadBytesAsPointer),
@@ -266,7 +338,7 @@ impl<'tcx> Scalar {
         Ok(b as u64)
     }
 
-    pub fn to_usize(self, cx: impl HasDataLayout) -> EvalResult<'static, u64> {
+    pub fn to_usize(self, cx: &impl HasDataLayout) -> EvalResult<'static, u64> {
         let b = self.to_bits(cx.data_layout().pointer_size)?;
         assert_eq!(b as u64 as u128, b);
         Ok(b as u64)
@@ -296,7 +368,7 @@ impl<'tcx> Scalar {
         Ok(b as i64)
     }
 
-    pub fn to_isize(self, cx: impl HasDataLayout) -> EvalResult<'static, i64> {
+    pub fn to_isize(self, cx: &impl HasDataLayout) -> EvalResult<'static, i64> {
         let b = self.to_bits(cx.data_layout().pointer_size)?;
         let b = sign_extend(b, cx.data_layout().pointer_size) as i128;
         assert_eq!(b as i64 as i128, b);
@@ -314,57 +386,67 @@ impl<'tcx> Scalar {
     }
 }
 
-impl From<Pointer> for Scalar {
+impl<Tag> From<Pointer<Tag>> for Scalar<Tag> {
     #[inline(always)]
-    fn from(ptr: Pointer) -> Self {
+    fn from(ptr: Pointer<Tag>) -> Self {
         Scalar::Ptr(ptr)
     }
 }
 
-/// A `Scalar` represents an immediate, primitive value existing outside of a
-/// `memory::Allocation`. It is in many ways like a small chunk of a `Allocation`, up to 8 bytes in
-/// size. Like a range of bytes in an `Allocation`, a `Scalar` can either represent the raw bytes
-/// of a simple value or a pointer into another `Allocation`
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, RustcEncodable, RustcDecodable, Hash)]
-pub enum Scalar {
-    /// The raw bytes of a simple value.
-    Bits {
-        /// The first `size` bytes are the value.
-        /// Do not try to read less or more bytes that that. The remaining bytes must be 0.
-        size: u8,
-        bits: u128,
-    },
-
-    /// A pointer into an `Allocation`. An `Allocation` in the `memory` module has a list of
-    /// relocations, but a `Scalar` is only large enough to contain one, so we just represent the
-    /// relocation and its associated offset together as a `Pointer` here.
-    Ptr(Pointer),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, RustcEncodable, RustcDecodable, Hash)]
-pub enum ScalarMaybeUndef {
-    Scalar(Scalar),
+pub enum ScalarMaybeUndef<Tag=(), Id=AllocId> {
+    Scalar(Scalar<Tag, Id>),
     Undef,
 }
 
-impl From<Scalar> for ScalarMaybeUndef {
+impl<Tag> From<Scalar<Tag>> for ScalarMaybeUndef<Tag> {
     #[inline(always)]
-    fn from(s: Scalar) -> Self {
+    fn from(s: Scalar<Tag>) -> Self {
         ScalarMaybeUndef::Scalar(s)
     }
 }
 
-impl<'tcx> ScalarMaybeUndef {
+impl<Tag> fmt::Display for ScalarMaybeUndef<Tag> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScalarMaybeUndef::Undef => write!(f, "uninitialized bytes"),
+            ScalarMaybeUndef::Scalar(s) => write!(f, "{}", s),
+        }
+    }
+}
+
+impl<'tcx> ScalarMaybeUndef<()> {
     #[inline]
-    pub fn not_undef(self) -> EvalResult<'static, Scalar> {
+    pub fn with_default_tag<Tag>(self) -> ScalarMaybeUndef<Tag>
+        where Tag: Default
+    {
+        match self {
+            ScalarMaybeUndef::Scalar(s) => ScalarMaybeUndef::Scalar(s.with_default_tag()),
+            ScalarMaybeUndef::Undef => ScalarMaybeUndef::Undef,
+        }
+    }
+}
+
+impl<'tcx, Tag> ScalarMaybeUndef<Tag> {
+    #[inline]
+    pub fn erase_tag(self) -> ScalarMaybeUndef
+    {
+        match self {
+            ScalarMaybeUndef::Scalar(s) => ScalarMaybeUndef::Scalar(s.erase_tag()),
+            ScalarMaybeUndef::Undef => ScalarMaybeUndef::Undef,
+        }
+    }
+
+    #[inline]
+    pub fn not_undef(self) -> EvalResult<'static, Scalar<Tag>> {
         match self {
             ScalarMaybeUndef::Scalar(scalar) => Ok(scalar),
-            ScalarMaybeUndef::Undef => err!(ReadUndefBytes),
+            ScalarMaybeUndef::Undef => err!(ReadUndefBytes(Size::from_bytes(0))),
         }
     }
 
     #[inline(always)]
-    pub fn to_ptr(self) -> EvalResult<'tcx, Pointer> {
+    pub fn to_ptr(self) -> EvalResult<'tcx, Pointer<Tag>> {
         self.not_undef()?.to_ptr()
     }
 
@@ -409,7 +491,7 @@ impl<'tcx> ScalarMaybeUndef {
     }
 
     #[inline(always)]
-    pub fn to_usize(self, cx: impl HasDataLayout) -> EvalResult<'tcx, u64> {
+    pub fn to_usize(self, cx: &impl HasDataLayout) -> EvalResult<'tcx, u64> {
         self.not_undef()?.to_usize(cx)
     }
 
@@ -429,7 +511,12 @@ impl<'tcx> ScalarMaybeUndef {
     }
 
     #[inline(always)]
-    pub fn to_isize(self, cx: impl HasDataLayout) -> EvalResult<'tcx, i64> {
+    pub fn to_isize(self, cx: &impl HasDataLayout) -> EvalResult<'tcx, i64> {
         self.not_undef()?.to_isize(cx)
     }
 }
+
+impl_stable_hash_for!(enum ::mir::interpret::ScalarMaybeUndef {
+    Scalar(v),
+    Undef
+});

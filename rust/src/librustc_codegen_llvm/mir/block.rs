@@ -49,9 +49,9 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_terminator(&mut self,
-                        mut bx: Builder<'a, 'll, 'tcx>,
-                        bb: mir::BasicBlock,
-                        terminator: &mir::Terminator<'tcx>)
+                          mut bx: Builder<'a, 'll, 'tcx>,
+                          bb: mir::BasicBlock,
+                          terminator: &mir::Terminator<'tcx>)
     {
         debug!("codegen_terminator: {:?}", terminator);
 
@@ -125,10 +125,10 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     this.unreachable_block()
                 };
                 let invokeret = bx.invoke(fn_ptr,
-                                           &llargs,
-                                           ret_bx,
-                                           llblock(this, cleanup),
-                                           cleanup_bundle);
+                                          &llargs,
+                                          ret_bx,
+                                          llblock(this, cleanup),
+                                          cleanup_bundle);
                 fn_ty.apply_attrs_callsite(&bx, invokeret);
 
                 if let Some((ret_dest, target)) = destination {
@@ -213,7 +213,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 } else {
                     let (otherwise, targets) = targets.split_last().unwrap();
                     let switch = bx.switch(discr.immediate(),
-                                            llblock(self, *otherwise), values.len());
+                                           llblock(self, *otherwise),
+                                           values.len());
                     let switch_llty = bx.cx.layout_of(switch_ty).immediate_llvm_type(bx.cx);
                     for (&value, target) in values.iter().zip(targets) {
                         let llval = C_uint_big(switch_llty, value);
@@ -297,8 +298,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 };
                 let (drop_fn, fn_ty) = match ty.sty {
                     ty::Dynamic(..) => {
-                        let fn_ty = drop_fn.ty(bx.cx.tcx);
-                        let sig = common::ty_fn_sig(bx.cx, fn_ty);
+                        let sig = drop_fn.fn_sig(bx.cx.tcx);
                         let sig = bx.tcx().normalize_erasing_late_bound_regions(
                             ty::ParamEnv::reveal_all(),
                             &sig,
@@ -387,8 +387,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                         let msg_str = Symbol::intern(str).as_str();
                         let msg_str = C_str_slice(bx.cx, msg_str);
                         let msg_file_line_col = C_struct(bx.cx,
-                                                     &[msg_str, filename, line, col],
-                                                     false);
+                                                         &[msg_str, filename, line, col],
+                                                         false);
                         let msg_file_line_col = consts::addr_of(bx.cx,
                                                                 msg_file_line_col,
                                                                 align,
@@ -412,7 +412,13 @@ impl FunctionCx<'a, 'll, 'tcx> {
                 bug!("undesugared DropAndReplace in codegen: {:?}", terminator);
             }
 
-            mir::TerminatorKind::Call { ref func, ref args, ref destination, cleanup } => {
+            mir::TerminatorKind::Call {
+                ref func,
+                ref args,
+                ref destination,
+                cleanup,
+                from_hir_call: _
+            } => {
                 // Create the callee. This is a fn ptr or zero-sized and hence a kind of scalar.
                 let callee = self.codegen_operand(&bx, func);
 
@@ -481,6 +487,54 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     }
                     _ => FnType::new(bx.cx, sig, &extra_args)
                 };
+
+                // emit a panic instead of instantiating an uninhabited type
+                if (intrinsic == Some("init") || intrinsic == Some("uninit")) &&
+                    fn_ty.ret.layout.abi.is_uninhabited()
+                {
+                    let loc = bx.sess().source_map().lookup_char_pos(span.lo());
+                    let filename = Symbol::intern(&loc.file.name.to_string()).as_str();
+                    let filename = C_str_slice(bx.cx, filename);
+                    let line = C_u32(bx.cx, loc.line as u32);
+                    let col = C_u32(bx.cx, loc.col.to_usize() as u32 + 1);
+                    let align = tcx.data_layout.aggregate_align
+                        .max(tcx.data_layout.i32_align)
+                        .max(tcx.data_layout.pointer_align);
+
+                    let str = format!(
+                        "Attempted to instantiate uninhabited type {} using mem::{}",
+                        sig.output(),
+                        if intrinsic == Some("init") { "zeroed" } else { "uninitialized" }
+                    );
+                    let msg_str = Symbol::intern(&str).as_str();
+                    let msg_str = C_str_slice(bx.cx, msg_str);
+                    let msg_file_line_col = C_struct(bx.cx,
+                                                     &[msg_str, filename, line, col],
+                                                     false);
+                    let msg_file_line_col = consts::addr_of(bx.cx,
+                                                            msg_file_line_col,
+                                                            align,
+                                                            Some("panic_loc"));
+
+                    // Obtain the panic entry point.
+                    let def_id =
+                        common::langcall(bx.tcx(), Some(span), "", lang_items::PanicFnLangItem);
+                    let instance = ty::Instance::mono(bx.tcx(), def_id);
+                    let fn_ty = FnType::of_instance(bx.cx, &instance);
+                    let llfn = callee::get_fn(bx.cx, instance);
+
+                    // Codegen the actual panic invoke/call.
+                    do_call(
+                        self,
+                        bx,
+                        fn_ty,
+                        llfn,
+                        &[msg_file_line_col],
+                        destination.as_ref().map(|(_, bb)| (ReturnDest::Nothing, *bb)),
+                        cleanup,
+                    );
+                    return;
+                }
 
                 // The arguments we'll be passing. Plus one to account for outptr, if used.
                 let arg_count = fn_ty.args.len() + fn_ty.ret.is_indirect() as usize;
@@ -565,7 +619,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
 
                     let callee_ty = instance.as_ref().unwrap().ty(bx.cx.tcx);
                     codegen_intrinsic_call(&bx, callee_ty, &fn_ty, &args, dest,
-                                         terminator.source_info.span);
+                                           terminator.source_info.span);
 
                     if let ReturnDest::IndirectOperand(dst, _) = ret_dest {
                         self.store_return(&bx, ret_dest, &fn_ty.ret, dst.llval);
@@ -588,14 +642,54 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     (&args[..], None)
                 };
 
-                for (i, arg) in first_args.iter().enumerate() {
+                'make_args: for (i, arg) in first_args.iter().enumerate() {
                     let mut op = self.codegen_operand(&bx, arg);
+
                     if let (0, Some(ty::InstanceDef::Virtual(_, idx))) = (i, def) {
-                        if let Pair(data_ptr, meta) = op.val {
+                        if let Pair(..) = op.val {
+                            // In the case of Rc<Self>, we need to explicitly pass a
+                            // *mut RcBox<Self> with a Scalar (not ScalarPair) ABI. This is a hack
+                            // that is understood elsewhere in the compiler as a method on
+                            // `dyn Trait`.
+                            // To get a `*mut RcBox<Self>`, we just keep unwrapping newtypes until
+                            // we get a value of a built-in pointer type
+                            'descend_newtypes: while !op.layout.ty.is_unsafe_ptr()
+                                            && !op.layout.ty.is_region_ptr()
+                            {
+                                'iter_fields: for i in 0..op.layout.fields.count() {
+                                    let field = op.extract_field(&bx, i);
+                                    if !field.layout.is_zst() {
+                                        // we found the one non-zero-sized field that is allowed
+                                        // now find *its* non-zero-sized field, or stop if it's a
+                                        // pointer
+                                        op = field;
+                                        continue 'descend_newtypes
+                                    }
+                                }
+
+                                span_bug!(span, "receiver has no non-zero-sized fields {:?}", op);
+                            }
+
+                            // now that we have `*dyn Trait` or `&dyn Trait`, split it up into its
+                            // data pointer and vtable. Look up the method in the vtable, and pass
+                            // the data pointer as the first argument
+                            match op.val {
+                                Pair(data_ptr, meta) => {
+                                    llfn = Some(meth::VirtualIndex::from_index(idx)
+                                        .get_fn(&bx, meta, &fn_ty));
+                                    llargs.push(data_ptr);
+                                    continue 'make_args
+                                }
+                                other => bug!("expected a Pair, got {:?}", other)
+                            }
+                        } else if let Ref(data_ptr, Some(meta), _) = op.val {
+                            // by-value dynamic dispatch
                             llfn = Some(meth::VirtualIndex::from_index(idx)
                                 .get_fn(&bx, meta, &fn_ty));
                             llargs.push(data_ptr);
                             continue;
+                        } else {
+                            span_bug!(span, "can't codegen a virtual call on {:?}", op);
                         }
                     }
 
@@ -690,7 +784,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
                     // have scary latent bugs around.
 
                     let scratch = PlaceRef::alloca(bx, arg.layout, "arg");
-                    base::memcpy_ty(bx, scratch.llval, llval, op.layout, align, MemFlags::empty());
+                    base::memcpy_ty(bx, scratch.llval, scratch.align, llval, align,
+                                    op.layout, MemFlags::empty());
                     (scratch.llval, scratch.align, true)
                 } else {
                     (llval, align, true)
@@ -702,7 +797,7 @@ impl FunctionCx<'a, 'll, 'tcx> {
             // Have to load the argument, maybe while casting it.
             if let PassMode::Cast(ty) = arg.mode {
                 llval = bx.load(bx.pointercast(llval, ty.llvm_type(bx.cx).ptr_to()),
-                                 align.min(arg.layout.align));
+                                align.min(arg.layout.align));
             } else {
                 // We can't use `PlaceRef::load` here because the argument
                 // may have a type we don't treat as immediate, but the ABI
@@ -724,10 +819,10 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_arguments_untupled(&mut self,
-                                bx: &Builder<'a, 'll, 'tcx>,
-                                operand: &mir::Operand<'tcx>,
-                                llargs: &mut Vec<&'ll Value>,
-                                args: &[ArgType<'tcx, Ty<'tcx>>]) {
+                                  bx: &Builder<'a, 'll, 'tcx>,
+                                  operand: &mir::Operand<'tcx>,
+                                  llargs: &mut Vec<&'ll Value>,
+                                  args: &[ArgType<'tcx, Ty<'tcx>>]) {
         let tuple = self.codegen_operand(bx, operand);
 
         // Handle both by-ref and immediate tuples.
@@ -879,8 +974,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_transmute(&mut self, bx: &Builder<'a, 'll, 'tcx>,
-                       src: &mir::Operand<'tcx>,
-                       dst: &mir::Place<'tcx>) {
+                         src: &mir::Operand<'tcx>,
+                         dst: &mir::Place<'tcx>) {
         if let mir::Place::Local(index) = *dst {
             match self.locals[index] {
                 LocalRef::Place(place) => self.codegen_transmute_into(bx, src, place),
@@ -907,8 +1002,8 @@ impl FunctionCx<'a, 'll, 'tcx> {
     }
 
     fn codegen_transmute_into(&mut self, bx: &Builder<'a, 'll, 'tcx>,
-                            src: &mir::Operand<'tcx>,
-                            dst: PlaceRef<'ll, 'tcx>) {
+                              src: &mir::Operand<'tcx>,
+                              dst: PlaceRef<'ll, 'tcx>) {
         let src = self.codegen_operand(bx, src);
         let llty = src.layout.llvm_type(bx.cx);
         let cast_ptr = bx.pointercast(dst.llval, llty.ptr_to());

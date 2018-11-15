@@ -22,7 +22,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
   libssl-dev \
   pkg-config \
   gcc-arm-none-eabi \
-  libnewlib-arm-none-eabi
+  libnewlib-arm-none-eabi \
+  qemu-system-arm
 
 WORKDIR /build
 
@@ -102,6 +103,7 @@ ENV TARGETS=$TARGETS,thumbv6m-none-eabi
 ENV TARGETS=$TARGETS,thumbv7m-none-eabi
 ENV TARGETS=$TARGETS,thumbv7em-none-eabi
 ENV TARGETS=$TARGETS,thumbv7em-none-eabihf
+ENV TARGETS=$TARGETS,riscv32imc-unknown-none-elf
 ENV TARGETS=$TARGETS,riscv32imac-unknown-none-elf
 ENV TARGETS=$TARGETS,armebv7r-none-eabi
 ENV TARGETS=$TARGETS,armebv7r-none-eabihf

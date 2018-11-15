@@ -41,8 +41,11 @@ fn main() {
     } else if target.contains("freebsd") {
         println!("cargo:rustc-link-lib=execinfo");
         println!("cargo:rustc-link-lib=pthread");
+    } else if target.contains("netbsd") {
+        println!("cargo:rustc-link-lib=pthread");
+        println!("cargo:rustc-link-lib=rt");
     } else if target.contains("dragonfly") || target.contains("bitrig") ||
-              target.contains("netbsd") || target.contains("openbsd") {
+              target.contains("openbsd") {
         println!("cargo:rustc-link-lib=pthread");
     } else if target.contains("solaris") {
         println!("cargo:rustc-link-lib=socket");
@@ -96,6 +99,10 @@ fn build_libbacktrace(target: &str) -> Result<(), ()> {
         .file("../libbacktrace/read.c")
         .file("../libbacktrace/sort.c")
         .file("../libbacktrace/state.c");
+
+    let any_debug = env::var("RUSTC_DEBUGINFO").unwrap_or_default() == "true" ||
+        env::var("RUSTC_DEBUGINFO_LINES").unwrap_or_default() == "true";
+    build.debug(any_debug);
 
     if target.contains("darwin") {
         build.file("../libbacktrace/macho.c");

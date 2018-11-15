@@ -134,11 +134,11 @@ impl<'a, 'tcx: 'a> Annotator<'a, 'tcx> {
         if self.tcx.features().staged_api {
             // This crate explicitly wants staged API.
             debug!("annotate(id = {:?}, attrs = {:?})", id, attrs);
-            if let Some(..) = attr::find_deprecation(self.tcx.sess.diagnostic(), attrs, item_sp) {
+            if let Some(..) = attr::find_deprecation(&self.tcx.sess.parse_sess, attrs, item_sp) {
                 self.tcx.sess.span_err(item_sp, "`#[deprecated]` cannot be used in staged api, \
                                                  use `#[rustc_deprecated]` instead");
             }
-            if let Some(mut stab) = attr::find_stability(self.tcx.sess.diagnostic(),
+            if let Some(mut stab) = attr::find_stability(&self.tcx.sess.parse_sess,
                                                          attrs, item_sp) {
                 // Error if prohibited, or can't inherit anything from a container
                 if kind == AnnotationKind::Prohibited ||
@@ -164,8 +164,10 @@ impl<'a, 'tcx: 'a> Annotator<'a, 'tcx> {
                 if let (&Some(attr::RustcDeprecation {since: dep_since, ..}),
                         &attr::Stable {since: stab_since}) = (&stab.rustc_depr, &stab.level) {
                     // Explicit version of iter::order::lt to handle parse errors properly
-                    for (dep_v, stab_v) in
-                            dep_since.as_str().split('.').zip(stab_since.as_str().split('.')) {
+                    for (dep_v, stab_v) in dep_since.as_str()
+                                                    .split('.')
+                                                    .zip(stab_since.as_str().split('.'))
+                    {
                         if let (Ok(dep_v), Ok(stab_v)) = (dep_v.parse::<u64>(), stab_v.parse()) {
                             match dep_v.cmp(&stab_v) {
                                 Ordering::Less => {
@@ -222,7 +224,7 @@ impl<'a, 'tcx: 'a> Annotator<'a, 'tcx> {
                 }
             }
 
-            if let Some(depr) = attr::find_deprecation(self.tcx.sess.diagnostic(), attrs, item_sp) {
+            if let Some(depr) = attr::find_deprecation(&self.tcx.sess.parse_sess, attrs, item_sp) {
                 if kind == AnnotationKind::Prohibited {
                     self.tcx.sess.span_err(item_sp, "This deprecation annotation is useless");
                 }
@@ -399,13 +401,13 @@ impl<'a, 'tcx> Index<'tcx> {
         let is_staged_api =
             tcx.sess.opts.debugging_opts.force_unstable_if_unmarked ||
             tcx.features().staged_api;
-        let mut staged_api = FxHashMap();
+        let mut staged_api = FxHashMap::default();
         staged_api.insert(LOCAL_CRATE, is_staged_api);
         let mut index = Index {
             staged_api,
-            stab_map: FxHashMap(),
-            depr_map: FxHashMap(),
-            active_features: FxHashSet(),
+            stab_map: Default::default(),
+            depr_map: Default::default(),
+            active_features: Default::default(),
         };
 
         let ref active_lib_features = tcx.features().declared_lib_features;
@@ -440,7 +442,8 @@ impl<'a, 'tcx> Index<'tcx> {
                     },
                     feature: Symbol::intern("rustc_private"),
                     rustc_depr: None,
-                    rustc_const_unstable: None,
+                    const_stability: None,
+                    promotable: false,
                 });
                 annotator.parent_stab = Some(stability);
             }
@@ -466,7 +469,7 @@ impl<'a, 'tcx> Index<'tcx> {
 /// Cross-references the feature names of unstable APIs with enabled
 /// features and possibly prints errors.
 pub fn check_unstable_api_usage<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
-    let mut checker = Checker { tcx: tcx };
+    let mut checker = Checker { tcx };
     tcx.hir.krate().visit_all_item_likes(&mut checker.as_deep_visitor());
 }
 
@@ -522,15 +525,12 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
             Some(Def::Method(_)) |
             Some(Def::AssociatedTy(_)) |
             Some(Def::AssociatedConst(_)) => {
-                match self.associated_item(def_id).container {
-                    ty::TraitContainer(trait_def_id) => {
-                        // Trait methods do not declare visibility (even
-                        // for visibility info in cstore). Use containing
-                        // trait instead, so methods of pub traits are
-                        // themselves considered pub.
-                        def_id = trait_def_id;
-                    }
-                    _ => {}
+                if let ty::TraitContainer(trait_def_id) = self.associated_item(def_id).container {
+                    // Trait methods do not declare visibility (even
+                    // for visibility info in cstore). Use containing
+                    // trait instead, so methods of pub traits are
+                    // themselves considered pub.
+                    def_id = trait_def_id;
                 }
             }
             _ => {}
@@ -560,8 +560,7 @@ impl<'a, 'gcx, 'tcx> TyCtxt<'a, 'gcx, 'tcx> {
     /// `id`.
     pub fn eval_stability(self, def_id: DefId, id: Option<NodeId>, span: Span) -> EvalResult {
         if span.allows_unstable() {
-            debug!("stability: \
-                    skipping span={:?} since it is internal", span);
+            debug!("stability: skipping span={:?} since it is internal", span);
             return EvalResult::Allow;
         }
 
@@ -769,8 +768,8 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
                     let param_env = self.tcx.param_env(def_id);
                     if !param_env.can_type_implement_copy(self.tcx, ty).is_ok() {
                         emit_feature_err(&self.tcx.sess.parse_sess,
-                                        "untagged_unions", item.span, GateIssue::Language,
-                                        "unions with non-`Copy` fields are unstable");
+                                         "untagged_unions", item.span, GateIssue::Language,
+                                         "unions with non-`Copy` fields are unstable");
                     }
                 }
             }
@@ -783,7 +782,7 @@ impl<'a, 'tcx> Visitor<'tcx> for Checker<'a, 'tcx> {
     fn visit_path(&mut self, path: &'tcx hir::Path, id: hir::HirId) {
         let id = self.tcx.hir.hir_to_node_id(id);
         match path.def {
-            Def::Local(..) | Def::Upvar(..) |
+            Def::Local(..) | Def::Upvar(..) | Def::SelfCtor(..) |
             Def::PrimTy(..) | Def::SelfTy(..) | Def::Err => {}
             _ => self.tcx.check_stability(path.def.def_id(), Some(id), path.span)
         }
@@ -815,7 +814,7 @@ pub fn check_unused_or_stable_features<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     }
 
     let declared_lang_features = &tcx.features().declared_lang_features;
-    let mut lang_features = FxHashSet();
+    let mut lang_features = FxHashSet::default();
     for &(feature, span, since) in declared_lang_features {
         if let Some(since) = since {
             // Warn if the user has enabled an already-stable lang feature.
@@ -829,7 +828,7 @@ pub fn check_unused_or_stable_features<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>) {
     }
 
     let declared_lib_features = &tcx.features().declared_lib_features;
-    let mut remaining_lib_features = FxHashMap();
+    let mut remaining_lib_features = FxHashMap::default();
     for (feature, span) in declared_lib_features {
         if remaining_lib_features.contains_key(&feature) {
             // Warn if the user enables a lib feature multiple times.

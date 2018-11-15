@@ -31,7 +31,7 @@ use syntax_pos::Span;
 /// On-demand query: yields a map containing all types mapped to their inherent impls.
 pub fn crate_inherent_impls<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
                                       crate_num: CrateNum)
-                                      -> CrateInherentImpls {
+                                      -> Lrc<CrateInherentImpls> {
     assert_eq!(crate_num, LOCAL_CRATE);
 
     let krate = tcx.hir.krate();
@@ -42,7 +42,7 @@ pub fn crate_inherent_impls<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>,
         }
     };
     krate.visit_all_item_likes(&mut collect);
-    collect.impls_map
+    Lrc::new(collect.impls_map)
 }
 
 /// On-demand query: yields a vector of the inherent impls for a specific type.
@@ -108,8 +108,8 @@ impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for InherentCollect<'a, 'tcx> {
             ty::Foreign(did) => {
                 self.check_def_id(item, did);
             }
-            ty::Dynamic(ref data, ..) if data.principal().is_some() => {
-                self.check_def_id(item, data.principal().unwrap().def_id());
+            ty::Dynamic(ref data, ..) => {
+                self.check_def_id(item, data.principal().def_id());
             }
             ty::Char => {
                 self.check_primitive_impl(def_id,
@@ -315,8 +315,7 @@ impl<'a, 'tcx> InherentCollect<'a, 'tcx> {
                              E0116,
                              "cannot define inherent `impl` for a type outside of the crate \
                               where the type is defined")
-                .span_label(item.span,
-                            "impl for type defined outside of crate.")
+                .span_label(item.span, "impl for type defined outside of crate.")
                 .note("define and implement a trait or new type instead")
                 .emit();
         }

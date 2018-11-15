@@ -53,7 +53,12 @@ pub struct ImportedSourceFile {
 }
 
 pub struct CrateMetadata {
+    /// Original name of the crate.
     pub name: Symbol,
+
+    /// Name of the crate as imported.  I.e. if imported with
+    /// `extern crate foo as bar;` this will be `bar`.
+    pub imported_name: Symbol,
 
     /// Information about the extern crate that caused this crate to
     /// be loaded. If this is `None`, then the crate was injected
@@ -106,7 +111,7 @@ impl CStore {
             // corresponding `CrateNum`. This first entry will always remain
             // `None`.
             metas: RwLock::new(IndexVec::from_elem_n(None, 1)),
-            extern_mod_crate_map: Lock::new(FxHashMap()),
+            extern_mod_crate_map: Default::default(),
             metadata_loader,
         }
     }

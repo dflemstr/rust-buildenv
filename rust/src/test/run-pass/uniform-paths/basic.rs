@@ -8,6 +8,10 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// run-pass
+#![allow(unused_imports)]
+#![allow(non_camel_case_types)]
+
 // edition:2018
 
 #![feature(uniform_paths)]
@@ -30,4 +34,12 @@ fn main() {
     Foo(());
     std_io::stdout();
     local_io(());
+
+    {
+        // Test that having `std_io` in a module scope and a non-module
+        // scope is allowed, when both resolve to the same definition.
+        use ::std::io as std_io;
+        use std_io::stdout;
+        stdout();
+    }
 }

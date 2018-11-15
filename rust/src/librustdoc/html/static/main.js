@@ -39,7 +39,10 @@
                      "associatedconstant",
                      "union",
                      "foreigntype",
-                     "keyword"];
+                     "keyword",
+                     "existential",
+                     "attr",
+                     "derive"];
 
     var search_input = document.getElementsByClassName('search-input')[0];
 
@@ -90,11 +93,6 @@
                 var end = start + className.length;
                 return !(end < elemClass.length && elemClass[end] !== ' ');
             }
-            if (start > 0 && elemClass[start - 1] !== ' ') {
-                return false;
-            }
-            var end = start + className.length;
-            return !(end < elemClass.length && elemClass[end] !== ' ');
         }
         return false;
     }
@@ -1791,9 +1789,12 @@
                         x[k].setAttribute('href', rootPath + href);
                     }
                 }
-                var li = document.createElement('li');
-                li.appendChild(code);
-                list.appendChild(li);
+                var display = document.createElement('h3');
+                addClass(display, "impl");
+                display.innerHTML = '<span class="in-band"><table class="table-display"><tbody>\
+                    <tr><td><code>' + code.outerHTML + '</code></td><td></td></tr></tbody></table>\
+                    </span>';
+                list.appendChild(display);
             }
         }
     };
@@ -1880,7 +1881,7 @@
             if (hasClass(relatedDoc, "stability")) {
                 relatedDoc = relatedDoc.nextElementSibling;
             }
-            if (hasClass(relatedDoc, "docblock")) {
+            if (hasClass(relatedDoc, "docblock") || hasClass(relatedDoc, "sub-variant")) {
                 var action = mode;
                 if (action === "toggle") {
                     if (hasClass(relatedDoc, "hidden-by-usual-hider")) {
@@ -1976,18 +1977,32 @@
         if (collapse) {
             toggleAllDocs(pageId, true);
         }
-        if (getCurrentValue('rustdoc-trait-implementations') !== "false") {
-            onEach(document.getElementsByClassName("collapse-toggle"), function(e) {
+        var collapser = function(e) {
                 // inherent impl ids are like 'impl' or impl-<number>'.
                 // they will never be hidden by default.
-                var n = e.parentNode;
+                var n = e.parentElement;
                 if (n.id.match(/^impl(?:-\d+)?$/) === null) {
                     // Automatically minimize all non-inherent impls
                     if (collapse || hasClass(n, 'impl')) {
                         collapseDocs(e, "hide", pageId);
                     }
                 }
-            });
+        };
+        if (getCurrentValue('rustdoc-trait-implementations') !== "false") {
+            var impl_list = document.getElementById('implementations-list');
+
+            if (impl_list !== null) {
+                onEach(impl_list.getElementsByClassName("collapse-toggle"), collapser);
+            }
+        }
+        if (getCurrentValue('rustdoc-method-docs') !== "false") {
+            var implItems = document.getElementsByClassName('impl-items');
+
+            if (implItems && implItems.length > 0) {
+                onEach(implItems, function(elem) {
+                    onEach(elem.getElementsByClassName("collapse-toggle"), collapser);
+                });
+            }
         }
     }
 
@@ -2025,7 +2040,8 @@
         if (!next) {
             return;
         }
-        if ((checkIfThereAreMethods(next.childNodes) || hasClass(e, 'method')) &&
+        if ((hasClass(e, 'method') || hasClass(e, 'associatedconstant') ||
+             checkIfThereAreMethods(next.childNodes)) &&
             (hasClass(next, 'docblock') ||
              hasClass(e, 'impl') ||
              (hasClass(next, 'stability') &&
@@ -2034,15 +2050,59 @@
         }
     };
     onEach(document.getElementsByClassName('method'), func);
+    onEach(document.getElementsByClassName('associatedconstant'), func);
     onEach(document.getElementsByClassName('impl'), func);
     onEach(document.getElementsByClassName('impl-items'), function(e) {
         onEach(e.getElementsByClassName('associatedconstant'), func);
+        var hiddenElems = e.getElementsByClassName('hidden');
+        var needToggle = false;
+
+        for (var i = 0; i < hiddenElems.length; ++i) {
+            if (hasClass(hiddenElems[i], "content") === false &&
+                hasClass(hiddenElems[i], "docblock") === false) {
+                needToggle = true;
+                break;
+            }
+        }
+        if (needToggle === true) {
+            var newToggle = document.createElement('a');
+            newToggle.href = 'javascript:void(0)';
+            newToggle.className = 'collapse-toggle hidden-default collapsed';
+            newToggle.innerHTML = "[<span class='inner'>" + labelForToggleButton(true) + "</span>" +
+                                  "] Show hidden undocumented items";
+            newToggle.onclick = function() {
+                if (hasClass(this, "collapsed")) {
+                    removeClass(this, "collapsed");
+                    onEach(this.parentNode.getElementsByClassName("hidden"), function(x) {
+                        if (hasClass(x, "content") === false) {
+                            removeClass(x, "hidden");
+                            addClass(x, "x");
+                        }
+                    }, true);
+                    this.innerHTML = "[<span class='inner'>" + labelForToggleButton(false) +
+                                     "</span>] Hide undocumented items"
+                } else {
+                    addClass(this, "collapsed");
+                    onEach(this.parentNode.getElementsByClassName("x"), function(x) {
+                        if (hasClass(x, "content") === false) {
+                            addClass(x, "hidden");
+                            removeClass(x, "x");
+                        }
+                    }, true);
+                    this.innerHTML = "[<span class='inner'>" + labelForToggleButton(true) +
+                                     "</span>] Show hidden undocumented items";
+                }
+            };
+            e.insertBefore(newToggle, e.firstChild);
+        }
     });
 
-    function createToggle(otherMessage, fontSize, extraClass) {
+    function createToggle(otherMessage, fontSize, extraClass, show) {
         var span = document.createElement('span');
         span.className = 'toggle-label';
-        span.style.display = 'none';
+        if (show) {
+            span.style.display = 'none';
+        }
         if (!otherMessage) {
             span.innerHTML = '&nbsp;Expand&nbsp;description';
         } else {
@@ -2058,22 +2118,28 @@
 
         var wrapper = document.createElement('div');
         wrapper.className = 'toggle-wrapper';
+        if (!show) {
+            addClass(wrapper, 'collapsed');
+            var inner = mainToggle.getElementsByClassName('inner');
+            if (inner && inner.length > 0) {
+                inner[0].innerHTML = '+';
+            }
+        }
         if (extraClass) {
-            wrapper.className += ' ' + extraClass;
+            addClass(wrapper, extraClass);
         }
         wrapper.appendChild(mainToggle);
         return wrapper;
     }
 
-    onEach(document.getElementsByClassName('docblock'), function(e) {
+    var showItemDeclarations = getCurrentValue('rustdoc-item-declarations') === "false";
+    function buildToggleWrapper(e) {
         if (hasClass(e, 'autohide')) {
             var wrap = e.previousElementSibling;
             if (wrap && hasClass(wrap, 'toggle-wrapper')) {
                 var toggle = wrap.childNodes[0];
-                var extra = false;
-                if (e.childNodes[0].tagName === 'H3') {
-                    extra = true;
-                }
+                var extra = e.childNodes[0].tagName === 'H3';
+
                 e.style.display = 'none';
                 addClass(wrap, 'collapsed');
                 onEach(toggle.getElementsByClassName('inner'), function(e) {
@@ -2088,13 +2154,18 @@
             }
         }
         if (e.parentNode.id === "main") {
-            var otherMessage;
+            var otherMessage = '';
             var fontSize;
             var extraClass;
 
             if (hasClass(e, "type-decl")) {
                 fontSize = "20px";
                 otherMessage = '&nbsp;Show&nbsp;declaration';
+                if (showItemDeclarations === false) {
+                    extraClass = 'collapsed';
+                }
+            } else if (hasClass(e, "sub-variant")) {
+                otherMessage = '&nbsp;Show&nbsp;fields';
             } else if (hasClass(e, "non-exhaustive")) {
                 otherMessage = '&nbsp;This&nbsp;';
                 if (hasClass(e, "non-exhaustive-struct")) {
@@ -2109,12 +2180,20 @@
                 extraClass = "marg-left";
             }
 
-            e.parentNode.insertBefore(createToggle(otherMessage, fontSize, extraClass), e);
-            if (otherMessage && getCurrentValue('rustdoc-item-declarations') !== "false") {
+            e.parentNode.insertBefore(
+                createToggle(otherMessage,
+                             fontSize,
+                             extraClass,
+                             hasClass(e, "type-decl") === false || showItemDeclarations === true),
+                e);
+            if (hasClass(e, "type-decl") === true && showItemDeclarations === true) {
                 collapseDocs(e.previousSibling.childNodes[0], "toggle");
             }
         }
-    });
+    }
+
+    onEach(document.getElementsByClassName('docblock'), buildToggleWrapper);
+    onEach(document.getElementsByClassName('sub-variant'), buildToggleWrapper);
 
     function createToggleWrapper(tog) {
         var span = document.createElement('span');
@@ -2153,29 +2232,50 @@
         });
     }
 
+    // To avoid checking on "rustdoc-item-attributes" value on every loop...
+    var itemAttributesFunc = function() {};
+    if (getCurrentValue("rustdoc-item-attributes") !== "false") {
+        itemAttributesFunc = function(x) {
+            collapseDocs(x.previousSibling.childNodes[0], "toggle");
+        };
+    }
     onEach(document.getElementById('main').getElementsByClassName('attributes'), function(i_e) {
         i_e.parentNode.insertBefore(createToggleWrapper(toggle.cloneNode(true)), i_e);
-        if (getCurrentValue("rustdoc-item-attributes") !== "false") {
-            collapseDocs(i_e.previousSibling.childNodes[0], "toggle");
-        }
+        itemAttributesFunc(i_e);
     });
 
+    // To avoid checking on "rustdoc-line-numbers" value on every loop...
+    var lineNumbersFunc = function() {};
+    if (getCurrentValue("rustdoc-line-numbers") === "true") {
+        lineNumbersFunc = function(x) {
+            var count = x.textContent.split('\n').length;
+            var elems = [];
+            for (var i = 0; i < count; ++i) {
+                elems.push(i + 1);
+            }
+            var node = document.createElement('pre');
+            addClass(node, 'line-number');
+            node.innerHTML = elems.join('\n');
+            x.parentNode.insertBefore(node, x);
+        };
+    }
     onEach(document.getElementsByClassName('rust-example-rendered'), function(e) {
         if (hasClass(e, 'compile_fail')) {
             e.addEventListener("mouseover", function(event) {
-                e.previousElementSibling.childNodes[0].style.color = '#f00';
+                this.parentElement.previousElementSibling.childNodes[0].style.color = '#f00';
             });
             e.addEventListener("mouseout", function(event) {
-                e.previousElementSibling.childNodes[0].style.color = '';
+                this.parentElement.previousElementSibling.childNodes[0].style.color = '';
             });
         } else if (hasClass(e, 'ignore')) {
             e.addEventListener("mouseover", function(event) {
-                e.previousElementSibling.childNodes[0].style.color = '#ff9200';
+                this.parentElement.previousElementSibling.childNodes[0].style.color = '#ff9200';
             });
             e.addEventListener("mouseout", function(event) {
-                e.previousElementSibling.childNodes[0].style.color = '';
+                this.parentElement.previousElementSibling.childNodes[0].style.color = '';
             });
         }
+        lineNumbersFunc(e);
     });
 
     function showModal(content) {

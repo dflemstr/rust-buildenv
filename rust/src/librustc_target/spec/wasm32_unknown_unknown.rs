@@ -36,8 +36,7 @@ pub fn target() -> Result<Target, String> {
         dll_suffix: ".wasm".to_string(),
         linker_is_gnu: false,
 
-        // A bit of a lie, but "eh"
-        max_atomic_width: Some(32),
+        max_atomic_width: Some(64),
 
         // Unwinding doesn't work right now, so the whole target unconditionally
         // defaults to panic=abort. Note that this is guaranteed to change in
@@ -54,6 +53,12 @@ pub fn target() -> Result<Target, String> {
         // we use the LLD shipped with the Rust toolchain by default
         linker: Some("rust-lld".to_owned()),
         lld_flavor: LldFlavor::Wasm,
+
+        // No need for indirection here, simd types can always be passed by
+        // value as the whole module either has simd or not, which is different
+        // from x86 (for example) where programs can have functions that don't
+        // enable simd features.
+        simd_types_indirect: false,
 
         .. Default::default()
     };

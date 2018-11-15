@@ -252,10 +252,11 @@ use core::fmt;
 use core::hash::{Hash, Hasher};
 use core::intrinsics::abort;
 use core::marker;
-use core::marker::{Unsize, PhantomData};
+use core::marker::{Unpin, Unsize, PhantomData};
 use core::mem::{self, align_of_val, forget, size_of_val};
 use core::ops::Deref;
-use core::ops::CoerceUnsized;
+use core::ops::{CoerceUnsized, DispatchFromDyn};
+use core::pin::Pin;
 use core::ptr::{self, NonNull};
 use core::convert::From;
 use core::usize;
@@ -281,6 +282,7 @@ struct RcBox<T: ?Sized> {
 /// type `T`.
 ///
 /// [get_mut]: #method.get_mut
+#[cfg_attr(not(test), lang = "rc")]
 #[stable(feature = "rust1", since = "1.0.0")]
 pub struct Rc<T: ?Sized> {
     ptr: NonNull<RcBox<T>>,
@@ -294,6 +296,9 @@ impl<T: ?Sized> !marker::Sync for Rc<T> {}
 
 #[unstable(feature = "coerce_unsized", issue = "27732")]
 impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Rc<U>> for Rc<T> {}
+
+#[unstable(feature = "dispatch_from_dyn", issue = "0")]
+impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Rc<U>> for Rc<T> {}
 
 impl<T> Rc<T> {
     /// Constructs a new `Rc<T>`.
@@ -319,6 +324,11 @@ impl<T> Rc<T> {
             }),
             phantom: PhantomData,
         }
+    }
+
+    #[unstable(feature = "pin", issue = "49150")]
+    pub fn pinned(value: T) -> Pin<Rc<T>> {
+        unsafe { Pin::new_unchecked(Rc::new(value)) }
     }
 
     /// Returns the contained value, if the `Rc` has exactly one strong reference.
@@ -658,16 +668,20 @@ impl Rc<dyn Any> {
 impl<T: ?Sized> Rc<T> {
     // Allocates an `RcBox<T>` with sufficient space for an unsized value
     unsafe fn allocate_for_ptr(ptr: *const T) -> *mut RcBox<T> {
-        // Create a fake RcBox to find allocation size and alignment
-        let fake_ptr = ptr as *mut RcBox<T>;
-
-        let layout = Layout::for_value(&*fake_ptr);
+        // Calculate layout using the given value.
+        // Previously, layout was calculated on the expression
+        // `&*(ptr as *const RcBox<T>)`, but this created a misaligned
+        // reference (see #54908).
+        let layout = Layout::new::<RcBox<()>>()
+            .extend(Layout::for_value(&*ptr)).unwrap().0
+            .pad_to_align().unwrap();
 
         let mem = Global.alloc(layout)
             .unwrap_or_else(|_| handle_alloc_error(layout));
 
-        // Initialize the real RcBox
+        // Initialize the RcBox
         let inner = set_data_ptr(ptr as *mut T, mem.as_ptr() as *mut u8) as *mut RcBox<T>;
+        debug_assert_eq!(Layout::for_value(&*inner), layout);
 
         ptr::write(&mut (*inner).strong, Cell::new(1));
         ptr::write(&mut (*inner).weak, Cell::new(1));
@@ -806,9 +820,7 @@ unsafe impl<#[may_dangle] T: ?Sized> Drop for Rc<T> {
     ///
     /// This will decrement the strong reference count. If the strong reference
     /// count reaches zero then the only other references (if any) are
-    /// [`Weak`][weak], so we `drop` the inner value.
-    ///
-    /// [weak]: struct.Weak.html
+    /// [`Weak`], so we `drop` the inner value.
     ///
     /// # Examples
     ///
@@ -862,7 +874,7 @@ impl<T: ?Sized> Clone for Rc<T> {
     ///
     /// let five = Rc::new(5);
     ///
-    /// Rc::clone(&five);
+    /// let _ = Rc::clone(&five);
     /// ```
     #[inline]
     fn clone(&self) -> Rc<T> {
@@ -1171,11 +1183,13 @@ impl<T: ?Sized> !marker::Sync for Weak<T> {}
 #[unstable(feature = "coerce_unsized", issue = "27732")]
 impl<T: ?Sized + Unsize<U>, U: ?Sized> CoerceUnsized<Weak<U>> for Weak<T> {}
 
+#[unstable(feature = "dispatch_from_dyn", issue = "0")]
+impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Weak<U>> for Weak<T> {}
+
 impl<T> Weak<T> {
     /// Constructs a new `Weak<T>`, without allocating any memory.
-    /// Calling [`upgrade`] on the return value always gives [`None`].
+    /// Calling [`upgrade`][Weak::upgrade] on the return value always gives [`None`].
     ///
-    /// [`upgrade`]: struct.Weak.html#method.upgrade
     /// [`None`]: ../../std/option/enum.Option.html
     ///
     /// # Examples
@@ -1300,7 +1314,7 @@ impl<T: ?Sized> Clone for Weak<T> {
     ///
     /// let weak_five = Rc::downgrade(&Rc::new(5));
     ///
-    /// Weak::clone(&weak_five);
+    /// let _ = Weak::clone(&weak_five);
     /// ```
     #[inline]
     fn clone(&self) -> Weak<T> {
@@ -1321,9 +1335,8 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Weak<T> {
 #[stable(feature = "downgraded_weak", since = "1.10.0")]
 impl<T> Default for Weak<T> {
     /// Constructs a new `Weak<T>`, allocating memory for `T` without initializing
-    /// it. Calling [`upgrade`] on the return value always gives [`None`].
+    /// it. Calling [`upgrade`][Weak::upgrade] on the return value always gives [`None`].
     ///
-    /// [`upgrade`]: struct.Weak.html#method.upgrade
     /// [`None`]: ../../std/option/enum.Option.html
     ///
     /// # Examples
@@ -1830,3 +1843,6 @@ impl<T: ?Sized> AsRef<T> for Rc<T> {
         &**self
     }
 }
+
+#[unstable(feature = "pin", issue = "49150")]
+impl<T: ?Sized> Unpin for Rc<T> { }

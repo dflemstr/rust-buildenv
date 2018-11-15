@@ -57,12 +57,8 @@
 
 #include "llvm/IR/LegacyPassManager.h"
 
-#if LLVM_VERSION_GE(4, 0)
 #include "llvm/Bitcode/BitcodeReader.h"
 #include "llvm/Bitcode/BitcodeWriter.h"
-#else
-#include "llvm/Bitcode/ReaderWriter.h"
-#endif
 
 #include "llvm/IR/DIBuilder.h"
 #include "llvm/IR/DebugInfo.h"
@@ -97,6 +93,7 @@ enum LLVMRustAttribute {
   SanitizeThread = 20,
   SanitizeAddress = 21,
   SanitizeMemory = 22,
+  NonLazyBind = 23,
 };
 
 typedef struct OpaqueRustString *RustStringRef;

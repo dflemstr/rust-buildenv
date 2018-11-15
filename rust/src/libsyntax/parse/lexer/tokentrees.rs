@@ -11,7 +11,7 @@
 use print::pprust::token_to_string;
 use parse::lexer::StringReader;
 use parse::{token, PResult};
-use tokenstream::{Delimited, TokenStream, TokenTree};
+use tokenstream::{Delimited, DelimSpan, TokenStream, TokenTree};
 
 impl<'a> StringReader<'a> {
     // Parse a stream of tokens into a list of `TokenTree`s, up to an `Eof`.
@@ -44,14 +44,37 @@ impl<'a> StringReader<'a> {
     }
 
     fn parse_token_tree(&mut self) -> PResult<'a, TokenStream> {
+        let sm = self.sess.source_map();
         match self.token {
             token::Eof => {
                 let msg = "this file contains an un-closed delimiter";
                 let mut err = self.sess.span_diagnostic.struct_span_err(self.span, msg);
                 for &(_, sp) in &self.open_braces {
-                    err.span_help(sp, "did you mean to close this delimiter?");
+                    err.span_label(sp, "un-closed delimiter");
                 }
 
+                if let Some((delim, _)) = self.open_braces.last() {
+                    if let Some((_, open_sp, close_sp)) = self.matching_delim_spans.iter()
+                        .filter(|(d, open_sp, close_sp)| {
+
+                        if let Some(close_padding) = sm.span_to_margin(*close_sp) {
+                            if let Some(open_padding) = sm.span_to_margin(*open_sp) {
+                                return delim == d && close_padding != open_padding;
+                            }
+                        }
+                        false
+                        }).next()  // these are in reverse order as they get inserted on close, but
+                    {              // we want the last open/first close
+                        err.span_label(
+                            *open_sp,
+                            "this delimiter might not be properly closed...",
+                        );
+                        err.span_label(
+                            *close_sp,
+                            "...as it matches this but it has different indentation",
+                        );
+                    }
+                }
                 Err(err)
             },
             token::OpenDelim(delim) => {
@@ -68,13 +91,13 @@ impl<'a> StringReader<'a> {
                 let tts = self.parse_token_trees_until_close_delim();
 
                 // Expand to cover the entire delimited token tree
-                let span = pre_span.with_hi(self.span.hi());
+                let delim_span = DelimSpan::from_pair(pre_span, self.span);
 
                 match self.token {
                     // Correct delimiter.
                     token::CloseDelim(d) if d == delim => {
-                        self.open_braces.pop().unwrap();
-
+                        let (open_brace, open_brace_span) = self.open_braces.pop().unwrap();
+                        self.matching_delim_spans.push((open_brace, open_brace_span, self.span));
                         // Parse the close delimiter.
                         self.real_token();
                     }
@@ -94,8 +117,21 @@ impl<'a> StringReader<'a> {
                             // delimiter. The previous unclosed delimiters could actually be
                             // closed! The parser just hasn't gotten to them yet.
                             if let Some(&(_, sp)) = self.open_braces.last() {
-                                err.span_label(sp, "unclosed delimiter");
+                                err.span_label(sp, "un-closed delimiter");
                             };
+                            if let Some(current_padding) = sm.span_to_margin(self.span) {
+                                for (brace, brace_span) in &self.open_braces {
+                                    if let Some(padding) = sm.span_to_margin(*brace_span) {
+                                        // high likelihood of these two corresponding
+                                        if current_padding == padding && brace == &other {
+                                            err.span_label(
+                                                *brace_span,
+                                                "close delimiter possibly meant for this",
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             err.emit();
                         }
                         self.open_braces.pop().unwrap();
@@ -119,7 +155,7 @@ impl<'a> StringReader<'a> {
                     _ => {}
                 }
 
-                Ok(TokenTree::Delimited(span, Delimited {
+                Ok(TokenTree::Delimited(delim_span, Delimited {
                     delim,
                     tts: tts.into(),
                 }).into())

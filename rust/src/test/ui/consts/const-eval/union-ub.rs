@@ -8,6 +8,8 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(const_err)] // make sure we cannot allow away the errors tested here
+
 union DummyUnion {
     u8: u8,
     bool: bool,
@@ -34,12 +36,11 @@ union Bar {
 
 // the value is not valid for bools
 const BAD_BOOL: bool = unsafe { DummyUnion { u8: 42 }.bool};
-//~^ ERROR this constant likely exhibits undefined behavior
+//~^ ERROR it is undefined behavior to use this value
 
 // The value is not valid for any union variant, but that's fine
 // unions are just a convenient way to transmute bits around
 const BAD_UNION: Foo = unsafe { Bar { u8: 42 }.foo };
 
 
-fn main() {
-}
+fn main() {}

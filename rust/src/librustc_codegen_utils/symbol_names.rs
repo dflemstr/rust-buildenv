@@ -79,7 +79,7 @@
 //! - In order to be able to also use symbols from two versions of the same
 //!   crate (which naturally also have the same name), a stronger measure is
 //!   required: The compiler accepts an arbitrary "disambiguator" value via the
-//!   `-C metadata` commandline argument. This disambiguator is then fed into
+//!   `-C metadata` command-line argument. This disambiguator is then fed into
 //!   the symbol hash of every exported item. Consequently, the symbols in two
 //!   identical crates but with different disambiguators are not in conflict
 //!   with each other. This facility is mainly intended to be used by build
@@ -114,6 +114,7 @@ use rustc_mir::monomorphize::Instance;
 use syntax_pos::symbol::Symbol;
 
 use std::fmt::Write;
+use std::mem::discriminant;
 
 pub fn provide(providers: &mut Providers) {
     *providers = Providers {
@@ -219,6 +220,10 @@ fn get_symbol_hash<'a, 'tcx>(
                 .hash_stable(&mut hcx, &mut hasher);
             (&tcx.crate_disambiguator(instantiating_crate)).hash_stable(&mut hcx, &mut hasher);
         }
+
+        // We want to avoid accidental collision between different types of instances.
+        // Especially, VtableShim may overlap with its original instance without this.
+        discriminant(&instance.def).hash_stable(&mut hcx, &mut hasher);
     });
 
     // 64 bits should be enough to avoid collisions.
@@ -228,7 +233,7 @@ fn get_symbol_hash<'a, 'tcx>(
 fn def_symbol_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> ty::SymbolName {
     let mut buffer = SymbolPathBuffer::new();
     item_path::with_forced_absolute_paths(|| {
-        tcx.push_item_path(&mut buffer, def_id);
+        tcx.push_item_path(&mut buffer, def_id, false);
     });
     buffer.into_interned()
 }
@@ -322,7 +327,13 @@ fn compute_symbol_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: Instance
 
     let hash = get_symbol_hash(tcx, def_id, instance, instance_ty, substs);
 
-    SymbolPathBuffer::from_interned(tcx.def_symbol_name(def_id)).finish(hash)
+    let mut buf = SymbolPathBuffer::from_interned(tcx.def_symbol_name(def_id));
+
+    if instance.is_vtable_shim() {
+        buf.push("{{vtable-shim}}");
+    }
+
+    buf.finish(hash)
 }
 
 // Follow C++ namespace-mangling style, see
@@ -338,6 +349,7 @@ fn compute_symbol_name<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, instance: Instance
 //
 // To be able to work on all platforms and get *some* reasonable output, we
 // use C++ name-mangling.
+#[derive(Debug)]
 struct SymbolPathBuffer {
     result: String,
     temp_buf: String,

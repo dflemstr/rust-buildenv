@@ -26,7 +26,6 @@ use rustc::ty::{self, TyCtxt};
 use rustc::ty::query::Providers;
 use rustc::hir::def_id::{CrateNum, DefId, LOCAL_CRATE, CRATE_DEF_INDEX};
 use rustc::hir::map::{DefKey, DefPath, DefPathHash};
-use rustc::hir::map::blocks::FnLikeNode;
 use rustc::hir::map::definitions::DefPathTable;
 use rustc::util::nodemap::DefIdMap;
 use rustc_data_structures::svh::Svh;
@@ -42,8 +41,7 @@ use syntax::edition::Edition;
 use syntax::parse::source_file_to_stream;
 use syntax::symbol::Symbol;
 use syntax_pos::{Span, NO_EXPANSION, FileName};
-use rustc_data_structures::indexed_set::IdxSet;
-use rustc::hir;
+use rustc_data_structures::bit_set::BitSet;
 
 macro_rules! provide {
     (<$lt:tt> $tcx:ident, $def_id:ident, $other:ident, $cdata:ident,
@@ -70,7 +68,7 @@ macro_rules! provide {
 
                 let $cdata = $tcx.crate_data_as_rc_any($def_id.krate);
                 let $cdata = $cdata.downcast_ref::<cstore::CrateMetadata>()
-                    .expect("CrateStore crated ata is not a CrateMetadata");
+                    .expect("CrateStore created data is not a CrateMetadata");
                 $compute
             })*
 
@@ -105,9 +103,9 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     generics_of => {
         tcx.alloc_generics(cdata.get_generics(def_id.index, tcx.sess))
     }
-    predicates_of => { cdata.get_predicates(def_id.index, tcx) }
-    predicates_defined_on => { cdata.get_predicates_defined_on(def_id.index, tcx) }
-    super_predicates_of => { cdata.get_super_predicates(def_id.index, tcx) }
+    predicates_of => { Lrc::new(cdata.get_predicates(def_id.index, tcx)) }
+    predicates_defined_on => { Lrc::new(cdata.get_predicates_defined_on(def_id.index, tcx)) }
+    super_predicates_of => { Lrc::new(cdata.get_super_predicates(def_id.index, tcx)) }
     trait_def => {
         tcx.alloc_trait_def(cdata.get_trait_def(def_id.index, tcx.sess))
     }
@@ -141,11 +139,11 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         mir
     }
     mir_const_qualif => {
-        (cdata.mir_const_qualif(def_id.index), Lrc::new(IdxSet::new_empty(0)))
+        (cdata.mir_const_qualif(def_id.index), Lrc::new(BitSet::new_empty(0)))
     }
     fn_sig => { cdata.fn_sig(def_id.index, tcx) }
     inherent_impls => { Lrc::new(cdata.get_inherent_implementations_for_type(def_id.index)) }
-    is_const_fn => { cdata.is_const_fn(def_id.index) }
+    is_const_fn_raw => { cdata.is_const_fn_raw(def_id.index) }
     is_foreign_item => { cdata.is_foreign_item(def_id.index) }
     describe_def => { cdata.get_def(def_id.index) }
     def_span => { cdata.get_span(def_id.index, &tcx.sess) }
@@ -173,6 +171,7 @@ provide! { <'tcx> tcx, def_id, other, cdata,
     is_panic_runtime => { cdata.root.panic_runtime }
     is_compiler_builtins => { cdata.root.compiler_builtins }
     has_global_allocator => { cdata.root.has_global_allocator }
+    has_panic_handler => { cdata.root.has_panic_handler }
     is_sanitizer_runtime => { cdata.root.sanitizer_runtime }
     is_profiler_runtime => { cdata.root.profiler_runtime }
     panic_strategy => { cdata.root.panic_strategy }
@@ -258,33 +257,15 @@ provide! { <'tcx> tcx, def_id, other, cdata,
         let cnum = cdata.cnum;
         assert!(cnum != LOCAL_CRATE);
 
-        // If this crate is a custom derive crate, then we're not even going to
-        // link those in so we skip those crates.
-        if cdata.root.macro_derive_registrar.is_some() {
-            return Arc::new(Vec::new())
-        }
-
         Arc::new(cdata.exported_symbols(tcx))
     }
 }
 
 pub fn provide<'tcx>(providers: &mut Providers<'tcx>) {
-    fn is_const_fn<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> bool {
-        let node_id = tcx.hir.as_local_node_id(def_id)
-                             .expect("Non-local call to local provider is_const_fn");
-
-        if let Some(fn_like) = FnLikeNode::from_node(tcx.hir.get(node_id)) {
-            fn_like.constness() == hir::Constness::Const
-        } else {
-            false
-        }
-    }
-
     // FIXME(#44234) - almost all of these queries have no sub-queries and
     // therefore no actual inputs, they're just reading tables calculated in
     // resolve! Does this work? Unsure! That's what the issue is about
     *providers = Providers {
-        is_const_fn,
         is_dllimport_foreign_item: |tcx, id| {
             tcx.native_library_kind(id) == Some(NativeLibraryKind::NativeUnknown)
         },
@@ -446,8 +427,7 @@ impl cstore::CStore {
         let data = self.get_crate_data(id.krate);
         if let Some(ref proc_macros) = data.proc_macros {
             return LoadedMacro::ProcMacro(proc_macros[id.index.to_proc_macro_index()].1.clone());
-        } else if data.name == "proc_macro" &&
-                  self.get_crate_data(id.krate).item_name(id.index) == "quote" {
+        } else if data.name == "proc_macro" && data.item_name(id.index) == "quote" {
             use syntax::ext::base::SyntaxExtension;
             use syntax_ext::proc_macro_impl::BangProcMacro;
 
@@ -459,8 +439,9 @@ impl cstore::CStore {
             return LoadedMacro::ProcMacro(Lrc::new(ext));
         }
 
-        let (name, def) = data.get_macro(id.index);
-        let source_name = FileName::Macros(name.to_string());
+        let def = data.get_macro(id.index);
+        let macro_full_name = data.def_path(id.index).to_string_friendly(|_| data.imported_name);
+        let source_name = FileName::Macros(macro_full_name);
 
         let source_file = sess.parse_sess.source_map().new_source_file(source_name, def.body);
         let local_span = Span::new(source_file.start_pos, source_file.end_pos, NO_EXPANSION);

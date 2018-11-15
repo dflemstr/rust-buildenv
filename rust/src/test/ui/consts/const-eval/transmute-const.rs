@@ -13,7 +13,6 @@
 use std::mem;
 
 static FOO: bool = unsafe { mem::transmute(3u8) };
-//~^ ERROR this static likely exhibits undefined behavior
-//~^^ type validation failed: encountered 3, but expected something in the range 0..=1
+//~^ ERROR it is undefined behavior to use this value
 
 fn main() {}

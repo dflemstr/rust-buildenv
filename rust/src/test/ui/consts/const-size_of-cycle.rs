@@ -8,9 +8,9 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+// ignore-musl
+// ignore-x86
 // error-pattern: cycle detected
-
-#![feature(const_fn)]
 
 struct Foo {
     bytes: [u8; std::mem::size_of::<Foo>()]

@@ -62,7 +62,7 @@ impl<'a, 'gcx, 'tcx> TypeFreshener<'a, 'gcx, 'tcx> {
         TypeFreshener {
             infcx,
             freshen_count: 0,
-            freshen_map: FxHashMap(),
+            freshen_map: Default::default(),
         }
     }
 
@@ -107,14 +107,13 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::ReFree(_) |
             ty::ReScope(_) |
             ty::ReVar(_) |
-            ty::ReSkolemized(..) |
+            ty::RePlaceholder(..) |
             ty::ReEmpty |
             ty::ReErased => {
                 // replace all free regions with 'erased
                 self.tcx().types.re_erased
             }
 
-            ty::ReCanonical(..) |
             ty::ReClosureBound(..) => {
                 bug!(
                     "encountered unexpected region: {:?}",
@@ -171,8 +170,8 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
                 t
             }
 
-            ty::Infer(ty::CanonicalTy(..)) =>
-                bug!("encountered canonical ty during freshening"),
+            ty::Bound(..) =>
+                bug!("encountered bound ty during freshening"),
 
             ty::Generator(..) |
             ty::Bool |
@@ -193,11 +192,12 @@ impl<'a, 'gcx, 'tcx> TypeFolder<'gcx, 'tcx> for TypeFreshener<'a, 'gcx, 'tcx> {
             ty::Never |
             ty::Tuple(..) |
             ty::Projection(..) |
+            ty::UnnormalizedProjection(..) |
             ty::Foreign(..) |
             ty::Param(..) |
             ty::Closure(..) |
             ty::GeneratorWitness(..) |
-            ty::Anon(..) => {
+            ty::Opaque(..) => {
                 t.super_fold_with(self)
             }
         }

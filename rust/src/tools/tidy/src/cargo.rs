@@ -65,9 +65,8 @@ fn verify(tomlfile: &Path, libfile: &Path, bad: &mut bool) {
         Some(i) => &toml[i+1..],
         None => return,
     };
-    let mut lines = deps.lines().peekable();
-    while let Some(line) = lines.next() {
-        if line.starts_with("[") {
+    for line in deps.lines() {
+        if line.starts_with('[') {
             break
         }
 
@@ -85,8 +84,7 @@ fn verify(tomlfile: &Path, libfile: &Path, bad: &mut bool) {
 
         // This is intentional, this dependency just makes the crate available
         // for others later on. Cover cases
-        let whitelisted = krate == "alloc_jemalloc";
-        let whitelisted = whitelisted || krate.starts_with("panic");
+        let whitelisted = krate.starts_with("panic");
         if toml.contains("name = \"std\"") && whitelisted {
             continue
         }

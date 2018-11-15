@@ -31,7 +31,6 @@ use channel;
 use util::{libdir, is_dylib, exe};
 use builder::{Builder, RunConfig, ShouldRun, Step};
 use compile;
-use native;
 use tool::{self, Tool};
 use cache::{INTERNER, Interned};
 use time;
@@ -65,6 +64,14 @@ pub fn tmpdir(builder: &Builder) -> PathBuf {
 
 fn rust_installer(builder: &Builder) -> Command {
     builder.tool_cmd(Tool::RustInstaller)
+}
+
+fn missing_tool(tool_name: &str, skip: bool) {
+    if skip {
+        println!("Unable to build {}, skipping dist", tool_name)
+    } else {
+        panic!("Unable to build {}", tool_name)
+    }
 }
 
 #[derive(Debug, PartialOrd, Ord, Copy, Clone, Hash, PartialEq, Eq)]
@@ -852,8 +859,6 @@ impl Step for Src {
             "src/build_helper",
             "src/dlmalloc",
             "src/liballoc",
-            "src/liballoc_jemalloc",
-            "src/liballoc_system",
             "src/libbacktrace",
             "src/libcompiler_builtins",
             "src/libcore",
@@ -871,13 +876,12 @@ impl Step for Src {
             "src/rustc/dlmalloc_shim",
             "src/libtest",
             "src/libterm",
-            "src/jemalloc",
             "src/libprofiler_builtins",
             "src/stdsimd",
+            "src/libproc_macro",
         ];
         let std_src_dirs_exclude = [
             "src/libcompiler_builtins/compiler-rt/test",
-            "src/jemalloc/test/unit",
         ];
 
         copy_src_dirs(builder, &std_src_dirs[..], &std_src_dirs_exclude[..], &dst_src);
@@ -904,7 +908,7 @@ impl Step for Src {
     }
 }
 
-const CARGO_VENDOR_VERSION: &str = "0.1.4";
+const CARGO_VENDOR_VERSION: &str = "0.1.19";
 
 #[derive(Debug, PartialOrd, Ord, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct PlainSourceTarball;
@@ -982,12 +986,6 @@ impl Step for PlainSourceTarball {
                    .arg("--debug")
                    .arg("--vers").arg(CARGO_VENDOR_VERSION)
                    .arg("cargo-vendor");
-                if let Some(dir) = builder.openssl_install_dir(builder.config.build) {
-                    builder.ensure(native::Openssl {
-                        target: builder.config.build,
-                    });
-                    cmd.env("OPENSSL_DIR", dir);
-                }
                 builder.run(&mut cmd);
             }
 
@@ -1166,7 +1164,7 @@ impl Step for Rls {
         let rls = builder.ensure(tool::Rls {
             compiler: builder.compiler(stage, builder.config.build),
             target, extra_features: Vec::new()
-        }).or_else(|| { println!("Unable to build RLS, skipping dist"); None })?;
+        }).or_else(|| { missing_tool("RLS", builder.build.config.missing_tools); None })?;
 
         builder.install(&rls, &image.join("bin"), 0o755);
         let doc = image.join("share/doc/rls");
@@ -1245,24 +1243,26 @@ impl Step for Clippy {
         let clippy = builder.ensure(tool::Clippy {
             compiler: builder.compiler(stage, builder.config.build),
             target, extra_features: Vec::new()
-        }).or_else(|| { println!("Unable to build clippy, skipping dist"); None })?;
+        }).or_else(|| { missing_tool("clippy", builder.build.config.missing_tools); None })?;
         let cargoclippy = builder.ensure(tool::CargoClippy {
             compiler: builder.compiler(stage, builder.config.build),
             target, extra_features: Vec::new()
-        }).or_else(|| { println!("Unable to build cargo clippy, skipping dist"); None })?;
+        }).or_else(|| { missing_tool("cargo clippy", builder.build.config.missing_tools); None })?;
 
         builder.install(&clippy, &image.join("bin"), 0o755);
         builder.install(&cargoclippy, &image.join("bin"), 0o755);
         let doc = image.join("share/doc/clippy");
         builder.install(&src.join("README.md"), &doc, 0o644);
-        builder.install(&src.join("LICENSE"), &doc, 0o644);
+        builder.install(&src.join("LICENSE-APACHE"), &doc, 0o644);
+        builder.install(&src.join("LICENSE-MIT"), &doc, 0o644);
 
         // Prepare the overlay
         let overlay = tmp.join("clippy-overlay");
         drop(fs::remove_dir_all(&overlay));
         t!(fs::create_dir_all(&overlay));
         builder.install(&src.join("README.md"), &overlay, 0o644);
-        builder.install(&src.join("LICENSE"), &doc, 0o644);
+        builder.install(&src.join("LICENSE-APACHE"), &doc, 0o644);
+        builder.install(&src.join("LICENSE-MIT"), &doc, 0o644);
         builder.create(&overlay.join("version"), &version);
 
         // Generate the installer tarball
@@ -1324,11 +1324,11 @@ impl Step for Rustfmt {
         let rustfmt = builder.ensure(tool::Rustfmt {
             compiler: builder.compiler(stage, builder.config.build),
             target, extra_features: Vec::new()
-        }).or_else(|| { println!("Unable to build Rustfmt, skipping dist"); None })?;
+        }).or_else(|| { missing_tool("Rustfmt", builder.build.config.missing_tools); None })?;
         let cargofmt = builder.ensure(tool::Cargofmt {
             compiler: builder.compiler(stage, builder.config.build),
             target, extra_features: Vec::new()
-        }).or_else(|| { println!("Unable to build Cargofmt, skipping dist"); None })?;
+        }).or_else(|| { missing_tool("Cargofmt", builder.build.config.missing_tools); None })?;
 
         builder.install(&rustfmt, &image.join("bin"), 0o755);
         builder.install(&cargofmt, &image.join("bin"), 0o755);
@@ -1444,8 +1444,8 @@ impl Step for Extended {
         tarballs.extend(rls_installer.clone());
         tarballs.extend(clippy_installer.clone());
         tarballs.extend(rustfmt_installer.clone());
-        tarballs.extend(llvm_tools_installer.clone());
-        tarballs.extend(lldb_installer.clone());
+        tarballs.extend(llvm_tools_installer);
+        tarballs.extend(lldb_installer);
         tarballs.push(analysis_installer);
         tarballs.push(std_installer);
         if builder.config.docs {
@@ -1902,6 +1902,16 @@ fn maybe_install_llvm_dylib(builder: &Builder,
     let src_libdir = builder
         .llvm_out(target)
         .join("lib");
+    let dst_libdir = image.join("lib/rustlib").join(&*target).join("lib");
+    t!(fs::create_dir_all(&dst_libdir));
+
+    if target.contains("apple-darwin") {
+        let llvm_dylib_path = src_libdir.join("libLLVM.dylib");
+        if llvm_dylib_path.exists() {
+            builder.install(&llvm_dylib_path, &dst_libdir, 0o644);
+        }
+        return
+    }
 
     // Usually libLLVM.so is a symlink to something like libLLVM-6.0.so.
     // Since tools link to the latter rather than the former, we have to
@@ -1913,8 +1923,6 @@ fn maybe_install_llvm_dylib(builder: &Builder,
                    llvm_dylib_path.display(), e);
         });
 
-        let dst_libdir = image.join("lib");
-        t!(fs::create_dir_all(&dst_libdir));
 
         builder.install(&llvm_dylib_path, &dst_libdir, 0o644);
     }
@@ -1967,7 +1975,9 @@ impl Step for LlvmTools {
         let src_bindir = builder
             .llvm_out(target)
             .join("bin");
-        let dst_bindir = image.join("bin");
+        let dst_bindir = image.join("lib/rustlib")
+            .join(&*target)
+            .join("bin");
         t!(fs::create_dir_all(&dst_bindir));
         for tool in LLVM_TOOLS {
             let exe = src_bindir.join(exe(tool, &target));
@@ -2046,7 +2056,8 @@ impl Step for Lldb {
         drop(fs::remove_dir_all(&image));
 
         // Prepare the image directory
-        let dst = image.join("bin");
+        let root = image.join("lib/rustlib").join(&*target);
+        let dst = root.join("bin");
         t!(fs::create_dir_all(&dst));
         for program in &["lldb", "lldb-argdumper", "lldb-mi", "lldb-server"] {
             let exe = bindir.join(exe(program, &target));
@@ -2055,7 +2066,7 @@ impl Step for Lldb {
 
         // The libraries.
         let libdir = builder.llvm_out(target).join("lib");
-        let dst = image.join("lib");
+        let dst = root.join("lib");
         t!(fs::create_dir_all(&dst));
         for entry in t!(fs::read_dir(&libdir)) {
             let entry = entry.unwrap();
@@ -2083,7 +2094,7 @@ impl Step for Lldb {
             let entry = t!(entry);
             if let Ok(name) = entry.file_name().into_string() {
                 if name.starts_with("python") {
-                    let dst = image.join(libdir_name)
+                    let dst = root.join(libdir_name)
                         .join(entry.file_name());
                     t!(fs::create_dir_all(&dst));
                     builder.cp_r(&entry.path(), &dst);

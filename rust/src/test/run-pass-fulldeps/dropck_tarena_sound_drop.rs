@@ -8,6 +8,7 @@
 // option. This file may not be copied, modified, or distributed
 // except according to those terms.
 
+#![allow(unknown_lints)]
 // Check that an arena (TypedArena) can carry elements whose drop
 // methods might access borrowed data, as long as the borrowed data
 // has lifetime that strictly outlives the arena itself.
@@ -30,7 +31,7 @@ struct CheckId<T:HasId> { v: T }
 // In the code below, the impl of HasId for `&'a usize` does not
 // actually access the borrowed data, but the point is that the
 // interface to CheckId does not (and cannot) know that, and therefore
-// when encountering the a value V of type CheckId<S>, we must
+// when encountering a value V of type CheckId<S>, we must
 // conservatively force the type S to strictly outlive V.
 impl<T:HasId> Drop for CheckId<T> {
     fn drop(&mut self) {
@@ -45,6 +46,6 @@ impl<'a> HasId for &'a usize { fn count(&self) -> usize { 1 } }
 fn f<'a, 'b>(_arena: &'a TypedArena<C<'b>>) {}
 
 fn main() {
-    let arena: TypedArena<C> = TypedArena::new();
+    let arena: TypedArena<C> = TypedArena::default();
     f(&arena);
 }

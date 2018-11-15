@@ -16,6 +16,8 @@ use spec::Target;
 use std::{cmp, fmt};
 use std::ops::{Add, Deref, Sub, Mul, AddAssign, Range, RangeInclusive};
 
+use rustc_data_structures::indexed_vec::{Idx, IndexVec};
+
 pub mod call;
 
 /// Parsed [Data layout](http://llvm.org/docs/LangRef.html#data-layout)
@@ -35,7 +37,8 @@ pub struct TargetDataLayout {
     pub aggregate_align: Align,
 
     /// Alignments for vector types.
-    pub vector_align: Vec<(Size, Align)>
+    pub vector_align: Vec<(Size, Align)>,
+    pub instruction_address_space: u32,
 }
 
 impl Default for TargetDataLayout {
@@ -57,13 +60,22 @@ impl Default for TargetDataLayout {
             vector_align: vec![
                 (Size::from_bits(64), Align::from_bits(64, 64).unwrap()),
                 (Size::from_bits(128), Align::from_bits(128, 128).unwrap())
-            ]
+            ],
+            instruction_address_space: 0,
         }
     }
 }
 
 impl TargetDataLayout {
     pub fn parse(target: &Target) -> Result<TargetDataLayout, String> {
+        // Parse an address space index from a string.
+        let parse_address_space = |s: &str, cause: &str| {
+            s.parse::<u32>().map_err(|err| {
+                format!("invalid address space `{}` for `{}` in \"data-layout\": {}",
+                        s, cause, err)
+            })
+        };
+
         // Parse a bit count from a string.
         let parse_bits = |s: &str, kind: &str, cause: &str| {
             s.parse::<u64>().map_err(|err| {
@@ -96,6 +108,9 @@ impl TargetDataLayout {
             match spec.split(':').collect::<Vec<_>>()[..] {
                 ["e"] => dl.endian = Endian::Little,
                 ["E"] => dl.endian = Endian::Big,
+                [p] if p.starts_with("P") => {
+                    dl.instruction_address_space = parse_address_space(&p[1..], "P")?
+                }
                 ["a", ref a..] => dl.aggregate_align = align(a, "a")?,
                 ["f32", ref a..] => dl.f32_align = align(a, "f32")?,
                 ["f64", ref a..] => dl.f64_align = align(a, "f64")?,
@@ -203,11 +218,11 @@ impl TargetDataLayout {
     }
 }
 
-pub trait HasDataLayout: Copy {
+pub trait HasDataLayout {
     fn data_layout(&self) -> &TargetDataLayout;
 }
 
-impl<'a> HasDataLayout for &'a TargetDataLayout {
+impl HasDataLayout for TargetDataLayout {
     fn data_layout(&self) -> &TargetDataLayout {
         self
     }
@@ -267,7 +282,7 @@ impl Size {
     }
 
     #[inline]
-    pub fn checked_add<C: HasDataLayout>(self, offset: Size, cx: C) -> Option<Size> {
+    pub fn checked_add<C: HasDataLayout>(self, offset: Size, cx: &C) -> Option<Size> {
         let dl = cx.data_layout();
 
         let bytes = self.bytes().checked_add(offset.bytes())?;
@@ -280,7 +295,7 @@ impl Size {
     }
 
     #[inline]
-    pub fn checked_mul<C: HasDataLayout>(self, count: u64, cx: C) -> Option<Size> {
+    pub fn checked_mul<C: HasDataLayout>(self, count: u64, cx: &C) -> Option<Size> {
         let dl = cx.data_layout();
 
         let bytes = self.bytes().checked_mul(count)?;
@@ -416,6 +431,24 @@ impl Align {
             pref_pow2: cmp::max(self.pref_pow2, other.pref_pow2),
         }
     }
+
+    /// Compute the best alignment possible for the given offset
+    /// (the largest power of two that the offset is a multiple of).
+    ///
+    /// NB: for an offset of `0`, this happens to return `2^64`.
+    pub fn max_for_offset(offset: Size) -> Align {
+        let pow2 = offset.bytes().trailing_zeros() as u8;
+        Align {
+            abi_pow2: pow2,
+            pref_pow2: pow2,
+        }
+    }
+
+    /// Lower the alignment, if necessary, such that the given offset
+    /// is aligned to it (the offset is a multiple of the alignment).
+    pub fn restrict_for_offset(self, offset: Size) -> Align {
+        self.min(Align::max_for_offset(offset))
+    }
 }
 
 /// Integers, also used for enum discriminants.
@@ -439,7 +472,7 @@ impl Integer {
         }
     }
 
-    pub fn align<C: HasDataLayout>(self, cx: C) -> Align {
+    pub fn align<C: HasDataLayout>(self, cx: &C) -> Align {
         let dl = cx.data_layout();
 
         match self {
@@ -474,7 +507,7 @@ impl Integer {
     }
 
     /// Find the smallest integer with the given alignment.
-    pub fn for_abi_align<C: HasDataLayout>(cx: C, align: Align) -> Option<Integer> {
+    pub fn for_abi_align<C: HasDataLayout>(cx: &C, align: Align) -> Option<Integer> {
         let dl = cx.data_layout();
 
         let wanted = align.abi();
@@ -487,7 +520,7 @@ impl Integer {
     }
 
     /// Find the largest integer with the given alignment or less.
-    pub fn approximate_abi_align<C: HasDataLayout>(cx: C, align: Align) -> Integer {
+    pub fn approximate_abi_align<C: HasDataLayout>(cx: &C, align: Align) -> Integer {
         let dl = cx.data_layout();
 
         let wanted = align.abi();
@@ -553,7 +586,7 @@ pub enum Primitive {
 }
 
 impl<'a, 'tcx> Primitive {
-    pub fn size<C: HasDataLayout>(self, cx: C) -> Size {
+    pub fn size<C: HasDataLayout>(self, cx: &C) -> Size {
         let dl = cx.data_layout();
 
         match self {
@@ -564,7 +597,7 @@ impl<'a, 'tcx> Primitive {
         }
     }
 
-    pub fn align<C: HasDataLayout>(self, cx: C) -> Align {
+    pub fn align<C: HasDataLayout>(self, cx: &C) -> Align {
         let dl = cx.data_layout();
 
         match self {
@@ -624,7 +657,7 @@ impl Scalar {
     /// Returns the valid range as a `x..y` range.
     ///
     /// If `x` and `y` are equal, the range is full, not empty.
-    pub fn valid_range_exclusive<C: HasDataLayout>(&self, cx: C) -> Range<u128> {
+    pub fn valid_range_exclusive<C: HasDataLayout>(&self, cx: &C) -> Range<u128> {
         // For a (max) value of -1, max will be `-1 as usize`, which overflows.
         // However, that is fine here (it would still represent the full range),
         // i.e., if the range is everything.
@@ -784,13 +817,25 @@ impl Abi {
             _ => false,
         }
     }
+
+    /// Returns true if this is an uninhabited type
+    pub fn is_uninhabited(&self) -> bool {
+        match *self {
+            Abi::Uninhabited => true,
+            _ => false,
+        }
+    }
+}
+
+newtype_index! {
+    pub struct VariantIdx { .. }
 }
 
 #[derive(PartialEq, Eq, Hash, Debug)]
 pub enum Variants {
     /// Single enum variants, structs/tuples, unions, and all non-ADTs.
     Single {
-        index: usize
+        index: VariantIdx,
     },
 
     /// General-case enums: for each case there is a struct, and they all have
@@ -798,7 +843,7 @@ pub enum Variants {
     /// at a non-0 offset, after where the tag would go.
     Tagged {
         tag: Scalar,
-        variants: Vec<LayoutDetails>,
+        variants: IndexVec<VariantIdx, LayoutDetails>,
     },
 
     /// Multiple cases distinguished by a niche (values invalid for a type):
@@ -810,11 +855,11 @@ pub enum Variants {
     /// `None` has a null pointer for the second tuple field, and
     /// `Some` is the identity function (with a non-null reference).
     NicheFilling {
-        dataful_variant: usize,
-        niche_variants: RangeInclusive<usize>,
+        dataful_variant: VariantIdx,
+        niche_variants: RangeInclusive<VariantIdx>,
         niche: Scalar,
         niche_start: u128,
-        variants: Vec<LayoutDetails>,
+        variants: IndexVec<VariantIdx, LayoutDetails>,
     }
 }
 
@@ -828,11 +873,11 @@ pub struct LayoutDetails {
 }
 
 impl LayoutDetails {
-    pub fn scalar<C: HasDataLayout>(cx: C, scalar: Scalar) -> Self {
+    pub fn scalar<C: HasDataLayout>(cx: &C, scalar: Scalar) -> Self {
         let size = scalar.value.size(cx);
         let align = scalar.value.align(cx);
         LayoutDetails {
-            variants: Variants::Single { index: 0 },
+            variants: Variants::Single { index: VariantIdx::new(0) },
             fields: FieldPlacement::Union(0),
             abi: Abi::Scalar(scalar),
             size,
@@ -848,7 +893,7 @@ impl LayoutDetails {
 /// to those obtained from `layout_of(ty)`, as we need to produce
 /// layouts for which Rust types do not exist, such as enum variants
 /// or synthetic fields of enums (i.e. discriminants) and fat pointers.
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TyLayout<'a, Ty> {
     pub ty: Ty,
     pub details: &'a LayoutDetails
@@ -865,20 +910,24 @@ pub trait LayoutOf {
     type Ty;
     type TyLayout;
 
-    fn layout_of(self, ty: Self::Ty) -> Self::TyLayout;
+    fn layout_of(&self, ty: Self::Ty) -> Self::TyLayout;
 }
 
 pub trait TyLayoutMethods<'a, C: LayoutOf<Ty = Self>>: Sized {
-    fn for_variant(this: TyLayout<'a, Self>, cx: C, variant_index: usize) -> TyLayout<'a, Self>;
-    fn field(this: TyLayout<'a, Self>, cx: C, i: usize) -> C::TyLayout;
+    fn for_variant(
+        this: TyLayout<'a, Self>,
+        cx: &C,
+        variant_index: VariantIdx,
+    ) -> TyLayout<'a, Self>;
+    fn field(this: TyLayout<'a, Self>, cx: &C, i: usize) -> C::TyLayout;
 }
 
 impl<'a, Ty> TyLayout<'a, Ty> {
-    pub fn for_variant<C>(self, cx: C, variant_index: usize) -> Self
+    pub fn for_variant<C>(self, cx: &C, variant_index: VariantIdx) -> Self
     where Ty: TyLayoutMethods<'a, C>, C: LayoutOf<Ty = Ty> {
         Ty::for_variant(self, cx, variant_index)
     }
-    pub fn field<C>(self, cx: C, i: usize) -> C::TyLayout
+    pub fn field<C>(self, cx: &C, i: usize) -> C::TyLayout
     where Ty: TyLayoutMethods<'a, C>, C: LayoutOf<Ty = Ty> {
         Ty::field(self, cx, i)
     }

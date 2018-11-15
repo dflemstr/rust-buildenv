@@ -19,7 +19,7 @@ use rustc::hir::Node;
 use rustc::hir::def_id::DefId;
 use rustc::lint::builtin::{SAFE_EXTERN_STATICS, SAFE_PACKED_BORROWS, UNUSED_UNSAFE};
 use rustc::mir::*;
-use rustc::mir::visit::{PlaceContext, Visitor};
+use rustc::mir::visit::{PlaceContext, Visitor, MutatingUseContext};
 
 use syntax::ast;
 use syntax::symbol::Symbol;
@@ -28,6 +28,7 @@ use util;
 
 pub struct UnsafetyChecker<'a, 'tcx: 'a> {
     mir: &'a Mir<'tcx>,
+    min_const_fn: bool,
     source_scope_local_data: &'a IndexVec<SourceScope, SourceScopeLocalData>,
     violations: Vec<UnsafetyViolation>,
     source_info: SourceInfo,
@@ -38,12 +39,16 @@ pub struct UnsafetyChecker<'a, 'tcx: 'a> {
 }
 
 impl<'a, 'gcx, 'tcx> UnsafetyChecker<'a, 'tcx> {
-    fn new(mir: &'a Mir<'tcx>,
-           source_scope_local_data: &'a IndexVec<SourceScope, SourceScopeLocalData>,
-           tcx: TyCtxt<'a, 'tcx, 'tcx>,
-           param_env: ty::ParamEnv<'tcx>) -> Self {
+    fn new(
+        min_const_fn: bool,
+        mir: &'a Mir<'tcx>,
+        source_scope_local_data: &'a IndexVec<SourceScope, SourceScopeLocalData>,
+        tcx: TyCtxt<'a, 'tcx, 'tcx>,
+        param_env: ty::ParamEnv<'tcx>,
+    ) -> Self {
         Self {
             mir,
+            min_const_fn,
             source_scope_local_data,
             violations: vec![],
             source_info: SourceInfo {
@@ -52,7 +57,7 @@ impl<'a, 'gcx, 'tcx> UnsafetyChecker<'a, 'tcx> {
             },
             tcx,
             param_env,
-            used_unsafe: FxHashSet(),
+            used_unsafe: Default::default(),
             inherited_blocks: vec![],
         }
     }
@@ -103,13 +108,14 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
         self.source_info = statement.source_info;
         match statement.kind {
             StatementKind::Assign(..) |
-            StatementKind::ReadForMatch(..) |
+            StatementKind::FakeRead(..) |
             StatementKind::SetDiscriminant { .. } |
             StatementKind::StorageLive(..) |
             StatementKind::StorageDead(..) |
             StatementKind::EndRegion(..) |
-            StatementKind::Validate(..) |
-            StatementKind::UserAssertTy(..) |
+            StatementKind::Retag { .. } |
+            StatementKind::EscapeToRaw { .. } |
+            StatementKind::AscribeUserType(..) |
             StatementKind::Nop => {
                 // safe (at least as emitted during MIR construction)
             }
@@ -147,7 +153,7 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
                     place: &Place<'tcx>,
                     context: PlaceContext<'tcx>,
                     location: Location) {
-        if let PlaceContext::Borrow { .. } = context {
+        if context.is_borrow() {
             if util::is_disaligned(self.tcx, self.mir, self.param_env, place) {
                 let source_info = self.source_info;
                 let lint_root =
@@ -188,9 +194,11 @@ impl<'a, 'tcx> Visitor<'tcx> for UnsafetyChecker<'a, 'tcx> {
                     }
                     ty::Adt(adt, _) => {
                         if adt.is_union() {
-                            if context == PlaceContext::Store ||
-                                context == PlaceContext::AsmOutput ||
-                                context == PlaceContext::Drop
+                            if context == PlaceContext::MutatingUse(MutatingUseContext::Store) ||
+                                context == PlaceContext::MutatingUse(MutatingUseContext::Drop) ||
+                                context == PlaceContext::MutatingUse(
+                                    MutatingUseContext::AsmOutput
+                                )
                             {
                                 let elem_ty = match elem {
                                     &ProjectionElem::Field(_, ty) => ty,
@@ -269,6 +277,15 @@ impl<'a, 'tcx> UnsafetyChecker<'a, 'tcx> {
     fn register_violations(&mut self,
                            violations: &[UnsafetyViolation],
                            unsafe_blocks: &[(ast::NodeId, bool)]) {
+        if self.min_const_fn {
+            for violation in violations {
+                let mut violation = violation.clone();
+                violation.kind = UnsafetyViolationKind::MinConstFn;
+                if !self.violations.contains(&violation) {
+                    self.violations.push(violation)
+                }
+            }
+        }
         let within_unsafe = match self.source_scope_local_data[self.source_info.scope].safety {
             Safety::Safe => {
                 for violation in violations {
@@ -276,7 +293,6 @@ impl<'a, 'tcx> UnsafetyChecker<'a, 'tcx> {
                         self.violations.push(violation.clone())
                     }
                 }
-
                 false
             }
             Safety::BuiltinUnsafe | Safety::FnUnsafe => true,
@@ -369,6 +385,7 @@ fn unsafety_check_result<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId)
 
     let param_env = tcx.param_env(def_id);
     let mut checker = UnsafetyChecker::new(
+        tcx.is_const_fn(def_id) && tcx.is_min_const_fn(def_id),
         mir, source_scope_local_data, tcx, param_env);
     checker.visit_mir(mir);
 
@@ -474,6 +491,15 @@ pub fn check_unsafety<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) {
                 struct_span_err!(
                     tcx.sess, source_info.span, E0133,
                     "{} is unsafe and requires unsafe function or block", description)
+                    .span_label(source_info.span, &description.as_str()[..])
+                    .note(&details.as_str()[..])
+                    .emit();
+            }
+            UnsafetyViolationKind::MinConstFn => {
+                tcx.sess.struct_span_err(
+                    source_info.span,
+                    &format!("{} is unsafe and unsafe operations \
+                            are not allowed in const fn", description))
                     .span_label(source_info.span, &description.as_str()[..])
                     .note(&details.as_str()[..])
                     .emit();

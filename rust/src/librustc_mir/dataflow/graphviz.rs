@@ -12,11 +12,8 @@
 
 use syntax::ast::NodeId;
 use rustc::mir::{BasicBlock, Mir};
-use rustc_data_structures::bitslice::bits_to_string;
-use rustc_data_structures::indexed_vec::Idx;
 
 use dot;
-use dot::IntoCow;
 
 use std::fs;
 use std::io;
@@ -218,13 +215,12 @@ where MWF: MirWithFlowState<'tcx>,
         let i = n.index();
 
         let flow = self.mbcx.flow_state();
-        let bits_per_block = flow.sets.bits_per_block();
 
         write!(w, "<tr>")?;
 
         // Entry
         let set = flow.sets.on_entry_set_for(i);
-        write!(w, "<td>{:?}</td>", dot::escape_html(&bits_to_string(set.words(), bits_per_block)))?;
+        write!(w, "<td>{:?}</td>", dot::escape_html(&set.to_string()))?;
 
         // Terminator
         write!(w, "<td>")?;
@@ -260,20 +256,17 @@ impl<'a, 'tcx, MWF, P> dot::GraphWalk<'a> for Graph<'a, 'tcx, MWF, P>
             .basic_blocks()
             .indices()
             .collect::<Vec<_>>()
-            .into_cow()
+            .into()
     }
 
     fn edges(&self) -> dot::Edges<Edge> {
         let mir = self.mbcx.mir();
-        // base initial capacity on assumption every block has at
-        // least one outgoing edge (Which should be true for all
-        // blocks but one, the exit-block).
-        let mut edges = Vec::with_capacity(mir.basic_blocks().len());
-        for bb in mir.basic_blocks().indices() {
-            let outgoing = outgoing(mir, bb);
-            edges.extend(outgoing.into_iter());
-        }
-        edges.into_cow()
+
+        mir.basic_blocks()
+           .indices()
+           .flat_map(|bb| outgoing(mir, bb))
+           .collect::<Vec<_>>()
+           .into()
     }
 
     fn source(&self, edge: &Edge) -> Node {

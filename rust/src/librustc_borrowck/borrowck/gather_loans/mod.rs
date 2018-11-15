@@ -43,7 +43,10 @@ pub fn gather_loans_in_fn<'a, 'tcx>(bccx: &BorrowckCtxt<'a, 'tcx>,
     let mut glcx = GatherLoanCtxt {
         bccx,
         all_loans: Vec::new(),
-        item_ub: region::Scope::Node(bccx.tcx.hir.body(body).value.hir_id.local_id),
+        item_ub: region::Scope {
+            id: bccx.tcx.hir.body(body).value.hir_id.local_id,
+            data: region::ScopeData::Node
+        },
         move_data: MoveData::default(),
         move_error_collector: move_error::MoveErrorCollector::new(),
     };
@@ -360,12 +363,11 @@ impl<'a, 'tcx> GatherLoanCtxt<'a, 'tcx> {
 
                     ty::ReStatic => self.item_ub,
 
-                    ty::ReCanonical(_) |
                     ty::ReEmpty |
                     ty::ReClosureBound(..) |
                     ty::ReLateBound(..) |
                     ty::ReVar(..) |
-                    ty::ReSkolemized(..) |
+                    ty::RePlaceholder(..) |
                     ty::ReErased => {
                         span_bug!(
                             cmt.span,
@@ -375,7 +377,10 @@ impl<'a, 'tcx> GatherLoanCtxt<'a, 'tcx> {
                 };
                 debug!("loan_scope = {:?}", loan_scope);
 
-                let borrow_scope = region::Scope::Node(borrow_id);
+                let borrow_scope = region::Scope {
+                    id: borrow_id,
+                    data: region::ScopeData::Node
+                };
                 let gen_scope = self.compute_gen_scope(borrow_scope, loan_scope);
                 debug!("gen_scope = {:?}", gen_scope);
 

@@ -21,12 +21,12 @@
 
 #![feature(crate_visibility_modifier)]
 #![feature(macro_at_most_once_rep)]
-#![cfg_attr(not(stage0), feature(nll))]
-#![cfg_attr(not(stage0), feature(infer_outlives_requirements))]
+#![feature(nll)]
 #![feature(rustc_attrs)]
 #![feature(rustc_diagnostic_macros)]
 #![feature(slice_sort_by_cached_key)]
 #![feature(str_escape)]
+#![feature(step_trait)]
 #![feature(try_trait)]
 #![feature(unicode_internals)]
 
@@ -38,7 +38,7 @@ extern crate serialize;
 #[macro_use] extern crate log;
 pub extern crate rustc_errors as errors;
 extern crate syntax_pos;
-extern crate rustc_data_structures;
+#[macro_use] extern crate rustc_data_structures;
 extern crate rustc_target;
 #[macro_use] extern crate scoped_tls;
 #[macro_use]
@@ -47,8 +47,7 @@ extern crate smallvec;
 extern crate serialize as rustc_serialize; // used by deriving
 
 use rustc_data_structures::sync::Lock;
-use rustc_data_structures::bitvec::BitVector;
-pub use rustc_data_structures::small_vec::OneVector;
+use rustc_data_structures::bit_set::GrowableBitSet;
 pub use rustc_data_structures::thin_vec::ThinVec;
 use ast::AttrId;
 
@@ -72,6 +71,23 @@ macro_rules! panictry {
     })
 }
 
+// A variant of 'panictry!' that works on a Vec<Diagnostic> instead of a single DiagnosticBuilder.
+macro_rules! panictry_buffer {
+    ($handler:expr, $e:expr) => ({
+        use std::result::Result::{Ok, Err};
+        use errors::{FatalError, DiagnosticBuilder};
+        match $e {
+            Ok(e) => e,
+            Err(errs) => {
+                for e in errs {
+                    DiagnosticBuilder::new_diagnostic($handler, e).emit();
+                }
+                FatalError.raise()
+            }
+        }
+    })
+}
+
 #[macro_export]
 macro_rules! unwrap_or {
     ($opt:expr, $default:expr) => {
@@ -83,8 +99,8 @@ macro_rules! unwrap_or {
 }
 
 pub struct Globals {
-    used_attrs: Lock<BitVector<AttrId>>,
-    known_attrs: Lock<BitVector<AttrId>>,
+    used_attrs: Lock<GrowableBitSet<AttrId>>,
+    known_attrs: Lock<GrowableBitSet<AttrId>>,
     syntax_pos_globals: syntax_pos::Globals,
 }
 
@@ -93,8 +109,8 @@ impl Globals {
         Globals {
             // We have no idea how many attributes their will be, so just
             // initiate the vectors with 0 bits. We'll grow them as necessary.
-            used_attrs: Lock::new(BitVector::new()),
-            known_attrs: Lock::new(BitVector::new()),
+            used_attrs: Lock::new(GrowableBitSet::new_empty()),
+            known_attrs: Lock::new(GrowableBitSet::new_empty()),
             syntax_pos_globals: syntax_pos::Globals::new(),
         }
     }
