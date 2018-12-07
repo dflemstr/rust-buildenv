@@ -43,8 +43,8 @@
 //!
 //! `Rc<T>` automatically dereferences to `T` (via the [`Deref`] trait),
 //! so you can call `T`'s methods on a value of type [`Rc<T>`][`Rc`]. To avoid name
-//! clashes with `T`'s methods, the methods of [`Rc<T>`][`Rc`] itself are [associated
-//! functions][assoc], called using function-like syntax:
+//! clashes with `T`'s methods, the methods of [`Rc<T>`][`Rc`] itself are associated
+//! functions, called using function-like syntax:
 //!
 //! ```
 //! use std::rc::Rc;
@@ -234,7 +234,6 @@
 //! [downgrade]: struct.Rc.html#method.downgrade
 //! [upgrade]: struct.Weak.html#method.upgrade
 //! [`None`]: ../../std/option/enum.Option.html#variant.None
-//! [assoc]: ../../book/first-edition/method-syntax.html#associated-functions
 //! [mutability]: ../../std/cell/index.html#introducing-mutability-inside-of-something-immutable
 
 #![stable(feature = "rust1", since = "1.0.0")]
@@ -634,7 +633,7 @@ impl<T: Clone> Rc<T> {
 impl Rc<dyn Any> {
     #[inline]
     #[stable(feature = "rc_downcast", since = "1.29.0")]
-    /// Attempt to downcast the `Rc<Any>` to a concrete type.
+    /// Attempt to downcast the `Rc<dyn Any>` to a concrete type.
     ///
     /// # Examples
     ///
@@ -642,7 +641,7 @@ impl Rc<dyn Any> {
     /// use std::any::Any;
     /// use std::rc::Rc;
     ///
-    /// fn print_if_string(value: Rc<Any>) {
+    /// fn print_if_string(value: Rc<dyn Any>) {
     ///     if let Ok(string) = value.downcast::<String>() {
     ///         println!("String ({}): {}", string.len(), string);
     ///     }
@@ -1188,8 +1187,9 @@ impl<T: ?Sized + Unsize<U>, U: ?Sized> DispatchFromDyn<Weak<U>> for Weak<T> {}
 
 impl<T> Weak<T> {
     /// Constructs a new `Weak<T>`, without allocating any memory.
-    /// Calling [`upgrade`][Weak::upgrade] on the return value always gives [`None`].
+    /// Calling [`upgrade`] on the return value always gives [`None`].
     ///
+    /// [`upgrade`]: #method.upgrade
     /// [`None`]: ../../std/option/enum.Option.html
     ///
     /// # Examples
@@ -1260,6 +1260,52 @@ impl<T: ?Sized> Weak<T> {
         } else {
             Some(unsafe { self.ptr.as_ref() })
         }
+    }
+
+    /// Returns true if the two `Weak`s point to the same value (not just values
+    /// that compare as equal).
+    ///
+    /// # Notes
+    ///
+    /// Since this compares pointers it means that `Weak::new()` will equal each
+    /// other, even though they don't point to any value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(weak_ptr_eq)]
+    /// use std::rc::{Rc, Weak};
+    ///
+    /// let first_rc = Rc::new(5);
+    /// let first = Rc::downgrade(&first_rc);
+    /// let second = Rc::downgrade(&first_rc);
+    ///
+    /// assert!(Weak::ptr_eq(&first, &second));
+    ///
+    /// let third_rc = Rc::new(5);
+    /// let third = Rc::downgrade(&third_rc);
+    ///
+    /// assert!(!Weak::ptr_eq(&first, &third));
+    /// ```
+    ///
+    /// Comparing `Weak::new`.
+    ///
+    /// ```
+    /// #![feature(weak_ptr_eq)]
+    /// use std::rc::{Rc, Weak};
+    ///
+    /// let first = Weak::new();
+    /// let second = Weak::new();
+    /// assert!(Weak::ptr_eq(&first, &second));
+    ///
+    /// let third_rc = Rc::new(());
+    /// let third = Rc::downgrade(&third_rc);
+    /// assert!(!Weak::ptr_eq(&first, &third));
+    /// ```
+    #[inline]
+    #[unstable(feature = "weak_ptr_eq", issue = "55981")]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr.as_ptr() == other.ptr.as_ptr()
     }
 }
 

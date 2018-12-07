@@ -256,7 +256,7 @@ fn initial_buffer_size(file: &File) -> usize {
 /// use std::fs;
 /// use std::net::SocketAddr;
 ///
-/// fn main() -> Result<(), Box<std::error::Error + 'static>> {
+/// fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 ///     let foo: SocketAddr = String::from_utf8_lossy(&fs::read("address.txt")?).parse()?;
 ///     Ok(())
 /// }
@@ -298,7 +298,7 @@ pub fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
 /// use std::fs;
 /// use std::net::SocketAddr;
 ///
-/// fn main() -> Result<(), Box<std::error::Error + 'static>> {
+/// fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
 ///     let foo: SocketAddr = fs::read_to_string("address.txt")?.parse()?;
 ///     Ok(())
 /// }
@@ -2065,7 +2065,7 @@ impl DirBuilder {
             Err(e) => return Err(e),
         }
         match path.parent() {
-            Some(p) => try!(self.create_dir_all(p)),
+            Some(p) => self.create_dir_all(p)?,
             None => return Err(io::Error::new(io::ErrorKind::Other, "failed to create whole tree")),
         }
         match self.inner.mkdir(path) {

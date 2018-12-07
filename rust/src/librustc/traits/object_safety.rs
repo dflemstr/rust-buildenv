@@ -409,7 +409,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
             .collect::<Vec<_>>();
 
         // existential predicates need to be in a specific order
-        associated_types.sort_by_key(|item| self.def_path_hash(item.def_id));
+        associated_types.sort_by_cached_key(|item| self.def_path_hash(item.def_id));
 
         let projection_predicates = associated_types.into_iter().map(|item| {
             ty::ExistentialPredicate::Projection(ty::ExistentialProjection {
@@ -470,7 +470,7 @@ impl<'a, 'tcx> TyCtxt<'a, 'tcx, 'tcx> {
     ///
     /// for `self: &'a mut Self`, this means `&'a mut Self: DispatchFromDyn<&'a mut U>`
     /// for `self: Rc<Self>`, this means `Rc<Self>: DispatchFromDyn<Rc<U>>`
-    /// for `self: Pin<Box<Self>>, this means `Pin<Box<Self>>: DispatchFromDyn<Pin<Box<U>>>`
+    /// for `self: Pin<Box<Self>>`, this means `Pin<Box<Self>>: DispatchFromDyn<Pin<Box<U>>>`
     //
     // FIXME(mikeyhew) when unsized receivers are implemented as part of unsized rvalues, add this
     // fallback query: `Receiver: Unsize<Receiver[Self => U]>` to support receivers like

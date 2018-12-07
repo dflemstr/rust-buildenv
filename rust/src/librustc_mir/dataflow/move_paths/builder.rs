@@ -128,7 +128,7 @@ impl<'b, 'a, 'gcx, 'tcx> Gatherer<'b, 'a, 'gcx, 'tcx> {
                                 proj: &PlaceProjection<'tcx>)
                                 -> Result<MovePathIndex, MoveError<'tcx>>
     {
-        let base = try!(self.move_path_for(&proj.base));
+        let base = self.move_path_for(&proj.base)?;
         let mir = self.builder.mir;
         let tcx = self.builder.tcx;
         let place_ty = proj.base.ty(mir, tcx).to_ty(tcx);
@@ -301,7 +301,6 @@ impl<'b, 'a, 'gcx, 'tcx> Gatherer<'b, 'a, 'gcx, 'tcx> {
                 span_bug!(stmt.source_info.span,
                           "SetDiscriminant should not exist during borrowck");
             }
-            StatementKind::EndRegion(..) |
             StatementKind::Retag { .. } |
             StatementKind::EscapeToRaw { .. } |
             StatementKind::AscribeUserType(..) |

@@ -70,6 +70,7 @@ macro_rules! book {
 book!(
     Nomicon, "src/doc/nomicon", "nomicon";
     Reference, "src/doc/reference", "reference";
+    EditionGuide, "src/doc/edition-guide", "edition-guide";
     RustdocBook, "src/doc/rustdoc", "rustdoc";
     RustcBook, "src/doc/rustc", "rustc";
     RustByExample, "src/doc/rust-by-example", "rust-by-example";
@@ -260,22 +261,31 @@ impl Step for TheBook {
         let compiler = self.compiler;
         let target = self.target;
         let name = self.name;
-        // build book first edition
+
+        // build book
         builder.ensure(Rustbook {
             target,
-            name: INTERNER.intern_string(format!("{}/first-edition", name)),
+            name: INTERNER.intern_string(name.to_string()),
         });
 
-        // build book second edition
+        // building older edition redirects
+
+        let source_name = format!("{}/first-edition", name);
         builder.ensure(Rustbook {
             target,
-            name: INTERNER.intern_string(format!("{}/second-edition", name)),
+            name: INTERNER.intern_string(source_name),
         });
 
-        // build book 2018 edition
+        let source_name = format!("{}/second-edition", name);
         builder.ensure(Rustbook {
             target,
-            name: INTERNER.intern_string(format!("{}/2018-edition", name)),
+            name: INTERNER.intern_string(source_name),
+        });
+
+        let source_name = format!("{}/2018-edition", name);
+        builder.ensure(Rustbook {
+            target,
+            name: INTERNER.intern_string(source_name),
         });
 
         // build the version info page and CSS
@@ -283,11 +293,6 @@ impl Step for TheBook {
             compiler,
             target,
         });
-
-        // build the index page
-        let index = format!("{}/index.md", name);
-        builder.info(&format!("Documenting book index ({})", target));
-        invoke_rustdoc(builder, compiler, target, &index);
 
         // build the redirect pages
         builder.info(&format!("Documenting book redirect pages ({})", target));
@@ -692,9 +697,6 @@ impl Step for Rustc {
             return;
         }
 
-        // Build libstd docs so that we generate relative links.
-        builder.ensure(Std { stage, target });
-
         // Build rustc.
         builder.ensure(compile::Rustc { compiler, target });
 
@@ -713,12 +715,16 @@ impl Step for Rustc {
 
         // Find dependencies for top level crates.
         let mut compiler_crates = HashSet::new();
-        for root_crate in &["rustc", "rustc_driver", "rustc_codegen_llvm"] {
+        for root_crate in &["rustc_driver", "rustc_codegen_llvm", "rustc_codegen_ssa"] {
             let interned_root_crate = INTERNER.intern_str(root_crate);
             find_compiler_crates(builder, &interned_root_crate, &mut compiler_crates);
         }
 
         for krate in &compiler_crates {
+            // Create all crate output directories first to make sure rustdoc uses
+            // relative links.
+            // FIXME: Cargo should probably do this itself.
+            t!(fs::create_dir_all(out_dir.join(krate)));
             cargo.arg("-p").arg(krate);
         }
 
@@ -792,8 +798,8 @@ impl Step for Rustdoc {
             return;
         }
 
-        // Build libstd docs so that we generate relative links.
-        builder.ensure(Std { stage, target });
+        // Build rustc docs so that we generate relative links.
+        builder.ensure(Rustc { stage, target });
 
         // Build rustdoc.
         builder.ensure(tool::Rustdoc { host: compiler.host });
@@ -816,6 +822,10 @@ impl Step for Rustdoc {
             SourceType::InTree,
             &[]
         );
+
+        // Only include compiler crates, no dependencies of those, such as `libc`.
+        cargo.arg("--no-deps");
+        cargo.arg("-p").arg("rustdoc");
 
         cargo.env("RUSTDOCFLAGS", "--document-private-items");
         builder.run(&mut cargo);
@@ -910,13 +920,13 @@ fn symlink_dir_force(config: &Config, src: &Path, dst: &Path) -> io::Result<()> 
     }
     if let Ok(m) = fs::symlink_metadata(dst) {
         if m.file_type().is_dir() {
-            try!(fs::remove_dir_all(dst));
+            fs::remove_dir_all(dst)?;
         } else {
             // handle directory junctions on windows by falling back to
             // `remove_dir`.
-            try!(fs::remove_file(dst).or_else(|_| {
+            fs::remove_file(dst).or_else(|_| {
                 fs::remove_dir(dst)
-            }));
+            })?;
         }
     }
 

@@ -344,6 +344,13 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
 
         let first_borrow_desc;
 
+        let explanation = self.explain_why_borrow_contains_point(context, issued_borrow, None);
+        let second_borrow_desc = if explanation.is_explained() {
+            "second "
+        } else {
+            ""
+        };
+
         // FIXME: supply non-"" `opt_via` when appropriate
         let mut err = match (
             gen_borrow_kind,
@@ -454,6 +461,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     issued_span,
                     "",
                     None,
+                    second_borrow_desc,
                     Origin::Mir,
                 )
             }
@@ -469,6 +477,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
                     issued_span,
                     "",
                     None,
+                    second_borrow_desc,
                     Origin::Mir,
                 )
             }
@@ -513,7 +522,7 @@ impl<'cx, 'gcx, 'tcx> MirBorrowckCtxt<'cx, 'gcx, 'tcx> {
             );
         }
 
-        self.explain_why_borrow_contains_point(context, issued_borrow, None)
+        explanation
             .add_explanation_to_diagnostic(self.infcx.tcx, self.mir, &mut err, first_borrow_desc);
 
         err.buffer(&mut self.errors_buffer);
@@ -2193,7 +2202,7 @@ impl<'tcx> AnnotatedBorrowFnSignature<'tcx> {
         match ty.sty {
             ty::TyKind::Ref(ty::RegionKind::ReLateBound(_, br), _, _)
             | ty::TyKind::Ref(
-                ty::RegionKind::RePlaceholder(ty::Placeholder { name: br, .. }),
+                ty::RegionKind::RePlaceholder(ty::PlaceholderRegion { name: br, .. }),
                 _,
                 _,
             ) => with_highlight_region_for_bound_region(*br, counter, || ty.to_string()),
@@ -2207,7 +2216,7 @@ impl<'tcx> AnnotatedBorrowFnSignature<'tcx> {
         match ty.sty {
             ty::TyKind::Ref(region, _, _) => match region {
                 ty::RegionKind::ReLateBound(_, br)
-                | ty::RegionKind::RePlaceholder(ty::Placeholder { name: br, .. }) => {
+                | ty::RegionKind::RePlaceholder(ty::PlaceholderRegion { name: br, .. }) => {
                     with_highlight_region_for_bound_region(*br, counter, || region.to_string())
                 }
                 _ => region.to_string(),

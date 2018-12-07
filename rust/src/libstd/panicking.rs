@@ -29,7 +29,7 @@ use intrinsics;
 use mem;
 use ptr;
 use raw;
-use sys::stdio::{Stderr, stderr_prints_nothing};
+use sys::stdio::panic_output;
 use sys_common::rwlock::RWLock;
 use sys_common::thread_info;
 use sys_common::util;
@@ -193,7 +193,6 @@ fn default_hook(info: &PanicInfo) {
             None => "Box<Any>",
         }
     };
-    let mut err = Stderr::new().ok();
     let thread = thread_info::current_thread();
     let name = thread.as_ref().and_then(|t| t.name()).unwrap_or("<unnamed>");
 
@@ -215,17 +214,14 @@ fn default_hook(info: &PanicInfo) {
         }
     };
 
-    let prev = LOCAL_STDERR.with(|s| s.borrow_mut().take());
-    match (prev, err.as_mut()) {
-       (Some(mut stderr), _) => {
-           write(&mut *stderr);
-           let mut s = Some(stderr);
-           LOCAL_STDERR.with(|slot| {
-               *slot.borrow_mut() = s.take();
-           });
-       }
-       (None, Some(ref mut err)) => { write(err) }
-       _ => {}
+    if let Some(mut local) = LOCAL_STDERR.with(|s| s.borrow_mut().take()) {
+       write(&mut *local);
+       let mut s = Some(local);
+       LOCAL_STDERR.with(|slot| {
+           *slot.borrow_mut() = s.take();
+       });
+    } else if let Some(mut out) = panic_output() {
+        write(&mut out);
     }
 }
 
@@ -334,9 +330,17 @@ pub fn rust_begin_panic(info: &PanicInfo) -> ! {
 #[unstable(feature = "libstd_sys_internals",
            reason = "used by the panic! macro",
            issue = "0")]
-#[inline(never)] #[cold]
+#[cold]
+// If panic_immediate_abort, inline the abort call,
+// otherwise avoid inlining because of it is cold path.
+#[cfg_attr(not(feature="panic_immediate_abort"),inline(never))]
+#[cfg_attr(    feature="panic_immediate_abort" ,inline)]
 pub fn begin_panic_fmt(msg: &fmt::Arguments,
                        file_line_col: &(&'static str, u32, u32)) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        unsafe { intrinsics::abort() }
+    }
+
     let (file, line, col) = *file_line_col;
     let info = PanicInfo::internal_constructor(
         Some(msg),
@@ -398,8 +402,15 @@ fn continue_panic_fmt(info: &PanicInfo) -> ! {
            reason = "used by the panic! macro",
            issue = "0")]
 #[cfg_attr(not(test), lang = "begin_panic")]
-#[inline(never)] #[cold] // avoid code bloat at the call sites as much as possible
+// never inline unless panic_immediate_abort to avoid code
+// bloat at the call sites as much as possible
+#[cfg_attr(not(feature="panic_immediate_abort"),inline(never))]
+#[cold]
 pub fn begin_panic<M: Any + Send>(msg: M, file_line_col: &(&'static str, u32, u32)) -> ! {
+    if cfg!(feature = "panic_immediate_abort") {
+        unsafe { intrinsics::abort() }
+    }
+
     // Note that this should be the only allocation performed in this code path.
     // Currently this means that panic!() on OOM will invoke this code path,
     // but then again we're not really ready for panic on OOM anyway. If
@@ -470,7 +481,7 @@ fn rust_panic_with_hook(payload: &mut dyn BoxMeUp,
             // Some platforms know that printing to stderr won't ever actually
             // print anything, and if that's the case we can skip the default
             // hook.
-            Hook::Default if stderr_prints_nothing() => {}
+            Hook::Default if panic_output().is_none() => {}
             Hook::Default => {
                 info.set_payload(payload.get());
                 default_hook(&info);
@@ -479,7 +490,7 @@ fn rust_panic_with_hook(payload: &mut dyn BoxMeUp,
                 info.set_payload(payload.get());
                 (*ptr)(&info);
             }
-        }
+        };
         HOOK_LOCK.read_unlock();
     }
 

@@ -536,10 +536,9 @@ fn next_code_point_reverse<'a, I>(bytes: &mut I) -> Option<u32>
     where I: DoubleEndedIterator<Item = &'a u8>,
 {
     // Decode UTF-8
-    let w = match bytes.next_back() {
-        None => return None,
-        Some(&next_byte) if next_byte < 128 => return Some(next_byte as u32),
-        Some(&back_byte) => back_byte,
+    let w = match *bytes.next_back()? {
+        next_byte if next_byte < 128 => return Some(next_byte as u32),
+        back_byte => back_byte,
     };
 
     // Multibyte case follows
@@ -1424,10 +1423,8 @@ fn contains_nonascii(x: usize) -> bool {
     (x & NONASCII_MASK) != 0
 }
 
-/// Walks through `iter` checking that it's a valid UTF-8 sequence,
-/// returning `true` in that case, or, if it is invalid, `false` with
-/// `iter` reset such that it is pointing at the first byte in the
-/// invalid sequence.
+/// Walks through `v` checking that it's a valid UTF-8 sequence,
+/// returning `Ok(())` in that case, or, if it is invalid, `Err(err)`.
 #[inline]
 fn run_utf8_validation(v: &[u8]) -> Result<(), Utf8Error> {
     let mut index = 0;

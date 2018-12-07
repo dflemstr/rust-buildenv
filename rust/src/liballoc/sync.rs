@@ -120,8 +120,8 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 ///
 /// `Arc<T>` automatically dereferences to `T` (via the [`Deref`][deref] trait),
 /// so you can call `T`'s methods on a value of type `Arc<T>`. To avoid name
-/// clashes with `T`'s methods, the methods of `Arc<T>` itself are [associated
-/// functions][assoc], called using function-like syntax:
+/// clashes with `T`'s methods, the methods of `Arc<T>` itself are associated
+/// functions, called using function-like syntax:
 ///
 /// ```
 /// use std::sync::Arc;
@@ -146,7 +146,6 @@ const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 /// [downgrade]: struct.Arc.html#method.downgrade
 /// [upgrade]: struct.Weak.html#method.upgrade
 /// [`None`]: ../../std/option/enum.Option.html#variant.None
-/// [assoc]: ../../book/first-edition/method-syntax.html#associated-functions
 /// [`RefCell<T>`]: ../../std/cell/struct.RefCell.html
 /// [`std::sync`]: ../../std/sync/index.html
 /// [`Arc::clone(&from)`]: #method.clone
@@ -1130,6 +1129,53 @@ impl<T: ?Sized> Weak<T> {
         } else {
             Some(unsafe { self.ptr.as_ref() })
         }
+    }
+
+    /// Returns true if the two `Weak`s point to the same value (not just values
+    /// that compare as equal).
+    ///
+    /// # Notes
+    ///
+    /// Since this compares pointers it means that `Weak::new()` will equal each
+    /// other, even though they don't point to any value.
+    ///
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// #![feature(weak_ptr_eq)]
+    /// use std::sync::{Arc, Weak};
+    ///
+    /// let first_rc = Arc::new(5);
+    /// let first = Arc::downgrade(&first_rc);
+    /// let second = Arc::downgrade(&first_rc);
+    ///
+    /// assert!(Weak::ptr_eq(&first, &second));
+    ///
+    /// let third_rc = Arc::new(5);
+    /// let third = Arc::downgrade(&third_rc);
+    ///
+    /// assert!(!Weak::ptr_eq(&first, &third));
+    /// ```
+    ///
+    /// Comparing `Weak::new`.
+    ///
+    /// ```
+    /// #![feature(weak_ptr_eq)]
+    /// use std::sync::{Arc, Weak};
+    ///
+    /// let first = Weak::new();
+    /// let second = Weak::new();
+    /// assert!(Weak::ptr_eq(&first, &second));
+    ///
+    /// let third_rc = Arc::new(());
+    /// let third = Arc::downgrade(&third_rc);
+    /// assert!(!Weak::ptr_eq(&first, &third));
+    /// ```
+    #[inline]
+    #[unstable(feature = "weak_ptr_eq", issue = "55981")]
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        this.ptr.as_ptr() == other.ptr.as_ptr()
     }
 }
 

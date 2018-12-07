@@ -154,9 +154,10 @@ macro_rules! make_mir_visitor {
 
             fn visit_retag(&mut self,
                            fn_entry: & $($mutability)* bool,
+                           two_phase: & $($mutability)* bool,
                            place: & $($mutability)* Place<'tcx>,
                            location: Location) {
-                self.super_retag(fn_entry, place, location);
+                self.super_retag(fn_entry, two_phase, place, location);
             }
 
             fn visit_place(&mut self,
@@ -377,7 +378,6 @@ macro_rules! make_mir_visitor {
                             location
                         );
                     }
-                    StatementKind::EndRegion(_) => {}
                     StatementKind::SetDiscriminant{ ref $($mutability)* place, .. } => {
                         self.visit_place(
                             place,
@@ -418,8 +418,9 @@ macro_rules! make_mir_visitor {
                         }
                     }
                     StatementKind::Retag { ref $($mutability)* fn_entry,
+                                           ref $($mutability)* two_phase,
                                            ref $($mutability)* place } => {
-                        self.visit_retag(fn_entry, place, location);
+                        self.visit_retag(fn_entry, two_phase, place, location);
                     }
                     StatementKind::AscribeUserType(
                         ref $($mutability)* place,
@@ -725,6 +726,7 @@ macro_rules! make_mir_visitor {
 
             fn super_retag(&mut self,
                            _fn_entry: & $($mutability)* bool,
+                           _two_phase: & $($mutability)* bool,
                            place: & $($mutability)* Place<'tcx>,
                            location: Location) {
                 self.visit_place(

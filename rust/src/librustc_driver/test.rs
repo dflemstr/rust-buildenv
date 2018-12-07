@@ -98,7 +98,7 @@ fn errors(msgs: &[&str]) -> (Box<dyn Emitter + sync::Send>, usize) {
 
 fn test_env<F>(source_string: &str, args: (Box<dyn Emitter + sync::Send>, usize), body: F)
 where
-    F: FnOnce(Env),
+    F: FnOnce(Env) + sync::Send,
 {
     syntax::with_globals(|| {
         let mut options = config::Options::default();
@@ -129,7 +129,7 @@ fn test_env_with_pool<F>(
     let cstore = CStore::new(::get_codegen_backend(&sess).metadata_loader());
     rustc_lint::register_builtins(&mut sess.lint_store.borrow_mut(), Some(&sess));
     let input = config::Input::Str {
-        name: FileName::Anon,
+        name: FileName::anon_source_code(&source_string),
         input: source_string.to_string(),
     };
     let krate =

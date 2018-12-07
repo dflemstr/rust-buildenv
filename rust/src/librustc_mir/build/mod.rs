@@ -91,8 +91,9 @@ pub fn mir_build<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> Mir<'t
             // types/lifetimes replaced)
             let fn_hir_id = tcx.hir.node_to_hir_id(id);
             let fn_sig = cx.tables().liberated_fn_sigs()[fn_hir_id].clone();
+            let fn_def_id = tcx.hir.local_def_id(id);
 
-            let ty = tcx.type_of(tcx.hir.local_def_id(id));
+            let ty = tcx.type_of(fn_def_id);
             let mut abi = fn_sig.abi;
             let implicit_argument = match ty.sty {
                 ty::Closure(..) => {
@@ -108,9 +109,15 @@ pub fn mir_build<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> Mir<'t
                 _ => None,
             };
 
-            // FIXME: safety in closures
             let safety = match fn_sig.unsafety {
                 hir::Unsafety::Normal => Safety::Safe,
+                hir::Unsafety::Unsafe if tcx.is_min_const_fn(fn_def_id) => {
+                    // As specified in #55607, a `const unsafe fn` differs
+                    // from an `unsafe fn` in that its body is still considered
+                    // safe code by default.
+                    assert!(implicit_argument.is_none());
+                    Safety::Safe
+                },
                 hir::Unsafety::Unsafe => Safety::FnUnsafe,
             };
 
@@ -664,7 +671,7 @@ fn construct_fn<'a, 'gcx, 'tcx, A>(hir: Cx<'a, 'gcx, 'tcx>,
             let var_hir_id = tcx.hir.node_to_hir_id(var_id);
             let closure_expr_id = tcx.hir.local_def_id(fn_id);
             let capture = hir.tables().upvar_capture(ty::UpvarId {
-                var_id: var_hir_id,
+                var_path: ty::UpvarPath {hir_id: var_hir_id},
                 closure_expr_id: LocalDefId::from_def_id(closure_expr_id),
             });
             let by_ref = match capture {
@@ -829,7 +836,7 @@ impl<'a, 'gcx, 'tcx> Builder<'a, 'gcx, 'tcx> {
                 1,
             ),
             upvar_decls,
-            var_indices: NodeMap(),
+            var_indices: Default::default(),
             unit_temp: None,
             cached_resume_block: None,
             cached_return_block: None,

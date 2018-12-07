@@ -33,8 +33,8 @@ impl<'tcx, O: fmt::Debug> fmt::Debug for traits::Obligation<'tcx, O> {
         if ty::tls::with(|tcx| tcx.sess.verbose()) {
             write!(
                 f,
-                "Obligation(predicate={:?},cause={:?},depth={})",
-                self.predicate, self.cause, self.recursion_depth
+                "Obligation(predicate={:?},cause={:?},param_env={:?},depth={})",
+                self.predicate, self.cause, self.param_env, self.recursion_depth
             )
         } else {
             write!(
@@ -324,7 +324,7 @@ impl<'tcx> TypeVisitor<'tcx> for BoundNamesCollector {
         use syntax::symbol::Symbol;
 
         match t.sty {
-            ty::Bound(bound_ty) if bound_ty.index == self.binder_index => {
+            ty::Bound(debruijn, bound_ty) if debruijn == self.binder_index => {
                 self.types.insert(
                     bound_ty.var.as_u32(),
                     match bound_ty.kind {
