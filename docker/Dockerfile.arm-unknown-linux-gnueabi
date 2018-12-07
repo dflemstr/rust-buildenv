@@ -1,4 +1,0 @@
-FROM japaric/arm-unknown-linux-gnueabi
-
-COPY install.sh /
-RUN /install.sh

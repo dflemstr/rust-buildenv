@@ -1,4 +1,0 @@
-FROM japaric/x86_64-unknown-dragonfly
-
-COPY install.sh /
-RUN /install.sh

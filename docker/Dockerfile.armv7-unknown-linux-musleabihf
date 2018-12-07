@@ -1,4 +1,0 @@
-FROM japaric/armv7-unknown-linux-musleabihf
-
-COPY install.sh /
-RUN /install.sh

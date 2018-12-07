@@ -1,4 +1,0 @@
-FROM japaric/thumbv7em-none-eabihf
-
-COPY install.sh /
-RUN /install.sh

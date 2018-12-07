@@ -1,4 +1,0 @@
-FROM japaric/mips-unknown-linux-gnu
-
-COPY install.sh /
-RUN /install.sh

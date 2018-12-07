@@ -1,4 +1,0 @@
-FROM japaric/armv7-unknown-linux-gnueabihf
-
-COPY install.sh /
-RUN /install.sh

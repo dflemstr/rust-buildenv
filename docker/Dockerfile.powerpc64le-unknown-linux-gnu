@@ -1,4 +1,0 @@
-FROM japaric/powerpc64le-unknown-linux-gnu
-
-COPY install.sh /
-RUN /install.sh

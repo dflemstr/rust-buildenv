@@ -1,4 +1,0 @@
-FROM japaric/i686-unknown-freebsd
-
-COPY install.sh /
-RUN /install.sh
