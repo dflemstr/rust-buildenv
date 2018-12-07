@@ -128,24 +128,25 @@ workflows:
   version: 2
   dist:
     jobs:
-      - dist-various-1
-      - dist-various-2
       - dist-aarch64-linux
       - dist-android
-      - dist-arm-linux
       - dist-armhf-linux
+      - dist-arm-linux
       - dist-armv7-linux
       - dist-i586-gnu-i586-i686-musl
       - dist-i686-freebsd
       - dist-i686-linux
-      - dist-mips-linux
-      - dist-mips64-linux
       - dist-mips64el-linux
+      - dist-mips64-linux
       - dist-mipsel-linux
-      - dist-powerpc-linux
-      - dist-powerpc64-linux
+      - dist-mips-linux
       - dist-powerpc64le-linux
+      - dist-powerpc64-linux
+      - dist-powerpc-linux
       - dist-s390x-linux
+      - dist-various-1
+      - dist-various-2
       - dist-x86_64-freebsd
+      - dist-x86_64-linux
       - dist-x86_64-musl
       - dist-x86_64-netbsd
