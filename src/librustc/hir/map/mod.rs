@@ -475,7 +475,7 @@ impl<'hir> Map<'hir> {
 
     pub fn ty_param_name(&self, id: NodeId) -> Name {
         match self.get(id) {
-            Node::Item(&Item { node: ItemKind::Trait(..), .. }) => keywords::SelfType.name(),
+            Node::Item(&Item { node: ItemKind::Trait(..), .. }) => keywords::SelfUpper.name(),
             Node::GenericParam(param) => param.name.ident().name,
             _ => bug!("ty_param_name: {} not a type parameter", self.node_to_string(id)),
         }
@@ -1032,14 +1032,14 @@ pub fn map_crate<'hir>(sess: &::session::Session,
         let mut collector = NodeCollector::root(&forest.krate,
                                                 &forest.dep_graph,
                                                 &definitions,
-                                                hcx);
+                                                hcx,
+                                                sess.source_map());
         intravisit::walk_crate(&mut collector, &forest.krate);
 
         let crate_disambiguator = sess.local_crate_disambiguator();
         let cmdline_args = sess.opts.dep_tracking_hash();
         collector.finalize_and_compute_crate_hash(crate_disambiguator,
                                                   cstore,
-                                                  sess.source_map(),
                                                   cmdline_args)
     };
 

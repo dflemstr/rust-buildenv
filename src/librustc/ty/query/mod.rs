@@ -27,7 +27,7 @@ use middle::stability::{self, DeprecationEntry};
 use middle::lib_features::LibFeatures;
 use middle::lang_items::{LanguageItems, LangItem};
 use middle::exported_symbols::{SymbolExportLevel, ExportedSymbol};
-use mir::interpret::ConstEvalResult;
+use mir::interpret::{ConstEvalRawResult, ConstEvalResult};
 use mir::mono::CodegenUnit;
 use mir;
 use mir::interpret::GlobalId;
@@ -309,7 +309,7 @@ define_queries! { <'tcx>
         /// validation. Please add a comment to every use site explaining why using `const_eval`
         /// isn't sufficient
         [] fn const_eval_raw: const_eval_raw_dep_node(ty::ParamEnvAnd<'tcx, GlobalId<'tcx>>)
-            -> ConstEvalResult<'tcx>,
+            -> ConstEvalRawResult<'tcx>,
 
         /// Results of evaluating const items or constants embedded in
         /// other items (such as enum variant explicit discriminants).
@@ -470,7 +470,7 @@ define_queries! { <'tcx>
         [] fn foreign_modules: ForeignModules(CrateNum) -> Lrc<Vec<ForeignModule>>,
 
         [] fn plugin_registrar_fn: PluginRegistrarFn(CrateNum) -> Option<DefId>,
-        [] fn derive_registrar_fn: DeriveRegistrarFn(CrateNum) -> Option<DefId>,
+        [] fn proc_macro_decls_static: ProcMacroDeclsStatic(CrateNum) -> Option<DefId>,
         [] fn crate_disambiguator: CrateDisambiguator(CrateNum) -> CrateDisambiguator,
         [] fn crate_hash: CrateHash(CrateNum) -> Svh,
         [] fn original_crate_name: OriginalCrateName(CrateNum) -> Symbol,

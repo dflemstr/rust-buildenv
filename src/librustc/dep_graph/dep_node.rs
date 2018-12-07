@@ -381,7 +381,7 @@ macro_rules! define_dep_nodes {
         #[allow(dead_code, non_upper_case_globals)]
         pub mod label_strs {
            $(
-                pub const $variant: &'static str = stringify!($variant);
+                pub const $variant: &str = stringify!($variant);
             )*
         }
     );
@@ -596,7 +596,7 @@ define_dep_nodes!( <'tcx>
     [] ReachableNonGenerics(CrateNum),
     [] NativeLibraries(CrateNum),
     [] PluginRegistrarFn(CrateNum),
-    [] DeriveRegistrarFn(CrateNum),
+    [] ProcMacroDeclsStatic(CrateNum),
     [input] CrateDisambiguator(CrateNum),
     [input] CrateHash(CrateNum),
     [input] OriginalCrateName(CrateNum),

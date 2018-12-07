@@ -173,10 +173,7 @@ impl<'tcx> InstanceDef<'tcx> {
             // available to normal end-users.
             return true
         }
-        let codegen_fn_attrs = tcx.codegen_fn_attrs(self.def_id());
-        // need to use `is_const_fn_raw` since we don't really care if the user can use it as a
-        // const fn, just whether the function should be inlined
-        codegen_fn_attrs.requests_inline() || tcx.is_const_fn_raw(self.def_id())
+        tcx.codegen_fn_attrs(self.def_id()).requests_inline()
     }
 }
 
@@ -350,9 +347,10 @@ fn resolve_associated_item<'a, 'tcx>(
 ) -> Option<Instance<'tcx>> {
     let def_id = trait_item.def_id;
     debug!("resolve_associated_item(trait_item={:?}, \
+            param_env={:?}, \
             trait_id={:?}, \
             rcvr_substs={:?})",
-           def_id, trait_id, rcvr_substs);
+            def_id, param_env, trait_id, rcvr_substs);
 
     let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_substs);
     let vtbl = tcx.codegen_fulfill_obligation((param_env, ty::Binder::bind(trait_ref)));
@@ -362,7 +360,7 @@ fn resolve_associated_item<'a, 'tcx>(
     match vtbl {
         traits::VtableImpl(impl_data) => {
             let (def_id, substs) = traits::find_associated_item(
-                tcx, trait_item, rcvr_substs, &impl_data);
+                tcx, param_env, trait_item, rcvr_substs, &impl_data);
             let substs = tcx.erase_regions(&substs);
             Some(ty::Instance::new(def_id, substs))
         }

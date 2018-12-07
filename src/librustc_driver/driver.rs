@@ -62,7 +62,7 @@ use syntax::symbol::Symbol;
 use syntax_pos::{FileName, hygiene};
 use syntax_ext;
 
-use derive_registrar;
+use proc_macro_decls;
 use pretty::ReplaceBodyWithLoop;
 
 use profile;
@@ -91,7 +91,7 @@ pub fn spawn_thread_pool<F: FnOnce(config::Options) -> R + sync::Send, R: sync::
     let config = ThreadPoolBuilder::new()
         .num_threads(Session::query_threads_from_opts(&opts))
         .deadlock_handler(|| unsafe { ty::query::handle_deadlock() })
-        .stack_size(16 * 1024 * 1024);
+        .stack_size(::STACK_SIZE);
 
     let with_pool = move |pool: &ThreadPool| {
         pool.install(move || f(opts))
@@ -356,10 +356,10 @@ pub fn compile_input(
 
     if sess.opts.debugging_opts.self_profile {
         sess.print_profiler_results();
+    }
 
-        if sess.opts.debugging_opts.profile_json {
-            sess.save_json_results();
-        }
+    if sess.opts.debugging_opts.profile_json {
+        sess.save_json_results();
     }
 
     controller_entry_point!(
@@ -908,7 +908,6 @@ where
         }
     });
 
-    let whitelisted_legacy_custom_derives = registry.take_whitelisted_custom_derives();
     let Registry {
         syntax_exts,
         early_lint_passes,
@@ -955,7 +954,6 @@ where
         crate_loader,
         &resolver_arenas,
     );
-    resolver.whitelisted_legacy_custom_derives = whitelisted_legacy_custom_derives;
     syntax_ext::register_builtins(&mut resolver, syntax_exts, sess.features_untracked().quote);
 
     // Expand all macros
@@ -1066,7 +1064,7 @@ where
             let num_crate_types = crate_types.len();
             let is_proc_macro_crate = crate_types.contains(&config::CrateType::ProcMacro);
             let is_test_crate = sess.opts.test;
-            syntax_ext::proc_macro_registrar::modify(
+            syntax_ext::proc_macro_decls::modify(
                 &sess.parse_sess,
                 &mut resolver,
                 krate,
@@ -1243,8 +1241,8 @@ where
         .set(time(sess, "looking for plugin registrar", || {
             plugin::build::find_plugin_registrar(sess.diagnostic(), &hir_map)
         }));
-    sess.derive_registrar_fn
-        .set(derive_registrar::find(&hir_map));
+    sess.proc_macro_decls_static
+        .set(proc_macro_decls::find(&hir_map));
 
     time(sess, "loop checking", || loops::check_crate(sess, &hir_map));
 

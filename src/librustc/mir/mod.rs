@@ -10,12 +10,11 @@
 
 //! MIR datatypes and passes. See the [rustc guide] for more info.
 //!
-//! [rustc guide]: https://rust-lang-nursery.github.io/rustc-guide/mir/index.html
+//! [rustc guide]: https://rust-lang.github.io/rustc-guide/mir/index.html
 
 use hir::def::CtorKind;
 use hir::def_id::DefId;
 use hir::{self, HirId, InlineAsm};
-use middle::region;
 use mir::interpret::{ConstValue, EvalErrorKind, Scalar};
 use mir::visit::MirVisitable;
 use rustc_apfloat::ieee::{Double, Single};
@@ -26,7 +25,7 @@ use rustc_data_structures::graph::{self, GraphPredecessors, GraphSuccessors};
 use rustc_data_structures::indexed_vec::{Idx, IndexVec};
 use rustc_data_structures::sync::Lrc;
 use rustc_data_structures::sync::MappedReadGuard;
-use rustc_serialize as serialize;
+use rustc_serialize::{self as serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::fmt::{self, Debug, Formatter, Write};
@@ -340,7 +339,7 @@ impl<'tcx> Mir<'tcx> {
     #[inline]
     pub fn args_iter(&self) -> impl Iterator<Item = Local> {
         let arg_count = self.arg_count;
-        (1..arg_count + 1).map(Local::new)
+        (1..=arg_count).map(Local::new)
     }
 
     /// Returns an iterator over all user-defined variables and compiler-generated temporaries (all
@@ -1779,6 +1778,10 @@ pub enum StatementKind<'tcx> {
         /// `fn_entry` indicates whether this is the initial retag that happens in the
         /// function prolog.
         fn_entry: bool,
+        /// `two_phase` indicates whether this is just the reservation action of
+        /// a two-phase borrow.
+        two_phase: bool,
+        /// The place to retag
         place: Place<'tcx>,
     },
 
@@ -1788,10 +1791,6 @@ pub enum StatementKind<'tcx> {
     /// See <https://internals.rust-lang.org/t/stacked-borrows-an-aliasing-model-for-rust/8153/>
     /// for more details.
     EscapeToRaw(Operand<'tcx>),
-
-    /// Mark one terminating point of a region scope (i.e. static region).
-    /// (The starting point(s) arise implicitly from borrows.)
-    EndRegion(region::Scope),
 
     /// Encodes a user's type ascription. These need to be preserved
     /// intact so that NLL can respect them. For example:
@@ -1846,10 +1845,12 @@ impl<'tcx> Debug for Statement<'tcx> {
         match self.kind {
             Assign(ref place, ref rv) => write!(fmt, "{:?} = {:?}", place, rv),
             FakeRead(ref cause, ref place) => write!(fmt, "FakeRead({:?}, {:?})", cause, place),
-            // (reuse lifetime rendering policy from ppaux.)
-            EndRegion(ref ce) => write!(fmt, "EndRegion({})", ty::ReScope(*ce)),
-            Retag { fn_entry, ref place } =>
-                write!(fmt, "Retag({}{:?})", if fn_entry { "[fn entry] " } else { "" }, place),
+            Retag { fn_entry, two_phase, ref place } =>
+                write!(fmt, "Retag({}{}{:?})",
+                    if fn_entry { "[fn entry] " } else { "" },
+                    if two_phase { "[2phase] " } else { "" },
+                    place,
+                ),
             EscapeToRaw(ref place) => write!(fmt, "EscapeToRaw({:?})", place),
             StorageLive(ref place) => write!(fmt, "StorageLive({:?})", place),
             StorageDead(ref place) => write!(fmt, "StorageDead({:?})", place),
@@ -2207,7 +2208,7 @@ pub enum CastKind {
     /// "Unsize" -- convert a thin-or-fat pointer to a fat pointer.
     /// codegen must figure out the details once full monomorphization
     /// is known. For example, this could be used to cast from a
-    /// `&[i32;N]` to a `&[i32]`, or a `Box<T>` to a `Box<Trait>`
+    /// `&[i32;N]` to a `&[i32]`, or a `Box<T>` to a `Box<dyn Trait>`
     /// (presuming `T: Trait`).
     Unsize,
 }
@@ -2777,8 +2778,11 @@ impl Location {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, RustcEncodable, RustcDecodable)]
 pub enum UnsafetyViolationKind {
     General,
-    /// unsafety is not allowed at all in min const fn
-    MinConstFn,
+    /// Right now function calls to `const unsafe fn` are only permitted behind a feature gate
+    /// Also, even `const unsafe fn` need an `unsafe` block to do the allowed operations.
+    GatedConstFnCall,
+    /// Permitted in const fn and regular fns
+    GeneralAndConstFn,
     ExternStatic(ast::NodeId),
     BorrowPacked(ast::NodeId),
 }
@@ -3026,9 +3030,8 @@ EnumTypeFoldableImpl! {
         (StatementKind::StorageLive)(a),
         (StatementKind::StorageDead)(a),
         (StatementKind::InlineAsm) { asm, outputs, inputs },
-        (StatementKind::Retag) { fn_entry, place },
+        (StatementKind::Retag) { fn_entry, two_phase, place },
         (StatementKind::EscapeToRaw)(place),
-        (StatementKind::EndRegion)(a),
         (StatementKind::AscribeUserType)(a, v, b),
         (StatementKind::Nop),
     }

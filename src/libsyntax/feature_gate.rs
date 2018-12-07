@@ -53,8 +53,7 @@ macro_rules! declare_features {
         /// Represents active features that are currently being implemented or
         /// currently being considered for addition/removal.
         const ACTIVE_FEATURES:
-                &'static [(&'static str, &'static str, Option<u32>,
-                           Option<Edition>, fn(&mut Features, Span))] =
+            &[(&str, &str, Option<u32>, Option<Edition>, fn(&mut Features, Span))] =
             &[$((stringify!($feature), $ver, $issue, $edition, set!($feature))),+];
 
         /// A set of features to be used by later passes.
@@ -176,10 +175,6 @@ declare_features! (
 
     // Allows the use of custom attributes; RFC 572
     (active, custom_attribute, "1.0.0", Some(29642), None),
-
-    // Allows the use of #[derive(Anything)] as sugar for
-    // #[derive_Anything].
-    (active, custom_derive, "1.0.0", Some(29644), None),
 
     // Allows the use of rustc_* attributes; RFC 572
     (active, rustc_attrs, "1.0.0", Some(29642), None),
@@ -393,9 +388,6 @@ declare_features! (
     // `extern` in paths
     (active, extern_in_paths, "1.23.0", Some(55600), None),
 
-    // Use `?` as the Kleene "at most one" operator
-    (active, macro_at_most_once_rep, "1.25.0", Some(48075), None),
-
     // Infer static outlives requirements; RFC 2093
     (active, infer_static_outlives_requirements, "1.26.0", Some(54185), None),
 
@@ -436,17 +428,14 @@ declare_features! (
     // Allows irrefutable patterns in if-let and while-let statements (RFC 2086)
     (active, irrefutable_let_patterns, "1.27.0", Some(44495), None),
 
-    // Allows use of the :literal macro fragment specifier (RFC 1576)
-    (active, macro_literal_matcher, "1.27.0", Some(35625), None),
-
     // inconsistent bounds in where clauses
     (active, trivial_bounds, "1.28.0", Some(48214), None),
 
     // 'a: { break 'a; }
     (active, label_break_value, "1.28.0", Some(48594), None),
 
-    // Integer match exhaustiveness checking
-    (active, exhaustive_integer_patterns, "1.30.0", Some(50907), None),
+    // Exhaustive pattern matching on `usize` and `isize`.
+    (active, precise_pointer_size_matching, "1.32.0", Some(56354), None),
 
     // #[doc(keyword = "...")]
     (active, doc_keyword, "1.28.0", Some(51315), None),
@@ -468,9 +457,6 @@ declare_features! (
     // Allows `use x::y;` to resolve through `self::x`, not just `::x`
     (active, uniform_paths, "1.30.0", Some(53130), None),
 
-    // Allows `Self` in type definitions
-    (active, self_in_typedefs, "1.30.0", Some(49303), None),
-
     // Allows unsized rvalues at arguments and parameters
     (active, unsized_locals, "1.30.0", Some(48055), None),
 
@@ -480,9 +466,6 @@ declare_features! (
 
     // Non-builtin attributes in inner attribute position
     (active, custom_inner_attributes, "1.30.0", Some(54726), None),
-
-    // Self struct constructor  (RFC 2302)
-    (active, self_struct_ctor, "1.30.0", Some(51994), None),
 
     // allow mixing of bind-by-move in patterns and references to
     // those identifiers in guards, *if* we are using MIR-borrowck
@@ -499,11 +482,14 @@ declare_features! (
     // Allows `const _: TYPE = VALUE`
     (active, underscore_const_names, "1.31.0", Some(54912), None),
 
-    // `extern crate foo as bar;` puts `bar` into extern prelude.
-    (active, extern_crate_item_prelude, "1.31.0", Some(55599), None),
-
     // `reason = ` in lint attributes and `expect` lint attribute
     (active, lint_reasons, "1.31.0", Some(54503), None),
+
+    // `extern crate self as foo;` puts local crate root into extern prelude under name `foo`.
+    (active, extern_crate_self, "1.31.0", Some(56409), None),
+
+    // Allows calling `const unsafe fn` inside `unsafe` blocks in `const fn` functions.
+    (active, min_const_unsafe_fn, "1.31.0", Some(55607), None),
 );
 
 declare_features! (
@@ -540,6 +526,9 @@ declare_features! (
      Some("subsumed by `#![feature(proc_macro_hygiene)]`")),
     (removed, panic_implementation, "1.28.0", Some(44489), None,
      Some("subsumed by `#[panic_handler]`")),
+    // Allows the use of `#[derive(Anything)]` as sugar for `#[derive_Anything]`.
+    (removed, custom_derive, "1.0.0", Some(29644), None,
+     Some("subsumed by `#[proc_macro_derive]`")),
 );
 
 declare_features! (
@@ -684,16 +673,28 @@ declare_features! (
     (accepted, extern_prelude, "1.30.0", Some(44660), None),
     // Parentheses in patterns
     (accepted, pattern_parentheses, "1.31.0", Some(51087), None),
-    // Allows the definition of `const fn` functions.
+    // Allows the definition of `const fn` functions
     (accepted, min_const_fn, "1.31.0", Some(53555), None),
     // Scoped lints
     (accepted, tool_lints, "1.31.0", Some(44690), None),
     // impl<I:Iterator> Iterator for &mut Iterator
     // impl Debug for Foo<'_>
     (accepted, impl_header_lifetime_elision, "1.31.0", Some(15872), None),
+    // `extern crate foo as bar;` puts `bar` into extern prelude
+    (accepted, extern_crate_item_prelude, "1.31.0", Some(55599), None),
+    // Allows use of the :literal macro fragment specifier (RFC 1576)
+    (accepted, macro_literal_matcher, "1.31.0", Some(35625), None),
+    // Integer match exhaustiveness checking (RFC 2591)
+    (accepted, exhaustive_integer_patterns, "1.32.0", Some(50907), None),
+    // Use `?` as the Kleene "at most one" operator
+    (accepted, macro_at_most_once_rep, "1.32.0", Some(48075), None),
+    // `Self` struct constructor (RFC 2302)
+    (accepted, self_struct_ctor, "1.32.0", Some(51994), None),
+    // `Self` in type definitions (RFC 2300)
+    (accepted, self_in_typedefs, "1.32.0", Some(49303), None),
 );
 
-// If you change this, please modify src/doc/unstable-book as well. You must
+// If you change this, please modify `src/doc/unstable-book` as well. You must
 // move that documentation into the relevant place in the other docs, and
 // remove the chapter on the flag.
 
@@ -771,7 +772,7 @@ pub fn is_builtin_attr(attr: &ast::Attribute) -> bool {
 }
 
 // Attributes that have a special meaning to rustc or rustdoc
-pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeGate)] = &[
+pub const BUILTIN_ATTRIBUTES: &[(&str, AttributeType, AttributeGate)] = &[
     // Normal attributes
 
     ("warn", Normal, Ungated),
@@ -1125,8 +1126,8 @@ pub const BUILTIN_ATTRIBUTES: &'static [(&'static str, AttributeType, AttributeG
     ("proc_macro_attribute", Normal, Ungated),
     ("proc_macro", Normal, Ungated),
 
-    ("rustc_derive_registrar", Normal, Gated(Stability::Unstable,
-                                             "rustc_derive_registrar",
+    ("rustc_proc_macro_decls", Normal, Gated(Stability::Unstable,
+                                             "rustc_proc_macro_decls",
                                              "used internally by rustc",
                                              cfg_fn!(rustc_attrs))),
 
@@ -1285,8 +1286,6 @@ impl<'a> Context<'a> {
                           "unless otherwise specified, attributes \
                            with the prefix `rustc_` \
                            are reserved for internal compiler diagnostics");
-        } else if name.starts_with("derive_") {
-            gate_feature!(self, custom_derive, attr.span, EXPLAIN_DERIVE_UNDERSCORE);
         } else if !attr::is_known(attr) {
             // Only run the custom attribute lint during regular
             // feature gate checking. Macro gating runs
@@ -1385,55 +1384,39 @@ fn leveled_feature_err<'a>(sess: &'a ParseSess, feature: &str, span: Span, issue
 
 }
 
-const EXPLAIN_BOX_SYNTAX: &'static str =
+const EXPLAIN_BOX_SYNTAX: &str =
     "box expression syntax is experimental; you can call `Box::new` instead.";
 
-pub const EXPLAIN_STMT_ATTR_SYNTAX: &'static str =
+pub const EXPLAIN_STMT_ATTR_SYNTAX: &str =
     "attributes on expressions are experimental.";
 
-pub const EXPLAIN_ASM: &'static str =
+pub const EXPLAIN_ASM: &str =
     "inline assembly is not stable enough for use and is subject to change";
 
-pub const EXPLAIN_GLOBAL_ASM: &'static str =
+pub const EXPLAIN_GLOBAL_ASM: &str =
     "`global_asm!` is not stable enough for use and is subject to change";
 
-pub const EXPLAIN_CUSTOM_TEST_FRAMEWORKS: &'static str =
+pub const EXPLAIN_CUSTOM_TEST_FRAMEWORKS: &str =
     "custom test frameworks are an unstable feature";
 
-pub const EXPLAIN_LOG_SYNTAX: &'static str =
+pub const EXPLAIN_LOG_SYNTAX: &str =
     "`log_syntax!` is not stable enough for use and is subject to change";
 
-pub const EXPLAIN_CONCAT_IDENTS: &'static str =
+pub const EXPLAIN_CONCAT_IDENTS: &str =
     "`concat_idents` is not stable enough for use and is subject to change";
 
-pub const EXPLAIN_FORMAT_ARGS_NL: &'static str =
+pub const EXPLAIN_FORMAT_ARGS_NL: &str =
     "`format_args_nl` is only for internal language use and is subject to change";
 
-pub const EXPLAIN_TRACE_MACROS: &'static str =
+pub const EXPLAIN_TRACE_MACROS: &str =
     "`trace_macros` is not stable enough for use and is subject to change";
-pub const EXPLAIN_ALLOW_INTERNAL_UNSTABLE: &'static str =
+pub const EXPLAIN_ALLOW_INTERNAL_UNSTABLE: &str =
     "allow_internal_unstable side-steps feature gating and stability checks";
-pub const EXPLAIN_ALLOW_INTERNAL_UNSAFE: &'static str =
+pub const EXPLAIN_ALLOW_INTERNAL_UNSAFE: &str =
     "allow_internal_unsafe side-steps the unsafe_code lint";
 
-pub const EXPLAIN_CUSTOM_DERIVE: &'static str =
-    "`#[derive]` for custom traits is deprecated and will be removed in the future.";
-
-pub const EXPLAIN_DEPR_CUSTOM_DERIVE: &'static str =
-    "`#[derive]` for custom traits is deprecated and will be removed in the future. \
-    Prefer using procedural macro custom derive.";
-
-pub const EXPLAIN_DERIVE_UNDERSCORE: &'static str =
-    "attributes of the form `#[derive_*]` are reserved for the compiler";
-
-pub const EXPLAIN_LITERAL_MATCHER: &'static str =
-    ":literal fragment specifier is experimental and subject to change";
-
-pub const EXPLAIN_UNSIZED_TUPLE_COERCION: &'static str =
+pub const EXPLAIN_UNSIZED_TUPLE_COERCION: &str =
     "unsized tuple coercion is not stable enough for use and is subject to change";
-
-pub const EXPLAIN_MACRO_AT_MOST_ONCE_REP: &'static str =
-    "using the `?` macro Kleene operator for \"at most one\" repetition is unstable";
 
 struct PostExpansionVisitor<'a> {
     context: &'a Context<'a>,
@@ -1583,6 +1566,7 @@ impl<'a> Visitor<'a> for PostExpansionVisitor<'a> {
                 }
             }
 
+            ast::ItemKind::Static(..) |
             ast::ItemKind::Const(_,_) => {
                 if i.ident.name == "_" {
                     gate_feature_post!(&self, underscore_const_names, i.span,

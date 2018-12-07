@@ -390,7 +390,6 @@ impl<'a> Builder<'a> {
                 test::RunPassFullDeps,
                 test::RunFailFullDeps,
                 test::CompileFailFullDeps,
-                test::IncrementalFullDeps,
                 test::Rustdoc,
                 test::Pretty,
                 test::RunPassPretty,
@@ -443,7 +442,8 @@ impl<'a> Builder<'a> {
                 doc::RustdocBook,
                 doc::RustByExample,
                 doc::RustcBook,
-                doc::CargoBook
+                doc::CargoBook,
+                doc::EditionGuide,
             ),
             Kind::Dist => describe!(
                 dist::Docs,

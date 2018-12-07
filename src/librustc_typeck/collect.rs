@@ -938,7 +938,7 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx ty
 
                     opt_self = Some(ty::GenericParamDef {
                         index: 0,
-                        name: keywords::SelfType.name().as_interned_str(),
+                        name: keywords::SelfUpper.name().as_interned_str(),
                         def_id: tcx.hir.local_def_id(param_id),
                         pure_wrt_drop: false,
                         kind: ty::GenericParamDefKind::Type {
@@ -1007,7 +1007,7 @@ fn generics_of<'a, 'tcx>(tcx: TyCtxt<'a, 'tcx, 'tcx>, def_id: DefId) -> &'tcx ty
                     synthetic,
                     ..
                 } => {
-                    if param.name.ident().name == keywords::SelfType.name() {
+                    if param.name.ident().name == keywords::SelfUpper.name() {
                         span_bug!(
                             param.span,
                             "`Self` should not be the name of a regular parameter"
@@ -1608,10 +1608,21 @@ fn predicates_defined_on<'a, 'tcx>(
     tcx: TyCtxt<'a, 'tcx, 'tcx>,
     def_id: DefId,
 ) -> Lrc<ty::GenericPredicates<'tcx>> {
+    debug!("predicates_defined_on({:?})", def_id);
     let mut result = tcx.explicit_predicates_of(def_id);
+    debug!(
+        "predicates_defined_on: explicit_predicates_of({:?}) = {:?}",
+        def_id,
+        result,
+    );
     let inferred_outlives = tcx.inferred_outlives_of(def_id);
     if !inferred_outlives.is_empty() {
         let span = tcx.def_span(def_id);
+        debug!(
+            "predicates_defined_on: inferred_outlives_of({:?}) = {:?}",
+            def_id,
+            inferred_outlives,
+        );
         Lrc::make_mut(&mut result)
             .predicates
             .extend(inferred_outlives.iter().map(|&p| (p, span)));
@@ -1881,7 +1892,7 @@ fn explicit_predicates_of<'a, 'tcx>(
                         &hir::GenericBound::Trait(ref poly_trait_ref, _) => {
                             let mut projections = Vec::new();
 
-                            let trait_ref = AstConv::instantiate_poly_trait_ref(
+                            let (trait_ref, _) = AstConv::instantiate_poly_trait_ref(
                                 &icx,
                                 poly_trait_ref,
                                 ty,
@@ -2005,7 +2016,12 @@ pub fn compute_bounds<'gcx: 'tcx, 'tcx>(
     let mut projection_bounds = Vec::new();
 
     let mut trait_bounds: Vec<_> = trait_bounds.iter().map(|&bound| {
-        (astconv.instantiate_poly_trait_ref(bound, param_ty, &mut projection_bounds), bound.span)
+        let (poly_trait_ref, _) = astconv.instantiate_poly_trait_ref(
+            bound,
+            param_ty,
+            &mut projection_bounds,
+        );
+        (poly_trait_ref, bound.span)
     }).collect();
 
     let region_bounds = region_bounds
@@ -2046,7 +2062,7 @@ fn predicates_from_bound<'tcx>(
     match *bound {
         hir::GenericBound::Trait(ref tr, hir::TraitBoundModifier::None) => {
             let mut projections = Vec::new();
-            let pred = astconv.instantiate_poly_trait_ref(tr, param_ty, &mut projections);
+            let (pred, _) = astconv.instantiate_poly_trait_ref(tr, param_ty, &mut projections);
             iter::once((pred.to_predicate(), tr.span)).chain(
                 projections
                     .into_iter()

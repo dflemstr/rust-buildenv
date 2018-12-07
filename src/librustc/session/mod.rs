@@ -68,7 +68,7 @@ pub struct Session {
     /// For a library crate, this is always none
     pub entry_fn: Once<Option<(NodeId, Span, config::EntryFnType)>>,
     pub plugin_registrar_fn: Once<Option<ast::NodeId>>,
-    pub derive_registrar_fn: Once<Option<ast::NodeId>>,
+    pub proc_macro_decls_static: Once<Option<ast::NodeId>>,
     pub default_sysroot: Option<PathBuf>,
     /// The name of the root source file of the crate, in the local file system.
     /// `None` means that there is no source file.
@@ -687,9 +687,9 @@ impl Session {
         )
     }
 
-    pub fn generate_derive_registrar_symbol(&self, disambiguator: CrateDisambiguator) -> String {
+    pub fn generate_proc_macro_decls_symbol(&self, disambiguator: CrateDisambiguator) -> String {
         format!(
-            "__rustc_derive_registrar_{}__",
+            "__rustc_proc_macro_decls_{}__",
             disambiguator.to_fingerprint().to_hex()
         )
     }
@@ -826,8 +826,10 @@ impl Session {
     }
 
     pub fn profiler<F: FnOnce(&mut SelfProfiler) -> ()>(&self, f: F) {
-        let mut profiler = self.self_profiling.borrow_mut();
-        f(&mut profiler);
+        if self.opts.debugging_opts.self_profile || self.opts.debugging_opts.profile_json {
+            let mut profiler = self.self_profiling.borrow_mut();
+            f(&mut profiler);
+        }
     }
 
     pub fn print_profiler_results(&self) {
@@ -1144,12 +1146,12 @@ pub fn build_session_(
         // For a library crate, this is always none
         entry_fn: Once::new(),
         plugin_registrar_fn: Once::new(),
-        derive_registrar_fn: Once::new(),
+        proc_macro_decls_static: Once::new(),
         default_sysroot,
         local_crate_source_file,
         working_dir,
         lint_store: RwLock::new(lint::LintStore::new()),
-        buffered_lints: Lock::new(Some(lint::LintBuffer::new())),
+        buffered_lints: Lock::new(Some(Default::default())),
         one_time_diagnostics: Default::default(),
         plugin_llvm_passes: OneThread::new(RefCell::new(Vec::new())),
         plugin_attributes: OneThread::new(RefCell::new(Vec::new())),

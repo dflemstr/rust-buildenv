@@ -1575,7 +1575,7 @@ impl<'a, 'tcx> Clean<Generics> for (&'a ty::Generics,
         let stripped_typarams = gens.params.iter().filter_map(|param| match param.kind {
             ty::GenericParamDefKind::Lifetime => None,
             ty::GenericParamDefKind::Type { .. } => {
-                if param.name == keywords::SelfType.name().as_str() {
+                if param.name == keywords::SelfUpper.name().as_str() {
                     assert_eq!(param.index, 0);
                     return None;
                 }
@@ -2744,6 +2744,7 @@ impl<'tcx> Clean<Type> for Ty<'tcx> {
             ty::Closure(..) | ty::Generator(..) => Tuple(vec![]), // FIXME(pcwalton)
 
             ty::Bound(..) => panic!("Bound"),
+            ty::Placeholder(..) => panic!("Placeholder"),
             ty::UnnormalizedProjection(..) => panic!("UnnormalizedProjection"),
             ty::GeneratorWitness(..) => panic!("GeneratorWitness"),
             ty::Infer(..) => panic!("Infer"),
@@ -3007,7 +3008,7 @@ pub struct Span {
 impl Span {
     pub fn empty() -> Span {
         Span {
-            filename: FileName::Anon,
+            filename: FileName::Anon(0),
             loline: 0, locol: 0,
             hiline: 0, hicol: 0,
         }
@@ -3173,7 +3174,7 @@ fn qpath_to_string(p: &hir::QPath) -> String {
         if i > 0 {
             s.push_str("::");
         }
-        if seg.ident.name != keywords::CrateRoot.name() {
+        if seg.ident.name != keywords::PathRoot.name() {
             s.push_str(&*seg.ident.as_str());
         }
     }
@@ -3725,7 +3726,7 @@ fn resolve_type(cx: &DocContext,
             hir::Float(float_ty) => return Primitive(float_ty.into()),
         },
         Def::SelfTy(..) if path.segments.len() == 1 => {
-            return Generic(keywords::SelfType.name().to_string());
+            return Generic(keywords::SelfUpper.name().to_string());
         }
         Def::TyParam(..) if path.segments.len() == 1 => {
             return Generic(format!("{:#}", path));
@@ -3947,10 +3948,7 @@ pub fn path_to_def_local(tcx: &TyCtxt, path: &[&str]) -> Option<DefId> {
     let mut path_it = path.iter().peekable();
 
     loop {
-        let segment = match path_it.next() {
-            Some(segment) => segment,
-            None => return None,
-        };
+        let segment = path_it.next()?;
 
         for item_id in mem::replace(&mut items, HirVec::new()).iter() {
             let item = tcx.hir.expect_item(item_id.id);
@@ -3985,10 +3983,7 @@ pub fn path_to_def(tcx: &TyCtxt, path: &[&str]) -> Option<DefId> {
         let mut path_it = path.iter().skip(1).peekable();
 
         loop {
-            let segment = match path_it.next() {
-                Some(segment) => segment,
-                None => return None,
-            };
+            let segment = path_it.next()?;
 
             for item in mem::replace(&mut items, Lrc::new(vec![])).iter() {
                 if item.ident.name == *segment {

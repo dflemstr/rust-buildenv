@@ -29,7 +29,6 @@
 #![feature(nll)]
 #![feature(quote)]
 #![feature(rustc_diagnostic_macros)]
-#![feature(macro_at_most_once_rep)]
 
 #[macro_use]
 extern crate syntax;
@@ -37,7 +36,6 @@ extern crate syntax;
 extern crate rustc;
 #[macro_use]
 extern crate log;
-extern crate rustc_mir;
 extern crate rustc_target;
 extern crate syntax_pos;
 extern crate rustc_data_structures;
